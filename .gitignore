@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local tool caches
+.codebase-memory/
+.freebuff/
+.workbuddy-ai/
+
+# SAIPAL runtime home: real analyzed session transcripts and indexes.
+# Never publish an analysis home.
+.saipal/
+
+# SAIPEN project memory is local state; only the lineage carrier is tracked.
+.saipen/*
+!.saipen/IDENTITY.md
+
+# Operator scratch
+*.log
+.DS_Store
+Thumbs.db

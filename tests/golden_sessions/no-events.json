@@ -1,0 +1,31 @@
+{
+  "adapter": "generic",
+  "ended_at": "2026-08-30T10:12:00Z",
+  "events": [],
+  "project": {
+    "git_head": "abc1234",
+    "name": "TERMISAI",
+    "root_fingerprint": "fp-termisai"
+  },
+  "protocol": {
+    "binding_status": "BOUND",
+    "confidence": "HIGH",
+    "git_head": "deadbeef",
+    "registry_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": "exact-commit",
+    "tree_fingerprint": "tree-001",
+    "version": "7.231.9"
+  },
+  "raw_source_ref": "~/.codex/sessions/golden.jsonl",
+  "raw_source_sha256": "raw-0001",
+  "runtime": {
+    "model": "gpt-x",
+    "provider": "openai",
+    "reasoning_mode": "unknown"
+  },
+  "schema_version": 1,
+  "session_id": "golden-empty-001",
+  "session_sha256": "432ca86c8871dfeb6c0147ddb48940d0dff6fcf85031d8566ae5aa49d3e1ca1c",
+  "started_at": "2026-08-30T10:00:00Z",
+  "temperature": "COLD"
+}

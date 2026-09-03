@@ -1,0 +1,75 @@
+{
+  "adapter": "generic",
+  "ended_at": "2026-08-30T10:12:00Z",
+  "events": [
+    {
+      "digest": "d001",
+      "facts": {
+        "chars": 42
+      },
+      "loc": "msg:1",
+      "seq": 1,
+      "ts": "2026-08-30T10:01:00Z",
+      "type": "USER_MESSAGE"
+    },
+    {
+      "digest": "d002",
+      "facts": {
+        "canonical": "saipal continue",
+        "raw": "cc"
+      },
+      "loc": "msg:2",
+      "seq": 2,
+      "ts": "2026-08-30T10:02:00Z",
+      "type": "COMMAND"
+    },
+    {
+      "digest": "d003",
+      "facts": {
+        "target": "STATE.md",
+        "tool": "read"
+      },
+      "loc": "msg:3",
+      "seq": 3,
+      "ts": "2026-08-30T10:03:00Z",
+      "type": "TOOL_CALL"
+    },
+    {
+      "digest": "d004",
+      "facts": {
+        "bytes": 128,
+        "ok": true
+      },
+      "loc": "msg:4",
+      "seq": 4,
+      "ts": "2026-08-30T10:04:00Z",
+      "type": "TOOL_RESULT"
+    }
+  ],
+  "project": {
+    "git_head": "abc1234",
+    "name": "TERMISAI",
+    "root_fingerprint": "fp-termisai"
+  },
+  "protocol": {
+    "binding_status": "PARTIAL",
+    "confidence": "MEDIUM",
+    "git_head": null,
+    "registry_sha256": null,
+    "source": "installed-release-metadata",
+    "tree_fingerprint": null,
+    "version": "1.0.0"
+  },
+  "raw_source_ref": "~/.codex/sessions/golden.jsonl",
+  "raw_source_sha256": "raw-0001",
+  "runtime": {
+    "model": "gpt-x",
+    "provider": "openai",
+    "reasoning_mode": "unknown"
+  },
+  "schema_version": 1,
+  "session_id": "golden-old-001",
+  "session_sha256": "ad5e8432391f22d163d120176f418344df0c21f165bdc9c53d6837527873eec1",
+  "started_at": "2026-08-30T10:00:00Z",
+  "temperature": "COLD"
+}

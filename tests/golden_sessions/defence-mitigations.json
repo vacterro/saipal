@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "session_id": "golden-defence-001",
+  "session_sha256": null,
+  "adapter": "generic",
+  "project": {
+    "name": "SAIPAL",
+    "git_head": "abc123",
+    "root_fingerprint": "f1"
+  },
+  "runtime": {
+    "provider": "openai",
+    "model": "gpt-5",
+    "reasoning_mode": "unknown"
+  },
+  "started_at": "2026-08-30T10:00:00Z",
+  "ended_at": "2026-08-30T10:20:00Z",
+  "temperature": "COLD",
+  "protocol": {
+    "git_head": "abc123",
+    "version": "7.231.9",
+    "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tree_fingerprint": null,
+    "binding_status": "BOUND",
+    "confidence": "HIGH",
+    "source": "release-registry"
+  },
+  "raw_source_ref": "tests/golden_sessions/defence-mitigations.json",
+  "raw_source_sha256": "raw-defence-0001",
+  "events": [
+    {
+      "seq": 1,
+      "type": "USER_MESSAGE",
+      "ts": "2026-08-30T10:01:00Z",
+      "loc": "msg:1",
+      "digest": "d001",
+      "facts": {"chars": 40, "override": true}
+    },
+    {
+      "seq": 2,
+      "type": "COMMAND",
+      "ts": "2026-08-30T10:02:00Z",
+      "loc": "msg:2",
+      "digest": "d002",
+      "facts": {"canonical": "saipen teleport", "raw": "teleport"}
+    },
+    {
+      "seq": 3,
+      "type": "STATE_SNAPSHOT",
+      "ts": "2026-08-30T10:03:00Z",
+      "loc": "msg:3",
+      "digest": "d003",
+      "facts": {"kind": "adapter_normalization", "adapter": "generic"}
+    },
+    {
+      "seq": 4,
+      "type": "TOOL_RESULT",
+      "ts": "2026-08-30T10:04:00Z",
+      "loc": "msg:4",
+      "digest": "d004",
+      "facts": {"tool": "bash", "env_failure": true}
+    },
+    {
+      "seq": 5,
+      "type": "ERROR",
+      "ts": "2026-08-30T10:05:00Z",
+      "loc": "msg:5",
+      "digest": "d005",
+      "facts": {"kind": "recovery", "message": "resumed after tool failure"}
+    },
+    {
+      "seq": 6,
+      "type": "SESSION_BOUNDARY",
+      "ts": "2026-08-30T10:06:00Z",
+      "loc": "msg:6",
+      "digest": "d006",
+      "facts": {"kind": "owner_doc", "document": "saipal/COMMANDS.md"}
+    }
+  ]
+}

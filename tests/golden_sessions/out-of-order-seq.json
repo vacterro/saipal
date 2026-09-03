@@ -1,0 +1,56 @@
+{
+  "adapter": "generic",
+  "ended_at": "2026-08-30T10:12:00Z",
+  "events": [
+    {
+      "digest": "d001",
+      "facts": {},
+      "loc": "msg:1",
+      "seq": 1,
+      "ts": "2026-08-30T10:01:00Z",
+      "type": "USER_MESSAGE"
+    },
+    {
+      "digest": "d003",
+      "facts": {},
+      "loc": "msg:3",
+      "seq": 3,
+      "ts": "2026-08-30T10:03:00Z",
+      "type": "COMMAND"
+    },
+    {
+      "digest": "d002",
+      "facts": {},
+      "loc": "msg:2",
+      "seq": 2,
+      "ts": "2026-08-30T10:02:00Z",
+      "type": "TOOL_CALL"
+    }
+  ],
+  "project": {
+    "git_head": "abc1234",
+    "name": "TERMISAI",
+    "root_fingerprint": "fp-termisai"
+  },
+  "protocol": {
+    "binding_status": "BOUND",
+    "confidence": "HIGH",
+    "git_head": "deadbeef",
+    "registry_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": "exact-commit",
+    "tree_fingerprint": "tree-001",
+    "version": "7.231.9"
+  },
+  "raw_source_ref": "~/.codex/sessions/golden.jsonl",
+  "raw_source_sha256": "raw-0001",
+  "runtime": {
+    "model": "gpt-x",
+    "provider": "openai",
+    "reasoning_mode": "unknown"
+  },
+  "schema_version": 1,
+  "session_id": "golden-seq-001",
+  "session_sha256": "8769a9ef5223fa9c44e8ed7ec4c335cb7a213b1d6f9c792ffc34e75d10aeed7e",
+  "started_at": "2026-08-30T10:00:00Z",
+  "temperature": "COLD"
+}

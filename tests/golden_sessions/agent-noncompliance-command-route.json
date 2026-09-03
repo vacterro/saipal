@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "session_id": "golden-agent-noncompliance-001",
+  "session_sha256": "86606fad7fd9b83dd3723a7016f77ce6abdbd350e5cabbfe7ed40c638f8f2da8",
+  "adapter": "generic",
+  "project": {
+    "name": "SAIPAL",
+    "git_head": "abc123",
+    "root_fingerprint": "f1"
+  },
+  "runtime": {
+    "provider": "openai",
+    "model": "gpt-5",
+    "reasoning_mode": "unknown"
+  },
+  "temperature": "COLD",
+  "started_at": "2026-08-30T10:00:00Z",
+  "ended_at": "2026-08-30T10:10:00Z",
+  "protocol": {
+    "version": "7.231.9",
+    "binding_status": "BOUND",
+    "git_head": "abc123",
+    "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "events": [
+    {
+      "seq": 1,
+      "type": "USER_MESSAGE",
+      "ts": "2026-08-30T10:01:00Z",
+      "loc": "msg:1",
+      "digest": "d001",
+      "facts": {
+        "chars": 5
+      }
+    },
+    {
+      "seq": 2,
+      "type": "COMMAND",
+      "ts": "2026-08-30T10:02:00Z",
+      "loc": "msg:2",
+      "digest": "d002",
+      "facts": {
+        "canonical": "saipal continue",
+        "raw": "cc"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "TOOL_CALL",
+      "ts": "2026-08-30T10:03:00Z",
+      "loc": "msg:3",
+      "digest": "d003",
+      "facts": {
+        "target": "STATE.md",
+        "tool": "read"
+      }
+    },
+    {
+      "seq": 4,
+      "type": "TOOL_RESULT",
+      "ts": "2026-08-30T10:04:00Z",
+      "loc": "msg:4",
+      "digest": "d004",
+      "facts": {
+        "ok": true,
+        "bytes": 128
+      }
+    },
+    {
+      "seq": 5,
+      "type": "COMMAND",
+      "ts": "2026-08-30T10:05:00Z",
+      "loc": "msg:5",
+      "digest": "d005",
+      "facts": {
+        "canonical": "saipen nope --force",
+        "raw": "nope"
+      }
+    },
+    {
+      "seq": 6,
+      "type": "TOOL_CALL",
+      "ts": "2026-08-30T10:06:00Z",
+      "loc": "msg:6",
+      "digest": "d006",
+      "facts": {
+        "target": "CORE.md",
+        "tool": "edit"
+      }
+    },
+    {
+      "seq": 7,
+      "type": "TOOL_RESULT",
+      "ts": "2026-08-30T10:07:00Z",
+      "loc": "msg:7",
+      "digest": "d007",
+      "facts": {
+        "ok": true,
+        "bytes": 64
+      }
+    },
+    {
+      "seq": 8,
+      "type": "SESSION_BOUNDARY",
+      "ts": "2026-08-30T10:10:00Z",
+      "loc": "msg:8",
+      "digest": "d008",
+      "facts": {}
+    }
+  ]
+}

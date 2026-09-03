@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "session_id": "golden-no-finding-normal-001",
+  "session_sha256": "7abd7e78cb5fd7a9f2fcbeb939558e3fb997677128b02bde091b37943a9b7005",
+  "adapter": "generic",
+  "project": {
+    "name": "SAIPAL",
+    "git_head": "abc123",
+    "root_fingerprint": "f1"
+  },
+  "runtime": {
+    "provider": "openai",
+    "model": "gpt-5",
+    "reasoning_mode": "unknown"
+  },
+  "temperature": "COLD",
+  "started_at": "2026-08-30T10:00:00Z",
+  "ended_at": "2026-08-30T10:10:00Z",
+  "protocol": {
+    "version": "7.231.9",
+    "binding_status": "BOUND",
+    "git_head": "abc123",
+    "registry_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "events": [
+    {
+      "seq": 1,
+      "type": "USER_MESSAGE",
+      "ts": "2026-08-30T10:01:00Z",
+      "loc": "msg:1",
+      "digest": "d001",
+      "facts": {
+        "chars": 5
+      }
+    },
+    {
+      "seq": 2,
+      "type": "COMMAND",
+      "ts": "2026-08-30T10:02:00Z",
+      "loc": "msg:2",
+      "digest": "d002",
+      "facts": {
+        "canonical": "saipal status",
+        "raw": "status"
+      }
+    },
+    {
+      "seq": 3,
+      "type": "TOOL_CALL",
+      "ts": "2026-08-30T10:03:00Z",
+      "loc": "msg:3",
+      "digest": "d003",
+      "facts": {
+        "target": "STATE.md",
+        "tool": "read"
+      }
+    },
+    {
+      "seq": 4,
+      "type": "TOOL_RESULT",
+      "ts": "2026-08-30T10:04:00Z",
+      "loc": "msg:4",
+      "digest": "d004",
+      "facts": {
+        "ok": true,
+        "bytes": 128
+      }
+    },
+    {
+      "seq": 5,
+      "type": "SESSION_BOUNDARY",
+      "ts": "2026-08-30T10:10:00Z",
+      "loc": "msg:5",
+      "digest": "d005",
+      "facts": {}
+    }
+  ]
+}
