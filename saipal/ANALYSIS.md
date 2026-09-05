@@ -5,9 +5,8 @@
 
 This document owns how the analyst agent (Layer B) reasons about evidence.
 The deterministic kernel (Layer A) produces signals; the analyst produces
-meaning. The analyst submits structured candidates back to the kernel through
-a constrained boundary. The kernel decides whether that reasoning is
-structurally admissible.
+meaning, and submits structured candidates back through a constrained boundary.
+The kernel decides whether that reasoning is structurally admissible.
 
 ## PAL-ANALYSIS-01 — what the analyst receives
 
@@ -19,7 +18,8 @@ One `saipal --json next` returns exactly one bounded unit of work — the
 | --- | --- |
 | `session` | id, generation, adapter, temperature, project, runtime (provider/model) |
 | `episode` | one semantic episode: index, kind, seq span, whether events were truncated |
-| `events` | that episode's normalized events, bounded, never transcript text |
+| `slice` | which bounded window of that episode this is: index, count, offset, span size, its own seq span, whether it is the last |
+| `events` | that slice's normalized events, bounded, never transcript text |
 | `evidence_refs` + `evidence_command` | locators the analyst may reopen, and the exact read-only command |
 | `protocol` | historical binding, proof level and whether a violation is claimable |
 | `applicable_law` | resolved rule ids, owner documents, expected behavior |
@@ -29,10 +29,17 @@ One `saipal --json next` returns exactly one bounded unit of work — the
 | `calibration` | prior maintainer dispositions |
 | `open_candidates` | findings already in flight, so the analyst does not re-raise them |
 
-**Semantic position is separate from the mechanical one.** The deterministic pass
-records its own watermark; the analyst's position lives in the session's
-`semantic` block and advances only when a candidate or a no-drift result is
-submitted. A mechanically exhausted session still owes every episode to the
+**A long episode is paged, never truncated.** A span longer than
+`carrier_limits.max_events` is handed over in consecutive windows that tile it
+exactly — no event skipped, none shown twice — and the `slice` names which one this
+is. A single truncated window left an honest analyst answering
+`INSUFFICIENT_EVIDENCE` about every long unit forever: a prefix, no way to ask for
+the rest.
+
+**Semantic position is separate from the mechanical one,** and it is an episode
+*and* a slice. The deterministic pass records its own watermark; the analyst's
+position lives in the session's `semantic` block and advances only on a
+submission, so a mechanically exhausted session still owes every episode to the
 analyst.
 
 Building a carrier performs **zero writes**, so `next` may be polled and returns
@@ -67,10 +74,8 @@ Every semantic candidate runs two explicit passes:
 - source mutated
 - behavior is style difference rather than protocol violation
 
-**Final classifier.** Must record:
-- winning interpretation
-- losing interpretation
-- evidence that defeated the loser
+**Final classifier.** Must record the winning interpretation, the losing one, and
+the evidence that defeated the loser.
 
 If neither wins strongly: BLOCKED / INSUFFICIENT_EVIDENCE. No audit.
 Precision beats audit volume.
@@ -83,9 +88,9 @@ the evidence and puts it in the carrier: `USER_OVERRIDE`, `LATER_RECOVERY`,
 
 A `DRIFT` candidate MUST list every raised code in `addressed_defences` and
 answer it in the defender pass; an unaddressed mitigation is refused as out of
-scope. Naming a code the surface did not raise is inadmissible. The kernel judges
-only whether the mitigation was answered — whether the answer is *good* is the
-maintainer's call.
+scope, and naming a code the surface did not raise is inadmissible. The kernel
+judges only whether the mitigation was answered — whether the answer is *good* is
+the maintainer's call.
 
 ## PAL-ANALYSIS-03 — disposition class separation
 
@@ -118,8 +123,7 @@ Three confusions are refused by name:
   `PHASE_CONTRACT`, `SOURCE_CONTRACT` or `EXECUTION_POLICY`.
 
 Never legalize a model failure by weakening a correct safety rule. That
-sentence is now a gate, not a hope.
-
+sentence is a gate, not a hope.
 ## PAL-ANALYSIS-04 — the structured candidate
 
 The analyst submits exactly one closed document per unit. Its field set,
@@ -129,8 +133,9 @@ else — an unknown field, prose in place of a field, a patch, a command — is
 inadmissible. A model that guesses the contract does not know it.
 
 Verdicts: `DRIFT`, `NO_DRIFT`, `INSUFFICIENT_EVIDENCE`. Every verdict carries the
-unit identity (`unit_digest`, `session_id`, `episode_index`), a
-`disposition_class` and `reasoning`.
+unit identity (`unit_digest`, `session_id`, `episode_index`, and `slice_index` for
+a paged episode — absent means the first slice), a `disposition_class` and
+`reasoning`.
 
 **A `DRIFT` verdict carries its burden, and only a `DRIFT` verdict may:** drift
 class, severity, confidence, change target, root cause, and a `challenge` object
@@ -144,10 +149,10 @@ is evidence of work — but may not carry any claim field. A no-drift receipt th
 names a drift class and a change target is a finding with the label filed off.
 
 **Scope is enforced, not trusted.** The candidate must answer the unit it was
-handed: matching session and episode index, event references inside the episode
-span, and a `unit_digest` equal to the carrier's. A digest mismatch means the
-evidence changed under the analyst, so the reasoning is stale and is refused
-rather than merged.
+handed: matching session, episode index and slice, event references inside the
+**slice** span, and a `unit_digest` equal to the carrier's. The digest covers the
+slice, so a candidate answering a window the analyst no longer stands on, or
+resting on evidence that changed underneath it, is refused as stale.
 
 ## PAL-ANALYSIS-05 — the submission boundary
 
@@ -161,13 +166,15 @@ discipline and scope. A refusal performs **zero writes** and names its reason:
 An accepted `DRIFT` candidate is merged through the existing finding lifecycle.
 The analyst's confidence is a proposal: the no-hindsight gate still caps it, the
 do-no-harm gate still runs before qualification, and the audit quality gate still
-decides whether anything leaves the home. The analyst does not choose a
-lifecycle state, an audit number, a path or a publication mode.
+decides whether anything leaves the home. The analyst does not choose a lifecycle
+state, an audit number, a path or a publication mode.
 
-Every accepted submission advances the semantic watermark exactly once and
-returns a receipt keyed by unit, verdict and reasoning digest. Re-submitting the
-same verdict and reasoning for the same unit returns that receipt and changes
-nothing — a crashed analyst may safely retry.
+Every accepted submission advances the semantic position exactly once and returns
+a receipt keyed by unit, verdict and reasoning digest. A verdict on a non-final
+slice advances to the next slice and leaves the episode open; only the last slice
+closes it, and a verdict on an already-passed slice never drags the position
+backwards. Re-submitting the same verdict and reasoning for one unit returns that
+receipt and changes nothing — a crashed analyst may safely retry.
 
 ## PAL-ANALYSIS-06 — no-drift receipts and true exhaustion
 
@@ -176,16 +183,18 @@ only evidence that an episode was actually examined, so a clean session is
 *proved* clean rather than merely unaccused.
 
 **Exhaustion is derived, never asserted.** The `semantic` cursor is written by the
-same code that advances it, so on its own it cannot distinguish "every episode was
-judged" from "the cursor ran off the end". Coverage is therefore counted from
-receipts, per episode:
+same code that advances it, so alone it cannot distinguish "every episode was
+judged" from "the cursor ran off the end". Coverage is counted from receipts:
 
-- `final` — a verdict recorded against final evidence;
-- `provisional` — judged only while the evidence could still grow (work done, no
-  conclusion drawn);
+- `final` — every slice of the episode carries a verdict recorded against final
+  evidence;
+- `provisional` — work recorded but no conclusion: a growing HOT tail, or an
+  episode judged only up to slice N of M;
 - `pending` — no verdict at all.
 
-A session is *truly exhausted* only when every episode has a final verdict.
-`saipal status` reports these counts, and it names the disagreement case
-explicitly: a session whose cursor claims exhaustion while receipts are missing is
-a bug signature, so it is surfaced rather than averaged into a percentage.
+Slice counts are reported beside the episode counts, because on a paged episode
+they are the honest unit of progress: one slice of five is work, not a judged
+episode. A session is *truly exhausted* only when every episode has a final
+verdict for every slice. `saipal status` reports these counts and names the
+disagreement case: a cursor claiming exhaustion while receipts are missing is a
+bug signature, surfaced rather than averaged into a percentage.

@@ -39,6 +39,43 @@ class EpisodeBoundaries(unittest.TestCase):
         for previous, following in zip(episodes, episodes[1:]):
             self.assertEqual(previous["end_seq"] + 1, following["start_seq"])
 
+    def test_every_event_lands_in_exactly_one_episode(self) -> None:
+        """T-71: the tail used to be dropped when the last event was a boundary."""
+        for stream in (
+            self.events,
+            [_event(1, "USER_MESSAGE"), _event(2, "TOOL_CALL"), _event(3, "COMMAND")],
+            [_event(1, "COMMAND")],
+            [_event(1, "USER_MESSAGE"), _event(2, "PHASE_CHANGE")],
+            [_event(1, "TOOL_CALL"), _event(2, "SOURCE_EVENT")],
+        ):
+            with self.subTest(last=stream[-1]["type"]):
+                episodes = episodes_mod.extract_episodes(stream)
+                covered = [
+                    seq
+                    for episode in episodes
+                    for seq in range(episode["start_seq"], episode["end_seq"] + 1)
+                ]
+                self.assertEqual(
+                    covered,
+                    [int(event["seq"]) for event in stream],
+                    "every event must belong to exactly one episode, in order",
+                )
+                self.assertEqual(
+                    sum(e["event_count"] for e in episodes),
+                    len(stream),
+                    "the recorded counts must add up to the stream",
+                )
+
+    def test_a_stream_ending_on_a_boundary_keeps_its_last_event(self) -> None:
+        """Red control: the exact defect, in the smallest possible stream."""
+        episodes = episodes_mod.extract_episodes(
+            [_event(1, "USER_MESSAGE"), _event(2, "COMMAND")]
+        )
+        self.assertEqual(
+            [(e["kind"], e["start_seq"], e["end_seq"]) for e in episodes],
+            [("command", 1, 1), ("terminal_task", 2, 2)],
+        )
+
     def test_episode_is_named_by_the_boundary_that_opened_it(self) -> None:
         episodes = episodes_mod.extract_episodes(self.events)
         self.assertEqual(

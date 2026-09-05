@@ -21,6 +21,7 @@ from saipal_engine.errors import PalError
 from saipal_engine.registry import load_registry
 
 CLEAN = "no-finding-normal.json"
+DRIFT = "agent-noncompliance-command-route.json"
 CONFLICT_BASE = "hot-partial.json"
 CONFLICT_MUTATED = "hot-prefix-mutated.json"
 
@@ -418,15 +419,15 @@ class MultiGenerationSessionIsAddressable(unittest.TestCase):
     def test_find_unit_selects_the_generation_next_hands_over(self) -> None:
         status, index, _detail = sessions_mod.load_index(self.home, registry=self.registry)
         self.assertEqual(status, "ok")
-        offered, episode = carrier_mod.next_unit(index, self.registry)
+        offered, episode, slice_index = carrier_mod.next_unit(index, self.registry)
         self.assertEqual(offered["session_id"], "golden-cold-001")
         addressed, _episode = carrier_mod.find_unit(
             index, "golden-cold-001", int(episode["index"])
         )
         self.assertEqual(addressed["generation"], offered["generation"])
         self.assertEqual(
-            carrier_mod.unit_digest(addressed, episode),
-            carrier_mod.unit_digest(offered, episode),
+            carrier_mod.unit_digest(addressed, episode, slice_index),
+            carrier_mod.unit_digest(offered, episode, slice_index),
         )
 
     def test_a_candidate_for_the_offered_unit_is_accepted(self) -> None:
@@ -476,6 +477,234 @@ class NoHindsightSurvivesSubmission(SubmitBase):
             "an unbound session cannot carry a HIGH-confidence violation claim",
         )
         self.assertIsNone(receipt["audit"], "no audit may leave on an unbound claim")
+
+
+class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
+    """A drifting episode is usually offered with a mechanical finding already
+    in flight; the analyst's own-words DRIFT must confirm it, not re-raise it.
+
+    `cc` runs the deterministic pass before the analyst loop, so the episode
+    under judgment commonly already stands on a mechanical finding (the
+    carrier's `open_candidates` says so). Fingerprints will not agree --
+    template prose and analyst prose are different descriptions of one
+    mechanism -- so the merge falls back to the shared occurrence anchor:
+    same session, same episode, same drift class, same event
+    (PAL-ANALYSIS-01 "the analyst does not re-raise them"; PAL-ANALYSIS-05
+    "merged through the existing finding lifecycle").
+    """
+
+    SESSION = "golden-agent-noncompliance-001"
+    DRIFT_EPISODE = 2  # the episode containing 'saipen nope --force' at seq 5
+
+    def setUp(self) -> None:
+        self.registry = load_registry()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _fresh_home(self) -> Path:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        home = support.make_home(self.tmp)
+        support.run_saipal("continue", home=home)
+        return home
+
+    def _stage_unbound(self, home: Path) -> None:
+        """Raw fixture copy: the release claim cannot verify, so the binding is
+        PARTIAL and the mechanical finding stays open (QUALIFIED, no audit)."""
+        inbox = home / "session_inbox"
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "drift.json").write_bytes(
+            support.fixture("agent-noncompliance-command-route.json").read_bytes()
+        )
+        support.run_saipal("continue", home=home)
+
+    def _stage_bound(self, home: Path) -> None:
+        """Stamped fixture: verified against the declared authority, so the
+        binding is BOUND and the mechanical finding emits its audit."""
+        support.put_inbox(home, "agent-noncompliance-command-route.json")
+        support.run_saipal("continue", home=home)
+
+    def _findings(self, home: Path) -> list[dict]:
+        path = home / "findings" / "index.json"
+        if not path.is_file():
+            return []
+        return json.loads(path.read_text(encoding="utf-8"))["findings"]
+
+    def _unit_for_drift_episode(self, home: Path) -> dict:
+        status, index, _detail = sessions_mod.load_index(home, registry=self.registry)
+        self.assertEqual(status, "ok")
+        unit = carrier_mod.build_carrier(
+            home,
+            registry=self.registry,
+            index=index,
+            session_id=self.SESSION,
+            episode_index=self.DRIFT_EPISODE,
+        )
+        self.assertEqual(unit["carrier"], "analyze-episodes")
+        return unit
+
+    def _confirmation(self, unit: dict, root_cause: str) -> dict:
+        return {
+            "schema_version": 1,
+            "verdict": "DRIFT",
+            "unit_digest": unit["unit_digest"],
+            "session_id": unit["session"]["session_id"],
+            "episode_index": unit["episode"]["index"],
+            "slice_index": unit["slice"]["index"],
+            "disposition_class": "ENGINE_ENFORCEMENT_GAP",
+            "reasoning": (
+                "the engine executed an undeclared command with a force flag "
+                "and the edit landed on the protocol core"
+            ),
+            "rule_ids": ["PAL-CMD-01", "PAL-CMD-02", "PAL-CMD-03"],
+            "event_refs": [5],
+            "drift_class": "COMMAND_ROUTE_DRIFT",
+            "severity": "P3",
+            "confidence": "MEDIUM",
+            "change_target": "ENGINE",
+            "root_cause": root_cause,
+            "challenge": {
+                "prosecutor": "PAL-CMD-01 names the closed surface; this route was not on it",
+                "defender": "the raw token may be a user alias the adapter normalized",
+                "winner": "prosecutor",
+                "loser_rejection": "the canonical form was recorded verbatim with --force",
+            },
+            "alternatives": ["the user invoked the command through a shell alias"],
+            "contrary_evidence": [],
+            "missing_evidence": [],
+            "protected_invariants": ["destructive_confirmation"],
+        }
+
+    def _analyst_fingerprint(self, root_cause: str, rule_ids: list[str]) -> str:
+        from saipal_engine import findings as findings_mod
+
+        return findings_mod.fingerprint_of(
+            {
+                "drift_class": "COMMAND_ROUTE_DRIFT",
+                "rule_ids": rule_ids,
+                "change_target": "ENGINE",
+                "root_cause": root_cause,
+            }
+        )
+
+    def test_open_confirmation_merges_instead_of_minting(self) -> None:
+        """Red control: analyst wording != mechanical wording must still land on
+        the mechanical finding instead of minting PAL-0002 for the same event."""
+        home = self._fresh_home()
+        self._stage_unbound(home)
+        mechanical = self._findings(home)
+        self.assertEqual(len(mechanical), 1)
+        self.assertEqual(mechanical[0]["state"], "QUALIFIED")
+        self.assertIsNone(mechanical[0]["audit"])
+        self.assertEqual(mechanical[0]["occurrences"][0]["event_refs"], [5])
+
+        analyst_wording = (
+            "an undeclared command with a force flag was executed "
+            "against the protocol core"
+        )
+        # Guard: this test only means something if the two descriptions really
+        # diverge (different causal identity, so only the occurrence anchor
+        # can bind them).
+        self.assertNotEqual(
+            mechanical[0]["fingerprint"],
+            self._analyst_fingerprint(analyst_wording, mechanical[0]["rule_ids"]),
+        )
+
+        unit = self._unit_for_drift_episode(home)
+        receipt = submit_mod.submit_candidate(
+            home,
+            self._confirmation(unit, analyst_wording),
+            registry=self.registry,
+        )
+        self.assertFalse(receipt["duplicate"])
+        self.assertEqual(
+            receipt["finding_id"],
+            mechanical[0]["finding_id"],
+            "the confirmation must land on the mechanical finding",
+        )
+
+        after = self._findings(home)
+        self.assertEqual(len(after), 1, "one event, one finding")
+        self.assertEqual(after[0]["finding_id"], mechanical[0]["finding_id"])
+        self.assertEqual(
+            after[0]["state"], "QUALIFIED", "the gates re-ran on the analyst's disposition"
+        )
+        self.assertEqual(len(after[0]["occurrences"]), 1, "no duplicated occurrence")
+        self.assertEqual(
+            after[0].get("analyst_reasoning"), self._confirmation(unit, analyst_wording)["reasoning"]
+        )
+
+    def test_a_same_fingerprint_confirmation_does_not_wedge_the_finding(self) -> None:
+        """Red control: confirming an open finding must re-advance it, not leave
+        it regressed at OBSERVED with no receipt naming it."""
+        home = self._fresh_home()
+        self._stage_unbound(home)
+        mechanical = self._findings(home)
+        self.assertEqual(mechanical[0]["state"], "QUALIFIED")
+
+        unit = self._unit_for_drift_episode(home)
+        # Literal template wording: same fingerprint, still a fresh submission.
+        cand = self._confirmation(unit, mechanical[0]["root_cause"])
+        self.assertEqual(
+            mechanical[0]["fingerprint"],
+            self._analyst_fingerprint(mechanical[0]["root_cause"], mechanical[0]["rule_ids"]),
+        )
+        receipt = submit_mod.submit_candidate(home, cand, registry=self.registry)
+        self.assertFalse(receipt["duplicate"])
+        self.assertEqual(receipt["finding_id"], mechanical[0]["finding_id"])
+
+        after = self._findings(home)
+        self.assertEqual(len(after), 1)
+        self.assertEqual(
+            after[0]["state"], "QUALIFIED",
+            "the confirmed finding must not be left wedged at OBSERVED",
+        )
+        self.assertIsNotNone(
+            after[0].get("analyst_reasoning"), "the analyst's judgment was recorded"
+        )
+        self.assertEqual(
+            after[0]["mechanical_confidence"], "HIGH",
+            "a confirmation must not erase the detector's mechanical proof",
+        )
+
+    def test_a_confirmation_of_an_emitted_finding_reuses_its_audit(self) -> None:
+        """Red control: a BOUND session already emitted the mechanical audit; a
+        confirming analyst verdict must not mint a second finding or a second
+        audit for the same drift."""
+        home = self._fresh_home()
+        self._stage_bound(home)
+        mechanical = self._findings(home)
+        self.assertEqual(len(mechanical), 1)
+        self.assertEqual(mechanical[0]["state"], "EMITTED")
+        self.assertEqual(mechanical[0]["audit"]["audit_number"], 1)
+
+        unit = self._unit_for_drift_episode(home)
+        analyst_wording = (
+            "an undeclared command with a force flag was executed "
+            "against the protocol core"
+        )
+        self.assertNotEqual(
+            mechanical[0]["fingerprint"],
+            self._analyst_fingerprint(analyst_wording, mechanical[0]["rule_ids"]),
+        )
+        receipt = submit_mod.submit_candidate(
+            home,
+            self._confirmation(unit, analyst_wording),
+            registry=self.registry,
+        )
+        self.assertFalse(receipt["duplicate"])
+        self.assertEqual(receipt["finding_id"], mechanical[0]["finding_id"])
+        self.assertEqual(receipt["audit"]["audit_number"], 1)
+
+        after = self._findings(home)
+        self.assertEqual(len(after), 1, "one drift, one finding")
+        self.assertEqual(after[0]["state"], "EMITTED")
+        self.assertEqual(
+            sorted(p.name for p in (home / "audit" / "staging").glob("*.md")),
+            ["1.md"],
+            "no second audit may leave for the same drift",
+        )
 
 
 if __name__ == "__main__":

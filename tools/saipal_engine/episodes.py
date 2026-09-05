@@ -66,7 +66,13 @@ def boundary_marks(events: list[dict], *, registry: dict | None = None) -> list[
 
 
 def mechanical_spans(events: list[dict]) -> list[dict]:
-    """Preserve provider step bookkeeping without treating it as meaning."""
+    """Preserve provider step bookkeeping without treating it as meaning.
+
+    Derived on demand from the bundle, never duplicated into the session index:
+    the bundle is the durable evidence, this is a deterministic projection of it,
+    and persisting 6,812 span objects nothing read cost 13% of an 11 MB index
+    (PERF-004).
+    """
     if not events:
         return []
     spans: list[dict] = []
@@ -96,8 +102,14 @@ def extract_episodes(events: list[dict], *, registry: dict | None = None) -> lis
     """Split a normalized event stream into episode spans.
 
     An episode covers `[start_seq, end_seq]` and is named by the boundary that
-    opened it. The trailing span is `terminal_task`, because the end of the
-    evidence is itself a boundary.
+    CLOSED it -- `trigger_seq` is that boundary's seq, and the boundary event
+    itself belongs to the NEXT episode. The trailing span is `terminal_task`,
+    because the end of the evidence is itself a boundary.
+
+    Every event lands in exactly one episode, including the last one. The tail
+    used to be emitted only when `start < last`, so a session whose final event
+    was itself a boundary opened a span of exactly one event and dropped it: that
+    event reached no detector, no carrier and no analyst, silently (T-71).
     """
     if not events:
         return []
@@ -119,6 +131,13 @@ def extract_episodes(events: list[dict], *, registry: dict | None = None) -> lis
             "end_seq": end_seq,
             "kind": kind,
             "trigger_seq": trigger_seq,
+            # How many events actually live in the span. Persisted because every
+            # reader that must know how many carrier slices an episode needs --
+            # coverage, the unit digest -- would otherwise have to reload the
+            # bundle to count them.
+            "event_count": sum(
+                1 for seq in sequences if start_seq <= seq <= end_seq
+            ),
             "start_evidence_ref": locator_at(start_seq),
             "end_evidence_ref": locator_at(end_seq),
         }
@@ -129,9 +148,7 @@ def extract_episodes(events: list[dict], *, registry: dict | None = None) -> lis
         episodes.append(episode(start, mark["seq"] - 1, mark["kind"], mark["seq"]))
         start = mark["seq"]
 
-    if start < last:
+    if start <= last:
         episodes.append(episode(start, last, TERMINAL_KIND, None))
-    elif not episodes:
-        episodes.append(episode(first, last, TERMINAL_KIND, None))
 
     return episodes

@@ -5,18 +5,17 @@ Context budget, safety valves, concurrency leases, atomic telemetry.
 
 from __future__ import annotations
 
-import json
-import os
-import socket
-import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 from .capability import require_action
-from .errors import PalError
-from .paths import atomic_write_json, home_paths, read_json
+from .paths import (
+    FencedLockFile,
+    atomic_write_json,
+    home_paths,
+    read_json,
+    sha256_text,
+)
 
 
 @dataclass
@@ -84,132 +83,91 @@ def check_safety_valves(
     return True, ""
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-            handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if handle:
-                ctypes.windll.kernel32.CloseHandle(handle)
-                return True
-            return False
-        except Exception:
-            return True
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    except Exception:
-        return True
-    return True
-
-
 class SessionLease:
+    """One analyzer per session, over the shared fenced lock primitive.
+
+    Ownership, staleness and takeover are `FencedLockFile`'s (audit W2-001); this
+    class owns where the lease file lives and when it is released.
+
+    The filename is a digest of the session id, never the id itself (audit
+    CORE-004). A session id is external provider data: `foo/bar` is a valid
+    identifier and used to turn into a path, so a schema-valid bundle crashed the
+    primary analysis path. Hashing also sidesteps Windows reserved names, length
+    limits and case-insensitive aliasing in one step; sanitizing a few characters
+    would not.
+    """
+
     def __init__(self, home: Path | str, session_id: str, *, ttl: float = 300):
         self.paths = home_paths(home)
         self.session_id = str(session_id)
         self.ttl = float(ttl)
-        self.path = self.paths.locks / f"lease-{self.session_id}.json"
-        self._held = False
+        self.path = self.paths.locks / self._lease_name(self.session_id)
+        self._lock = self._new_lock()
+
+    @staticmethod
+    def _lease_name(session_id: str) -> str:
+        """A flat, filesystem-safe, collision-free name for any session id."""
+        return f"lease-{sha256_text(str(session_id))}.json"
+
+    def _new_lock(self) -> FencedLockFile:
+        return FencedLockFile(
+            self.path,
+            ttl=self.ttl,
+            busy_detail=f"another cycle holds the lease for session {self.session_id!r}",
+        )
 
     @property
     def held(self) -> bool:
-        return self._held
+        return self._lock.held
 
-    def _payload(self, *, ttl: float) -> dict[str, Any]:
-        return {
-            "pid": os.getpid(),
-            "host": socket.gethostname(),
-            "created_at": time.time(),
-            "owner": uuid.uuid4().hex,
-            "ttl": float(ttl),
-        }
+    @property
+    def token(self) -> str | None:
+        return self._lock.token
 
-    def _read(self) -> dict | None:
-        try:
-            raw = self.path.read_bytes()
-        except FileNotFoundError:
-            return None
-        except OSError:
-            return None
-        try:
-            payload = json.loads(raw.decode("utf-8-sig"))
-        except (UnicodeDecodeError, ValueError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def _stale(self, payload: dict) -> bool:
-        try:
-            pid = int(payload.get("pid", 0))
-            age = time.time() - float(payload.get("created_at", 0))
-            ttl = float(payload.get("ttl", self.ttl))
-        except (TypeError, ValueError):
-            return True
-        if age >= ttl:
-            return True
-        return not _pid_alive(pid)
-
-    def acquire(self, home: Path | str | None = None, session_id: str | None = None, ttl: float | None = None) -> bool:
+    def acquire(
+        self,
+        home: Path | str | None = None,
+        session_id: str | None = None,
+        ttl: float | None = None,
+    ) -> bool:
         if home is not None:
             self.paths = home_paths(home)
             self.session_id = str(session_id or self.session_id)
-            self.path = self.paths.locks / f"lease-{self.session_id}.json"
         if ttl is not None:
             self.ttl = float(ttl)
-        self.paths.locks.mkdir(parents=True, exist_ok=True)
-        existing = self._read()
-        if existing is not None and not self._stale(existing):
+        self.path = self.paths.locks / self._lease_name(self.session_id)
+        if not self._lock.held:
+            self._lock = self._new_lock()
+        elif self._lock.path != self.path:
+            # Re-targeting a held lease would abandon the old lock file with no
+            # owner able to release it.
             return False
-        if existing is not None:
-            with _suppress_os_error():
-                os.unlink(str(self.path))
-        data = json.dumps(self._payload(ttl=self.ttl), sort_keys=True).encode("utf-8")
-        try:
-            descriptor = os.open(
-                str(self.path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-            )
-        except FileExistsError:
-            return False
-        except OSError as exc:
-            raise PalError("WRITER_BUSY", f"cannot create session lease: {exc}") from exc
-        try:
-            os.write(descriptor, data)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        self._held = True
-        return True
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if not self._held:
-            return
-        with _suppress_os_error():
-            os.unlink(str(self.path))
-        self._held = False
+        self._lock.release()
 
     def is_expired(self) -> bool:
-        payload = self._read()
-        if payload is None:
-            return True
-        return self._stale(payload)
+        stale, _raw = self._lock._stale_now()
+        return stale
 
     def refresh(self, ttl: float = 300) -> bool:
-        if not self._held:
-            return False
-        self.ttl = float(ttl)
-        data = json.dumps(self._payload(ttl=self.ttl), sort_keys=True).encode("utf-8")
-        try:
-            descriptor = os.open(str(self.path), os.O_WRONLY | os.O_TRUNC, 0o600)
-        except OSError:
-            return False
-        try:
-            os.write(descriptor, data)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        return True
+        return self._lock.refresh(ttl)
+
+    def __enter__(self) -> SessionLease:
+        """Held-lease regions use `with`, so every exit releases exactly once.
+
+        Manually balancing `release()` across each `return`/`continue`/raise is
+        how the missing-bundle path leaked a lease and blocked its session until
+        stale recovery (audit CORE-004). Entering assumes the caller already
+        acquired: acquisition can legitimately fail, and a context manager that
+        raised on contention would turn a normal skip into an exception.
+        """
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.release()
+        return False
 
 
 def init() -> dict:
@@ -266,15 +224,3 @@ def save_telemetry(home: Path | str, telemetry: dict) -> dict:
     paths = home_paths(home)
     atomic_write_json(paths.telemetry, payload, root=paths.root)
     return payload
-
-
-class _SuppressOsError:
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return exc_type is not None and issubclass(exc_type, OSError)
-
-
-def _suppress_os_error() -> _SuppressOsError:
-    return _SuppressOsError()

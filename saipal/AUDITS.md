@@ -28,9 +28,9 @@ SAIPAL may not choose filesystem paths. The enqueue is a single constrained
 operation that:
 
 1. acquires the audit inbox lock;
-2. allocates a monotonic audit id;
+2. allocates a monotonic audit id and records the claim as `pending`;
 3. writes temp then atomically renames to `audit/N.md`;
-4. verifies the final digest;
+4. verifies the final digest and confirms the claim;
 5. returns audit number, path, hash and operation id.
 
 Numbering is monotonic and durable. Gaps are never reused. If the inbox holds
@@ -38,7 +38,9 @@ Numbering is monotonic and durable. Gaps are never reused. If the inbox holds
 
 Idempotency binds `finding_id` + `audit_content_sha256` + enqueue operation id
 + returned audit number. A crash after file creation but before the local
-checkpoint must not duplicate the audit.
+checkpoint must not duplicate the audit: the slot was claimed before the file
+existed, so the retry reuses that number and every file in the audit directory
+stays named by a ledger entry. An unconfirmed claim is never a receipt.
 
 **Publication is policy-gated, not always-on.** `config.json` carries
 `publication_mode`: `STAGE_ONLY` (the default — audits land in the local
@@ -48,8 +50,11 @@ numbered audit; requires an operator-reviewed shadow pass) or
 ledger, the lock — always stays inside the SAIPAL home; an external sink
 receives the numbered audit file and nothing else.
 
-An unavailable sink is not a lost finding: the audit stages locally, the
-failure is logged, and a later cycle retries.
+An unavailable sink is not a lost finding: the audit stages locally, the failure
+is logged, and the delivery is recorded as **pending** so a later cycle retries it
+before doing new work. Local staging is not delivery — `EMITTED` means the audit
+exists, `delivery: PUBLISHED` means the sink verifiably has it — and a retry
+republishes that exact number and body, never a fresh audit.
 
 ## PAL-AUDIT-03 — minimal evidence, mandatory redaction
 

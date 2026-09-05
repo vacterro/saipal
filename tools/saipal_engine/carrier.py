@@ -30,14 +30,14 @@ from .registry import load_registry, require_mapping, require_string_list
 CARRIER_SCHEMA_KEY = "carrier_schema_version"
 
 
-def unit_digest(record: dict, episode: dict) -> str:
+def unit_digest(record: dict, episode: dict, slice_index: int = 0) -> str:
     """A digest of the evidence identity this unit of work stands on.
 
     Deliberately NOT a digest of the whole carrier: recurrence, calibration and
     open candidates move as unrelated work proceeds, and a digest that changed
     with them would reject every honest submission. What must not change under
     the analyst is the evidence: this session generation, this bundle content,
-    this episode span.
+    this episode span, and which slice of that span was handed over.
     """
     parts = (
         str(record.get("session_id") or ""),
@@ -46,6 +46,7 @@ def unit_digest(record: dict, episode: dict) -> str:
         str(episode.get("index") if episode is not None else ""),
         str(episode.get("start_seq") if episode is not None else ""),
         str(episode.get("end_seq") if episode is not None else ""),
+        str(int(slice_index)),
     )
     return sha256_text("\x00".join(parts))
 
@@ -100,6 +101,9 @@ def semantic_state(record: dict) -> dict:
     its own watermark: a mechanically exhausted session can still owe every one
     of its episodes to the analyst. Conflating the two made `next` idle the
     moment `continue` finished, which is why nothing was ever handed over.
+
+    The position is an episode AND a slice inside it: a long episode is handed
+    over in bounded windows, so the cursor has to name which window comes next.
     """
     raw = record.get("semantic")
     state = raw if isinstance(raw, dict) else {}
@@ -107,13 +111,35 @@ def semantic_state(record: dict) -> dict:
         index = int(state.get("next_episode_index") or 0)
     except (TypeError, ValueError):
         index = 0
+    try:
+        slice_index = int(state.get("next_slice_index") or 0)
+    except (TypeError, ValueError):
+        slice_index = 0
     return {
         "next_episode_index": max(0, index),
+        "next_slice_index": max(0, slice_index),
         "exhausted": bool(state.get("exhausted")),
         "submitted": int(state.get("submitted") or 0),
         "no_drift": int(state.get("no_drift") or 0),
         "provisional": int(state.get("provisional") or 0),
     }
+
+
+def slice_count(events: object, limit: int) -> int:
+    """How many bounded windows an episode of `events` events needs (min 1).
+
+    `events` is the span size: the real one when a bundle is loaded, otherwise
+    the `event_count` an episode recorded at intake. A record written before
+    episodes carried that count reports one slice -- the pre-paging behaviour,
+    which a re-import corrects.
+    """
+    try:
+        total = int(events or 0)
+    except (TypeError, ValueError):
+        total = 0
+    if total <= 0 or limit <= 0:
+        return 1
+    return (total + limit - 1) // limit
 
 
 def _generation(record: dict) -> int:
@@ -142,18 +168,38 @@ def freshest_records(index: dict | None) -> list[dict]:
     return list(best.values())
 
 
-def next_unit(index: dict | None, registry: dict) -> tuple[dict | None, dict | None]:
-    """`(session_record, episode)` for the next SEMANTIC unit, or `(None, None)`.
+def episode_slice_count(record: dict, episode: dict, limit: int) -> int:
+    """How many bounded slices this episode is handed over in."""
+    if episode is None:
+        return 1
+    recorded = episode.get("event_count")
+    if recorded is None:
+        # A record written before episodes carried their span size. Fall back to
+        # the span width, which over-counts skipped sequence numbers but never
+        # hides events behind a slice that is never offered.
+        try:
+            recorded = int(episode.get("end_seq", 0)) - int(episode.get("start_seq", 0)) + 1
+        except (TypeError, ValueError):
+            recorded = 0
+    return slice_count(recorded, limit)
 
-    Freshest-first, matching the intake order, so a carrier follows the same
-    priority the pipeline would. A session in CONFLICT is never handed over:
-    its evidence mutated under an analyzed prefix and the operator owns that.
+
+def next_unit(
+    index: dict | None, registry: dict
+) -> tuple[dict | None, dict | None, int]:
+    """`(session_record, episode, slice_index)` for the next SEMANTIC unit.
+
+    `(None, None, 0)` when nothing is pending. Freshest-first, matching the
+    intake order, so a carrier follows the same priority the pipeline would. A
+    session in CONFLICT is never handed over: its evidence mutated under an
+    analyzed prefix and the operator owns that.
 
     Only the freshest generation of a session is offered. A candidate names a
     session plus an episode index, so offering a superseded generation would hand
     out a unit the submission boundary cannot address -- a loop that refuses every
     reply as stale.
     """
+    limit = _limits(registry)["max_events"]
     ordered = sorted(
         freshest_records(index),
         key=lambda record: (
@@ -174,8 +220,31 @@ def next_unit(index: dict | None, registry: dict) -> tuple[dict | None, dict | N
         start = state["next_episode_index"]
         if start >= len(episodes):
             continue
-        return record, episodes[start]
-    return None, None
+        episode = episodes[start]
+        # The cursor's slice is clamped, never trusted: a re-imported session can
+        # legitimately have fewer slices than the position recorded against its
+        # predecessor, and an unreachable slice would idle the analyst forever.
+        slices = episode_slice_count(record, episode, limit)
+        return record, episode, min(state["next_slice_index"], slices - 1)
+    return None, None, 0
+
+
+def _in_window(entry: dict, episode: dict, window: dict) -> bool:
+    """Is this indexed locator inside the slice the analyst was handed?
+
+    Locators for events it cannot see are not evidence it may reopen: they would
+    invite a citation of something outside its own window.
+    """
+    try:
+        seq = int(entry.get("seq", -1))
+    except (TypeError, ValueError):
+        return False
+    start = window.get("start_seq")
+    end = window.get("end_seq")
+    if start is None or end is None:
+        start = int(episode.get("start_seq", 0))
+        end = int(episode.get("end_seq", 0))
+    return int(start) <= seq <= int(end)
 
 
 def _project(record: dict) -> dict:
@@ -188,7 +257,17 @@ def _runtime(record: dict) -> dict:
     return dict(runtime) if isinstance(runtime, dict) else {}
 
 
-def _episode_events(bundle: dict, episode: dict, limit: int) -> tuple[list[dict], bool]:
+def _episode_events(
+    bundle: dict, episode: dict, limit: int, slice_index: int = 0
+) -> tuple[list[dict], bool, dict]:
+    """One bounded slice of an episode's events, plus that slice's identity.
+
+    A real episode can be hundreds of events long, so a single truncated window
+    made an honest analyst answer INSUFFICIENT_EVIDENCE about almost every live
+    unit: it could see the first `limit` events and nothing else, forever. The
+    span is therefore handed over in consecutive windows, and the slice says
+    which one this is and whether more remain.
+    """
     start = int(episode.get("start_seq", 0))
     end = int(episode.get("end_seq", 0))
     span = [
@@ -196,7 +275,23 @@ def _episode_events(bundle: dict, episode: dict, limit: int) -> tuple[list[dict]
         for event in bundle_mod.events_of(bundle)
         if start <= int(event.get("seq", -1)) <= end
     ]
-    return span[:limit], len(span) > limit
+    total = slice_count(len(span), limit)
+    index = max(0, min(int(slice_index), total - 1))
+    offset = index * limit if limit > 0 else 0
+    window = span[offset : offset + limit] if limit > 0 else list(span)
+    return (
+        window,
+        offset + len(window) < len(span),
+        {
+            "index": index,
+            "count": total,
+            "offset": offset,
+            "span_event_count": len(span),
+            "start_seq": int(window[0]["seq"]) if window else None,
+            "end_seq": int(window[-1]["seq"]) if window else None,
+            "final_slice": index >= total - 1,
+        },
+    )
 
 
 def _signals(episode: dict, bundle: dict, record: dict, registry: dict, limit: int) -> list[dict]:
@@ -343,12 +438,14 @@ def build_carrier(
     index: dict | None = None,
     session_id: str | None = None,
     episode_index: int | None = None,
+    slice_index: int | None = None,
 ) -> dict:
     """One bounded analysis carrier, or the idle carrier. Performs zero writes.
 
     With no target, the next pending semantic unit is chosen. With an explicit
-    `session_id` + `episode_index`, that exact unit is rebuilt -- which is how a
-    submission is checked against the evidence it claims to have reasoned over.
+    `session_id` + `episode_index` (and optionally `slice_index`), that exact unit
+    is rebuilt -- which is how a submission is checked against the evidence it
+    claims to have reasoned over.
     """
     data = registry if registry is not None else load_registry()
     limits = _limits(data)
@@ -366,8 +463,9 @@ def build_carrier(
 
     if session_id is not None and episode_index is not None:
         record, episode = find_unit(index, session_id, int(episode_index))
+        target_slice = int(slice_index or 0)
     else:
-        record, episode = next_unit(index, data)
+        record, episode, target_slice = next_unit(index, data)
     if record is None or episode is None:
         return {
             "schema_version": int(data.get(CARRIER_SCHEMA_KEY, 1)),
@@ -389,14 +487,16 @@ def build_carrier(
         return {
             "schema_version": int(data.get(CARRIER_SCHEMA_KEY, 1)),
             "carrier": kinds["analyze_episodes"],
-            "unit_digest": unit_digest(record, episode),
+            "unit_digest": unit_digest(record, episode, target_slice),
             "session": {"session_id": record.get("session_id"), "source_ref": source_ref},
             "episode": {"index": episode.get("index")},
             "next_action": "saipal continue",
             "note": "the indexed session bundle is absent or unreadable in this home",
         }
 
-    events, truncated = _episode_events(bundle, episode, limits["max_events"])
+    events, truncated, window = _episode_events(
+        bundle, episode, limits["max_events"], target_slice
+    )
     signals = _signals(episode, bundle, record, data, limits["max_signals"])
     law = _applicable_law(episode, record, data, limits["max_rules"])
     rule_ids = list(law.get("rule_ids") or [])
@@ -412,13 +512,13 @@ def build_carrier(
     evidence_refs = [
         entry
         for entry in (record.get("evidence_refs") or [])
-        if int(episode.get("start_seq", 0)) <= int(entry.get("seq", -1)) <= int(episode.get("end_seq", 0))
+        if _in_window(entry, episode, window)
     ][: limits["max_evidence_refs"]]
 
     return {
         "schema_version": int(data.get(CARRIER_SCHEMA_KEY, 1)),
         "carrier": kinds["analyze_episodes"],
-        "unit_digest": unit_digest(record, episode),
+        "unit_digest": unit_digest(record, episode, window["index"]),
         "session": {
             "session_id": record.get("session_id"),
             "generation": record.get("generation"),
@@ -441,6 +541,7 @@ def build_carrier(
             "events_truncated": truncated,
             "finality": episode_finality(record, episode),
         },
+        "slice": window,
         "events": events,
         "evidence_refs": evidence_refs,
         "evidence_command": (

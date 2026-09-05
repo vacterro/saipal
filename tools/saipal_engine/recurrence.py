@@ -48,10 +48,10 @@ def _provider(session: dict) -> str:
     return head or "unknown"
 
 
-def _occurrence(session: dict, finding: dict, *, conformant: bool) -> dict:
+def _occurrence(session: dict, finding: dict, *, conformant: bool, occurrence_id: str = "") -> dict:
     adapter = str(session.get("adapter") or "")
     model = adapter.split(":", 1)[0].strip().lower() or "unknown"
-    return {
+    entry = {
         "session_id": session.get("session_id"),
         "adapter": adapter,
         "provider": _provider(session),
@@ -64,6 +64,12 @@ def _occurrence(session: dict, finding: dict, *, conformant: bool) -> dict:
         "conformant": conformant,
         "imported_at": session.get("imported_at") or "",
     }
+    # An identity for the WRITE, not for the session: a retry after a crash must
+    # be recognizable as the same occurrence rather than counted twice (audit
+    # W2-002). Absent means an unkeyed caller, which stays append-only.
+    if occurrence_id:
+        entry["occurrence_id"] = str(occurrence_id)
+    return entry
 
 
 def empty_recurrence() -> dict:
@@ -104,7 +110,15 @@ def save_recurrence(home: Path | str, data: dict, *, registry=None) -> dict:
     return data
 
 
-def _bump_occurrence(data: dict, finding: dict, session: dict, *, conformant: bool) -> None:
+def _bump_occurrence(
+    data: dict, finding: dict, session: dict, *, conformant: bool, occurrence_id: str = ""
+) -> bool:
+    """Record one occurrence. Returns False when it was already recorded.
+
+    A keyed occurrence is written at most once: the recurrence ledger feeds
+    cross-model conformance rates, so a crashed-then-retried submission counting
+    twice silently changes the numbers a maintainer routes by (audit W2-002).
+    """
     fingerprint = str(finding.get("fingerprint") or finding.get("finding_id")
                       or finding.get("drift_class") or "UNKNOWN")
     entry = data["by_finding"].setdefault(fingerprint, {
@@ -121,30 +135,85 @@ def _bump_occurrence(data: dict, finding: dict, session: dict, *, conformant: bo
     # path, gains its key the first time a real finding supplies one.
     if not entry.get("causal_key") and finding.get("causal_key"):
         entry["causal_key"] = finding["causal_key"]
-    entry["occurrences"].append(_occurrence(session, finding, conformant=conformant))
+    if occurrence_id and any(
+        str(existing.get("occurrence_id") or "") == str(occurrence_id)
+        for existing in entry["occurrences"]
+    ):
+        return False
+    entry["occurrences"].append(
+        _occurrence(session, finding, conformant=conformant, occurrence_id=occurrence_id)
+    )
     for rule in finding.get("rule_ids") or []:
         bucket = data["by_rule"].setdefault(str(rule), {"total": 0, "drift": 0})
         bucket["total"] += 1
         if not conformant:
             bucket["drift"] += 1
+    return True
 
 
-def record_occurrence(home, finding, session, *, registry=None) -> dict:
+def record_occurrence(home, finding, session, *, occurrence_id: str = "", registry=None) -> dict:
     if not isinstance(finding, dict) or not isinstance(session, dict):
         raise PalError("VALIDATION_FAILED", "finding and session must be objects")
     data = load_recurrence(home)
-    _bump_occurrence(data, finding, session, conformant=bool(session.get("conformant", True)))
+    changed = _bump_occurrence(
+        data,
+        finding,
+        session,
+        conformant=bool(session.get("conformant", True)),
+        occurrence_id=occurrence_id,
+    )
+    if not changed:
+        return data
     return save_recurrence(home, data, registry=registry)
 
 
-def record_negative(home, session, *, registry=None) -> dict:
+def record_negative(home, session, *, occurrence_id: str = "", registry=None) -> dict:
     if not isinstance(session, dict):
         raise PalError("VALIDATION_FAILED", "session must be an object")
     data = load_recurrence(home)
-    _bump_occurrence(
+    changed = _bump_occurrence(
         data, {"drift_class": "CONFORMANT", "severity": "P3", "confidence": "HIGH"},
-        session, conformant=True,
+        session, conformant=True, occurrence_id=occurrence_id,
     )
+    if not changed:
+        return data
+    return save_recurrence(home, data, registry=registry)
+
+
+def record_batch(
+    home,
+    session,
+    findings: list[dict],
+    *,
+    occurrence_id: str = "",
+    registry=None,
+) -> dict:
+    """Record every occurrence of one session in ONE ledger transaction.
+
+    The per-finding API loaded, validated, serialized and atomically replaced the
+    whole ledger once per finding: the audit measured 25.8x the cost of a single
+    batched save on a 5,000-occurrence ledger, growing as
+    O(new_findings x ledger_size) (PERF-005). An empty batch writes nothing, and a
+    batch whose every occurrence was already keyed-recorded writes nothing either.
+    """
+    if not isinstance(session, dict):
+        raise PalError("VALIDATION_FAILED", "session must be an object")
+    rows = [finding for finding in (findings or []) if isinstance(finding, dict)]
+    if not rows:
+        return load_recurrence(home)
+    data = load_recurrence(home)
+    changed = False
+    for finding in rows:
+        if _bump_occurrence(
+            data,
+            finding,
+            session,
+            conformant=bool(session.get("conformant", True)),
+            occurrence_id=occurrence_id,
+        ):
+            changed = True
+    if not changed:
+        return data
     return save_recurrence(home, data, registry=registry)
 
 

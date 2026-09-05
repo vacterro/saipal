@@ -13,8 +13,6 @@ race the same audit id.
 from __future__ import annotations
 
 import json
-import os
-import socket
 import time
 import uuid
 from pathlib import Path
@@ -24,6 +22,7 @@ from .errors import PalError
 from .paths import (
     AUDIT_LEDGER_NAME,
     AUDIT_STAGING_DIR,
+    FencedLockFile,
     atomic_write_bytes,
     atomic_write_json,
     home_paths,
@@ -36,6 +35,14 @@ LEDGER_SCHEMA_VERSION = 1
 ENTRIES_NAME = "entries.json"
 AUDIT_LOCK_NAME = "audit_inbox.lock"
 AUDIT_LOCK_TTL_SECONDS = 120
+
+#: Where an audit was written. The entries ledger lives in the SAIPAL home for
+#: BOTH destinations (PAL-AUDIT-02 keeps private bookkeeping local), so the
+#: destination has to be part of the idempotency key: without it a locally staged
+#: audit matched by finding + digest and made the later sink publish a no-op that
+#: returned the local receipt, which is why a restored sink never received the
+#: backlog (audit CORE-007).
+TARGET_LOCAL = "local"
 
 
 def enqueue_operation_id() -> str:
@@ -127,6 +134,16 @@ def allocate_audit_id(
     return next_id
 
 
+def _target_of(entry: dict) -> str:
+    """Where this ledger entry's audit was written.
+
+    An entry recorded before the field existed was written locally: the sink path
+    is newer than the ledger. Defaulting the other way would make a legacy local
+    receipt satisfy a sink publish.
+    """
+    return str(entry.get("target") or TARGET_LOCAL)
+
+
 def _result_of(entry: dict) -> dict:
     return {
         "audit_number": int(entry["audit_number"]),
@@ -137,112 +154,39 @@ def _result_of(entry: dict) -> dict:
 
 
 class AuditInboxLock:
-    """File-based lock protecting audit id allocation + file write + entry recording.
+    """Serializes audit id allocation + file write + entry recording.
 
     T-031: PAL-AUDIT-02 step 1 requires acquiring the audit inbox lock before
     allocating a number. Two concurrent publishers that both read the counter
-    before either writes it would race to the same ``audit/N.md``. This lock
-    serializes the allocate-write-record sequence with stale-takeover semantics
-    matching ``HomeLock``.
+    before either writes it would race to the same ``audit/N.md``.
+
+    T-062: the ownership semantics are `FencedLockFile`'s, shared with
+    ``HomeLock`` and ``SessionLease`` -- a publisher releases only the lock it
+    still owns, so a slow publisher cannot delete its successor's.
     """
 
     def __init__(self, lock_dir: Path, *, ttl: float = AUDIT_LOCK_TTL_SECONDS):
-        self.lock_path = lock_dir / AUDIT_LOCK_NAME
+        self.lock_path = Path(lock_dir) / AUDIT_LOCK_NAME
         self.ttl = ttl
-        self._held = False
-        self.detail = ""
+        self._lock = FencedLockFile(
+            self.lock_path,
+            ttl=ttl,
+            busy_detail="another publisher holds the audit inbox lock",
+        )
 
     @property
     def held(self) -> bool:
-        return self._held
+        return self._lock.held
 
-    def _payload(self) -> bytes:
-        return (
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "host": socket.gethostname(),
-                    "created_at": time.time(),
-                    "owner": uuid.uuid4().hex,
-                },
-                sort_keys=True,
-            )
-            + "\n"
-        ).encode("utf-8")
-
-    def _pid_alive(self, pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if os.name == "nt":
-            try:
-                import ctypes
-                handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-                if handle:
-                    ctypes.windll.kernel32.CloseHandle(handle)
-                    return True
-                return False
-            except Exception:
-                return True
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        except Exception:
-            return True
-        return True
-
-    def _take_over_if_stale(self) -> bool:
-        try:
-            with open(str(self.lock_path), "rb") as handle:
-                raw = handle.read()
-            payload = json.loads(raw.decode("utf-8-sig"))
-            age = time.time() - float(payload.get("created_at", 0))
-            pid = int(payload.get("pid", 0))
-        except (OSError, ValueError, TypeError, KeyError):
-            age, pid = self.ttl + 1, 0
-        if self._pid_alive(pid) and age < self.ttl:
-            return False
-        try:
-            os.unlink(str(self.lock_path))
-            return True
-        except OSError:
-            return False
+    @property
+    def detail(self) -> str:
+        return self._lock.detail
 
     def acquire(self) -> bool:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in (0, 1):
-            try:
-                descriptor = os.open(
-                    str(self.lock_path),
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                    0o600,
-                )
-            except FileExistsError:
-                if attempt == 0 and self._take_over_if_stale():
-                    continue
-                self.detail = "another publisher holds the audit inbox lock"
-                return False
-            except OSError as exc:
-                raise PalError("WRITER_BUSY", f"cannot create audit inbox lock: {exc}") from exc
-            try:
-                os.write(descriptor, self._payload())
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-            self._held = True
-            self.detail = "acquired"
-            return True
-        self.detail = "another publisher holds the audit inbox lock"
-        return False
+        return self._lock.acquire()
 
     def release(self) -> None:
-        if not self._held:
-            return
-        try:
-            os.unlink(str(self.lock_path))
-        except OSError:
-            pass
-        self._held = False
+        self._lock.release()
 
     def __enter__(self) -> AuditInboxLock:
         if not self.acquire():
@@ -266,7 +210,15 @@ def enqueue_audit(
     registry: dict | None = None,
     maintainer_root: Path | None = None,
     private_ledger_home: Path | None = None,
+    reserve_number: int | None = None,
 ) -> dict:
+    """Write one numbered audit to the local staging area or a maintainer sink.
+
+    `reserve_number` publishes an audit that ALREADY has an identity: a delivery
+    retried after a sink outage must arrive as the audit it was staged as, not as
+    a fresh number, or the maintainer receives the same finding twice under two
+    names (audit CORE-007).
+    """
     require_action("enqueue_audit", registry=registry)
 
     finding_id = finding.get("finding_id")
@@ -302,25 +254,56 @@ def enqueue_audit(
         )
     try:
         entries = _read_entries(entries_path)
+        target = TARGET_LOCAL if maintainer_root is None else str(Path(maintainer_root))
 
         for entry in entries:
             if (
                 entry.get("finding_id") == finding_id
                 and entry.get("audit_sha256") == body_sha
+                and _target_of(entry) == target
             ):
-                return _result_of(entry)
+                if not entry.get("pending"):
+                    return _result_of(entry)
+                # An earlier attempt allocated this slot and then stopped. Reuse
+                # its number rather than allocating another: a fresh id would
+                # leave the file it already wrote orphaned in the audit directory
+                # with no ledger entry naming it (audit W2-002).
+                audit_id = int(entry["audit_number"])
+                break
+        else:
+            entry = None
+            audit_id = (
+                int(reserve_number)
+                if reserve_number is not None
+                else allocate_audit_id(
+                    home, maintainer_root,
+                    **({"private_ledger_home": ledger_home} if private_ledger_home is not None else {}),
+                )
+            )
 
-        audit_id = allocate_audit_id(
-            home, maintainer_root,
-            **({"private_ledger_home": ledger_home} if private_ledger_home is not None else {}),
-        )
         final_path = audit_dir / f"{audit_id}.md"
-        if final_path.exists():
+        if entry is None and final_path.exists():
             raise PalError(
                 "VALIDATION_FAILED",
                 f"audit slot {audit_id}.md already exists; refusing to overwrite",
                 next_action="a fresh id will be allocated on the next attempt",
             )
+
+        if entry is None:
+            # The intention is durable BEFORE the file exists, so a crash leaves a
+            # recoverable claim on the slot instead of an unreferenced audit.
+            entry = {
+                "finding_id": finding_id,
+                "audit_number": audit_id,
+                "audit_path": _relative(audit_id, maintainer_root),
+                "audit_sha256": body_sha,
+                "target": target,
+                "enqueue_operation_id": enqueue_operation_id(),
+                "emitted_at": utc_now_iso(),
+                "pending": True,
+            }
+            entries.append(entry)
+            _write_ledger(entries_path, entries)
 
         root = maintainer_root if maintainer_root is not None else home
         payload = audit_body.encode("utf-8")
@@ -332,15 +315,8 @@ def enqueue_audit(
                 "audit file digest does not match the enqueued body",
             )
 
-        entry = {
-            "finding_id": finding_id,
-            "audit_number": audit_id,
-            "audit_path": _relative(audit_id, maintainer_root),
-            "audit_sha256": body_sha,
-            "enqueue_operation_id": enqueue_operation_id(),
-            "emitted_at": utc_now_iso(),
-        }
-        entries.append(entry)
+        entry.pop("pending", None)
+        entry["emitted_at"] = utc_now_iso()
         _write_ledger(entries_path, entries)
         return _result_of(entry)
     finally:
@@ -353,9 +329,23 @@ def verify_audit(path: Path, digest: str) -> bool:
 
 def lookup_receipt(home: Path | str, finding_id: str) -> dict | None:
     for entry in _read_entries(_entries_path(Path(home), None)):
-        if entry.get("finding_id") == finding_id:
+        if entry.get("finding_id") == finding_id and not entry.get("pending"):
             return _result_of(entry)
     return None
+
+
+def incomplete_enqueues(home: Path | str, maintainer_root: Path | None = None) -> list[dict]:
+    """Slots claimed by an attempt that never confirmed its file.
+
+    A pending entry is the recoverable state: the next `enqueue_audit` for the
+    same finding and body reuses the number. Surfacing them is for `doctor` and
+    for an operator asking why an audit directory holds a file nothing references.
+    """
+    return [
+        _result_of(entry)
+        for entry in _read_entries(_entries_path(Path(home), maintainer_root))
+        if entry.get("pending")
+    ]
 
 
 def _relative(audit_id: int, maintainer_root: Path | None) -> str:

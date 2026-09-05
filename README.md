@@ -94,9 +94,10 @@ is therefore *proved* clean rather than merely unaccused.
 
 ## Status
 
-Version 0.4.0. Waves A–I plus the semantic analyst loop (carrier, candidate
-schema, submission boundary, no-drift receipts, coverage) are implemented and
-green: 690 unit tests and 271 validator checks.
+Version 0.4.1. Waves A–I plus the semantic analyst loop (carrier, candidate
+schema, submission boundary, no-drift receipts, coverage, paged episodes,
+sink retry, trigger coalescing) are implemented and green: 949 unit tests and
+273 validator checks.
 
 Publication defaults to `STAGE_ONLY`; `PUBLISH_ENABLED` requires an explicit
 operator-reviewed shadow pass **and** a validated sink root in the same call.

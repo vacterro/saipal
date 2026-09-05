@@ -102,6 +102,12 @@ def import_maintainer_disposition(
     Three checks: the audit exists, the disposition is a known enum value, and
     a rejected audit is recorded as calibration rather than deleted. The new
     link state's audit file is never modified.
+
+    Revisions are APPEND-ONLY. A maintainer who changes their mind is itself
+    calibration evidence -- "rejected, then confirmed after a second look" and
+    "confirmed" teach an analyst different things -- so the superseded verdict
+    moves into `history` instead of being overwritten (audit W2-002). Re-importing
+    the SAME verdict is idempotent and records no history entry.
     """
     require_action("write_own_index")
     if disposition not in DISPOSITIONS:
@@ -127,6 +133,32 @@ def import_maintainer_disposition(
             "VALIDATION_FAILED",
             f"no audit with number {audit_number} is linked",
             next_action="run `saipal continue` to build the link ledger first",
+        )
+
+    proposed = {
+        "disposition": disposition,
+        "fix_version": fix_version,
+        "receipt_id": receipt_id if receipt_id is not None else link.get("receipt_id"),
+        "work_id": work_id if work_id is not None else link.get("work_id"),
+    }
+    unchanged = link.get("disposition") is not None and all(
+        link.get(field) == value for field, value in proposed.items()
+    )
+    if unchanged:
+        return link
+
+    if link.get("disposition") is not None:
+        history = link.get("history")
+        link["history"] = list(history) if isinstance(history, list) else []
+        link["history"].append(
+            {
+                "disposition": link.get("disposition"),
+                "fix_version": link.get("fix_version"),
+                "receipt_id": link.get("receipt_id"),
+                "work_id": link.get("work_id"),
+                "closed_at": link.get("closed_at"),
+                "superseded_at": utc_now_iso(),
+            }
         )
 
     link["disposition"] = disposition

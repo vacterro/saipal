@@ -153,27 +153,65 @@ def save_index(home: Path | str, index: dict, *, registry: dict | None = None) -
 
 
 def find_session(index: dict, session_id: str) -> dict | None:
-    for record in index.get("sessions", []):
-        if record.get("session_id") == session_id:
-            return record
-    return None
+    """The FRESHEST record for a session id, or None.
+
+    One session id legitimately holds several generations, so "the session" is
+    ambiguous unless it names one. It names the newest: a caller asking about a
+    session means the artifact that arrived last. Returning the first match made
+    every generation-aware decision run against generation 1 forever, which is how
+    a re-imported COLD artifact allocated a fresh generation on every poll
+    (audit CORE-002).
+    """
+    return latest_record(index, session_id)
+
+
+def records_for_session(index: dict, session_id: str) -> list[dict]:
+    """Every generation of one session id, oldest generation first."""
+    return sorted(
+        (
+            record
+            for record in (index or {}).get("sessions") or []
+            if record.get("session_id") == session_id
+        ),
+        key=_record_generation,
+    )
+
+
+def latest_record(index: dict, session_id: str) -> dict | None:
+    """The newest generation of one session id, or None."""
+    records = records_for_session(index, session_id)
+    return records[-1] if records else None
+
+
+def _record_generation(record: dict) -> int:
+    try:
+        return int(record.get("generation") or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def latest_generation(index: dict, session_id: str) -> int:
     return max(
-        (
-            int(record.get("generation", 0))
-            for record in index.get("sessions", [])
-            if record.get("session_id") == session_id
-        ),
+        (_record_generation(record) for record in records_for_session(index, session_id)),
         default=0,
     )
 
 
-def already_imported(record: dict, bundle_sha256: str) -> bool:
-    """True when this exact content was ingested before, under any filename."""
+def already_imported(records: dict | list[dict] | None, bundle_sha256: str) -> bool:
+    """True when this exact content was ingested before, under any filename.
+
+    The digest is checked across EVERY generation of the session, not just one
+    record: a digest that produced generation 2 is still "already imported" when
+    the same bytes arrive again, and checking only generation 1 made the index
+    grow by one generation per poll (audit CORE-002).
+    """
+    if records is None:
+        return False
+    candidates = [records] if isinstance(records, dict) else list(records)
     return any(
-        entry.get("sha256") == bundle_sha256 for entry in record.get("imports", [])
+        entry.get("sha256") == bundle_sha256
+        for record in candidates
+        for entry in record.get("imports") or []
     )
 
 
@@ -223,6 +261,7 @@ def new_record(
         "status": "IMPORTED",
         "semantic": {
             "next_episode_index": 0,
+            "next_slice_index": 0,
             "exhausted": False,
             "submitted": 0,
             "no_drift": 0,
@@ -233,7 +272,6 @@ def new_record(
         "imported_at": imported_at,
         "updated_at": imported_at,
         "episodes": episodes,
-        "mechanical_spans": episodes_mod.mechanical_spans(bundle_mod.events_of(bundle)),
         "evidence_refs": [
             {"seq": event["seq"], "evidence_ref": event["evidence_ref"]}
             for event in bundle_mod.events_of(bundle)

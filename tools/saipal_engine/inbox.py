@@ -8,6 +8,7 @@ operator.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,15 +21,95 @@ from .sessions import (
     STATUS_ABSENT,
     STATUS_UNRECOVERABLE,
     already_imported,
-    find_session,
     latest_generation,
     load_index,
     new_record,
+    records_for_session,
     save_index,
     validate_index,
 )
 
 BUNDLE_SUFFIX = ".json"
+
+#: Remembers which inbox file, at which size and mtime, produced which session
+#: and digest. The inbox is a durable forensic archive, not a queue: without this
+#: every cycle re-read, re-validated and re-hashed all 99 retained artifacts to
+#: discover that 95 of them were duplicates it had already skipped -- cost
+#: proportional to all history rather than to new evidence (PERF-002).
+INBOX_CACHE_NAME = "inbox_cache.json"
+INBOX_CACHE_VERSION = 1
+
+
+def _cache_path(root: Path) -> Path:
+    return home_paths(root).root / INBOX_CACHE_NAME
+
+
+def _load_cache(root: Path) -> dict:
+    from .paths import read_json
+
+    path = _cache_path(root)
+    if not path.exists():
+        return {"schema_version": INBOX_CACHE_VERSION, "files": {}}
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {"schema_version": INBOX_CACHE_VERSION, "files": {}}
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != INBOX_CACHE_VERSION
+        or not isinstance(payload.get("files"), dict)
+    ):
+        return {"schema_version": INBOX_CACHE_VERSION, "files": {}}
+    return payload
+
+
+def _save_cache(root: Path, cache: dict, *, registry: dict | None) -> None:
+    from .capability import require_action
+    from .paths import atomic_write_json
+
+    require_action("write_own_cache", registry=registry)
+    atomic_write_json(_cache_path(root), cache, root=home_paths(root).root)
+
+
+def _stat_key(path: Path) -> dict | None:
+    """Size and mtime: cheap, and enough to notice a rewritten artifact.
+
+    Not a substitute for the digest -- the digest is what identity rests on. This
+    only decides whether re-reading the file can be skipped, and any mismatch
+    falls through to a full read.
+    """
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return {"size": int(info.st_size), "mtime_ns": int(info.st_mtime_ns)}
+
+
+def _trustworthy(remembered: object, stat: dict) -> bool:
+    """May this cache entry stand in for reading the file?
+
+    Size and mtime alone are not enough. A file rewritten to the SAME size within
+    the same filesystem mtime tick as the moment the entry was recorded looks
+    identical to the unchanged file, and trusting that would suppress changed
+    evidence -- the exact failure mode CORE-002 and W2-003 were about, reintroduced
+    by a cache. So an entry is only trusted when the file's mtime is strictly
+    older than the observation: anything racy re-reads.
+    """
+    if not isinstance(remembered, dict):
+        return False
+    if remembered.get("size") != stat["size"]:
+        return False
+    if remembered.get("mtime_ns") != stat["mtime_ns"]:
+        return False
+    if not isinstance(remembered.get("session_id"), str):
+        return False
+    if not isinstance(remembered.get("bundle_sha256"), str):
+        return False
+    try:
+        observed_at = int(remembered.get("observed_at") or 0)
+    except (TypeError, ValueError):
+        return False
+    return observed_at > int(stat["mtime_ns"])
 
 
 def inbox_files(home: Path | str) -> list[Path]:
@@ -66,28 +147,60 @@ def import_inbox(
     skipped: list[dict] = []
     rejected: list[dict] = []
     conflicts: list[dict] = []
+    cache = _load_cache(paths.root)
+    cache_files = cache["files"]
+    cache_dirty = False
+    index_dirty = False
 
     for path in inbox_files(paths.root):
         source_ref = f"session_inbox/{path.name}"
+        stat = _stat_key(path)
+        remembered = cache_files.get(path.name)
+        if (
+            stat is not None
+            and _trustworthy(remembered, stat)
+            and already_imported(
+                records_for_session(index, remembered["session_id"]),
+                remembered["bundle_sha256"],
+            )
+        ):
+            # Same bytes as last time, and that content is already indexed. There
+            # is nothing this file can contribute, so it is not read at all.
+            skipped.append({"source_ref": source_ref, "reason": "duplicate digest"})
+            continue
+
         try:
-            bundle = bundle_mod.load_bundle_file(path, registry=data)
+            bundle, bundle_sha256 = bundle_mod.load_bundle_with_digest(
+                path, registry=data
+            )
         except PalError as exc:
             rejected.append(
                 {"source_ref": source_ref, "code": exc.code, "reason": exc.message}
             )
             continue
 
-        bundle_sha256 = bundle_mod.bundle_digest(bundle)
         session_id = bundle["session_id"]
-        existing = find_session(index, session_id)
+        if stat is not None:
+            cache_files[path.name] = {
+                **stat,
+                "session_id": session_id,
+                "bundle_sha256": bundle_sha256,
+                "observed_at": time.time_ns(),
+            }
+            cache_dirty = True
+        generations = records_for_session(index, session_id)
+        existing = generations[-1] if generations else None
 
         if existing is None:
             record = _create(index, bundle, source_ref, path, bundle_sha256, timestamp, data, authority=authority)
             index["sessions"].append(record)
             imported.append(_report(record, "new-session"))
+            index_dirty = True
             continue
 
-        if already_imported(existing, bundle_sha256):
+        # Dedupe BEFORE any generation decision, and across every generation:
+        # a digest that already produced generation 2 must not produce a third.
+        if already_imported(generations, bundle_sha256):
             skipped.append({"source_ref": source_ref, "reason": "duplicate digest"})
             continue
 
@@ -95,15 +208,22 @@ def import_inbox(
             record = _create(index, bundle, source_ref, path, bundle_sha256, timestamp, data, authority=authority)
             index["sessions"].append(record)
             imported.append(_report(record, "new-generation"))
+            index_dirty = True
             continue
 
         outcome = _extend_hot(existing, bundle, source_ref, path, bundle_sha256, timestamp, data)
+        index_dirty = True
         if outcome["conflict"]:
             conflicts.append(outcome["entry"])
         else:
             imported.append(outcome["entry"])
 
-    save_index(paths.root, index, registry=data)
+    # An unchanged inbox is a no-op: rewriting the session index after a pass that
+    # decided nothing was the same amplification (PERF-002/PERF-004).
+    if index_dirty:
+        save_index(paths.root, index, registry=data)
+    if cache_dirty:
+        _save_cache(paths.root, cache, registry=data)
 
     return {
         "imported": imported,
@@ -189,7 +309,7 @@ def _extend_hot(
     record["prefix_sha256"] = observed_prefix
     record["updated_at"] = timestamp
     record["episodes"] = episodes_mod.extract_episodes(events, registry=registry)
-    record["mechanical_spans"] = episodes_mod.mechanical_spans(events)
+    record.pop("mechanical_spans", None)
     record["evidence_refs"] = [
         {"seq": event["seq"], "evidence_ref": event["evidence_ref"]}
         for event in events

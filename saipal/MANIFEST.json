@@ -69,6 +69,7 @@
     "saipal_engine/adapters/jsonl_evidence.py",
     "saipal_engine/config.py",
     "saipal_engine/dispatcher.py",
+    "saipal_engine/publications.py",
     "saipal_engine/sink.py"
   ]
 }

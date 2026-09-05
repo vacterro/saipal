@@ -285,7 +285,7 @@ class EpisodeScope(CandidateBase):
     def test_an_event_outside_the_span_is_refused(self) -> None:
         payload = _drift(self.carrier)
         payload["event_refs"] = [self.carrier["episode"]["end_seq"] + 500]
-        self.assertTrue(any("outside the episode span" in p for p in self.scope(payload)))
+        self.assertTrue(any("outside the slice span" in p for p in self.scope(payload)))
 
     def test_an_idle_carrier_has_no_unit_to_answer(self) -> None:
         idle = {"carrier": "idle", "session": None}

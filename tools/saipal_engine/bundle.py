@@ -71,8 +71,15 @@ def _longest_string(node: Any) -> int:
     return 0
 
 
-def validate_bundle(payload: object, *, registry: dict | None = None) -> list[str]:
-    """Every reason this bundle is unusable, or an empty list."""
+def validate_bundle(
+    payload: object, *, registry: dict | None = None, digest: str | None = None
+) -> list[str]:
+    """Every reason this bundle is unusable, or an empty list.
+
+    `digest` lets a caller that already canonicalized the document pass it in.
+    Recomputing it here AND in the caller meant two canonical serializations plus
+    two SHA-256 passes over every inbox file, every cycle (PERF-002).
+    """
     spec = _spec(registry)
     if not isinstance(payload, dict):
         return ["bundle root is not an object"]
@@ -127,7 +134,7 @@ def validate_bundle(payload: object, *, registry: dict | None = None) -> list[st
     if declared is not None:
         if not isinstance(declared, str):
             problems.append("session_sha256 must be a string or null")
-        elif declared != bundle_digest(payload):
+        elif declared != (digest if digest is not None else bundle_digest(payload)):
             problems.append("session_sha256 does not match the bundle content")
 
     if "events" in payload:
@@ -226,9 +233,11 @@ def _validate_events(events: object, spec: dict) -> list[str]:
     return problems
 
 
-def parse_bundle(payload: object, *, registry: dict | None = None) -> dict:
+def parse_bundle(
+    payload: object, *, registry: dict | None = None, digest: str | None = None
+) -> dict:
     """Validate and return the bundle, or raise `PalError(BUNDLE_INVALID)`."""
-    problems = validate_bundle(payload, registry=registry)
+    problems = validate_bundle(payload, registry=registry, digest=digest)
     if problems:
         raise PalError(
             "BUNDLE_INVALID",
@@ -239,9 +248,14 @@ def parse_bundle(payload: object, *, registry: dict | None = None) -> dict:
     return payload
 
 
-def load_bundle_file(path: Path | str, *, registry: dict | None = None) -> dict:
-    """Read one inbox file. Unreadable is `INBOX_UNREADABLE`, malformed is
-    `BUNDLE_INVALID` -- the two mean different things to whoever exported it."""
+def load_bundle_with_digest(
+    path: Path | str, *, registry: dict | None = None
+) -> tuple[dict, str]:
+    """`(bundle, content_digest)` from one inbox file, canonicalized ONCE.
+
+    Intake needs both the validated bundle and its digest; asking for them
+    separately serialized every bundle twice (PERF-002).
+    """
     target = Path(path)
     try:
         payload = read_json(target)
@@ -251,7 +265,15 @@ def load_bundle_file(path: Path | str, *, registry: dict | None = None) -> dict:
         ) from exc
     except ValueError as exc:
         raise PalError("BUNDLE_INVALID", f"{target.name} is not valid JSON: {exc}") from exc
-    return parse_bundle(payload, registry=registry)
+    digest = bundle_digest(payload) if isinstance(payload, dict) else ""
+    return parse_bundle(payload, registry=registry, digest=digest), digest
+
+
+def load_bundle_file(path: Path | str, *, registry: dict | None = None) -> dict:
+    """Read one inbox file. Unreadable is `INBOX_UNREADABLE`, malformed is
+    `BUNDLE_INVALID` -- the two mean different things to whoever exported it."""
+    bundle, _digest = load_bundle_with_digest(path, registry=registry)
+    return bundle
 
 
 def events_of(bundle: dict) -> list[dict]:

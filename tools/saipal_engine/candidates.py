@@ -138,6 +138,16 @@ def candidate_problems(candidate: object, *, registry: dict | None = None) -> li
     elif episode_index < 0:
         problems.append("episode_index must not be negative")
 
+    # A long episode is handed over in bounded slices, so a candidate may name
+    # which slice it answers. Absent means the first one, which is what a
+    # single-slice episode has always been.
+    slice_index = candidate.get("slice_index")
+    if slice_index is not None:
+        if not isinstance(slice_index, int) or isinstance(slice_index, bool):
+            problems.append("slice_index must be an integer")
+        elif slice_index < 0:
+            problems.append("slice_index must not be negative")
+
     disposition = candidate.get("disposition_class")
     if disposition not in dispositions:
         problems.append(
@@ -303,6 +313,7 @@ def episode_scope_problems(
 
     session = carrier.get("session") or {}
     episode = carrier.get("episode") or {}
+    window = carrier.get("slice") or {}
     if candidate.get("session_id") != session.get("session_id"):
         problems.append(
             f"candidate session {candidate.get('session_id')!r} is not the carrier's "
@@ -313,19 +324,31 @@ def episode_scope_problems(
             f"candidate episode {candidate.get('episode_index')!r} is not the carrier's "
             f"episode {episode.get('index')!r}"
         )
+    claimed_slice = candidate.get("slice_index")
+    if claimed_slice is not None and window:
+        if int(claimed_slice) != int(window.get("index", 0)):
+            problems.append(
+                f"candidate slice {claimed_slice!r} is not the carrier's slice "
+                f"{window.get('index')!r}"
+            )
     if candidate.get("unit_digest") != carrier.get("unit_digest"):
         problems.append(
             "unit_digest does not match the carrier; the evidence changed under "
             "the analyst and the reasoning is stale"
         )
 
-    start = episode.get("start_seq")
-    end = episode.get("end_seq")
+    # Events are checked against the SLICE, not the whole episode: citing an
+    # event the analyst was never shown is a claim about evidence it did not read.
+    start = window.get("start_seq") if window else None
+    end = window.get("end_seq") if window else None
+    if start is None or end is None:
+        start = episode.get("start_seq")
+        end = episode.get("end_seq")
     if isinstance(start, int) and isinstance(end, int):
         for ref in candidate.get("event_refs") or []:
             if isinstance(ref, int) and not (start <= ref <= end):
                 problems.append(
-                    f"event_refs {ref} lies outside the episode span {start}-{end}"
+                    f"event_refs {ref} lies outside the slice span {start}-{end}"
                 )
 
     # PAL-ANALYSIS-02: a DRIFT claim must answer every mitigation the evidence

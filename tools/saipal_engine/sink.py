@@ -23,13 +23,14 @@ class AuditSink:
             return {"ok": False, "reason": "sink audit manifest is missing"}
         return {"ok": True, "root": str(self.root), "audit_dir": str(self.audit_dir)}
 
-    def publish(self, finding: dict, body: str) -> dict:
+    def publish(self, finding: dict, body: str, *, reserve_number: int | None = None) -> dict:
         result = self.preflight()
         if not result["ok"]:
             raise PalError("SINK_UNAVAILABLE", result["reason"], next_action="keep audit staged and retry")
         return enqueue.enqueue_audit(
             self.home, finding, body, maintainer_root=self.root,
             private_ledger_home=self.home,
+            reserve_number=reserve_number,
         )
 
     def verify(self, result: dict) -> bool:

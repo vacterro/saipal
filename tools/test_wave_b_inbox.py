@@ -152,8 +152,13 @@ class InboxImport(unittest.TestCase):
 
         self.assertEqual(payload["intake"]["conflicts"], [])
         record = support.sessions_of(self.home)[0]
+        # The extended fixture ends ON a boundary (`PHASE_CHANGE` at seq 5).
+        # This assertion used to expect 4, which was the T-71 defect showing
+        # through the oracle: `extract_episodes` emitted no episode for a final
+        # boundary event, so seq 5 was analyzed by nobody and the watermark
+        # stopped one event short of the evidence. 5 is the whole span.
         self.assertEqual(
-            record["last_analyzed_seq"], 4,
+            record["last_analyzed_seq"], 5,
             "a safe append-only extension must re-analyze the new tail",
         )
         self.assertEqual(record["event_count"], 5)

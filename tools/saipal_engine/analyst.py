@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .detectors import detect_for_episode
+from .detectors import EventIndex, detect_for_episode, event_index
 from .registry import load_registry
 
 
@@ -205,13 +205,25 @@ def classify_candidate(
 
 
 def contrary_evidence_pass(
-    candidate: dict, bundle: dict, episode: dict
+    candidate: dict, bundle: dict, episode: dict, index: EventIndex | None = None
 ) -> dict:
+    """Mitigating facts visible up to the end of this episode.
+
+    Bounded by the episode, so it reads that span rather than the whole bundle:
+    rescanning the full event stream once per candidate was the second half of
+    PERF-001's quadratic cost.
+    """
     refs = [int(seq) for seq in (candidate.get("event_refs") or [])]
     lower = max(refs) if refs else -1
     end_seq = int(episode.get("end_seq", -1)) if isinstance(episode, dict) else -1
     findings: list[str] = []
-    events = list(bundle.get("events") or []) if isinstance(bundle, dict) else []
+    if not isinstance(bundle, dict):
+        events: list[dict] = []
+    elif end_seq >= 0:
+        view = event_index(bundle, index)
+        events = view.span(view.events[0].get("seq", 0) if view.events else 0, end_seq)
+    else:
+        events = event_index(bundle, index).all()
 
     for event in events:
         seq = int(event.get("seq", -1))
@@ -248,12 +260,14 @@ def analyze_episode(
     detector_candidates: list[dict] | None = None,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> list[dict]:
     data = registry if registry is not None else load_registry()
+    view = event_index(bundle, index) if isinstance(bundle, dict) else None
     raw = (
         list(detector_candidates)
         if detector_candidates is not None
-        else detect_for_episode(episode, bundle, session_record, registry=data)
+        else detect_for_episode(episode, bundle, session_record, registry=data, index=view)
     )
     refined: list[dict] = []
     for candidate in raw:
@@ -264,6 +278,6 @@ def analyze_episode(
         )
         merged = dict(candidate)
         merged.update(classified)
-        merged = contrary_evidence_pass(merged, bundle, episode)
+        merged = contrary_evidence_pass(merged, bundle, episode, view)
         refined.append(merged)
     return refined

@@ -8,6 +8,7 @@ closed registry, never against prose.
 
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from typing import Any
 
 from .episodes import ACTIVE_WORK_KEYS, TERMINAL_KIND
@@ -90,18 +91,67 @@ _LEGAL_PHASE_EDGES: frozenset[tuple[str, str]] = frozenset(
 _TERMINAL_KINDS = frozenset({TERMINAL_KIND, "terminal_task", "session_end"})
 
 
+class EventIndex:
+    """One ordered view of a bundle's events, built once per analysis pass.
+
+    Every detector needs the events of one episode, and four of the five used to
+    rebuild that slice by copying and filtering the WHOLE bundle -- per detector,
+    per episode. With episodes growing alongside events that is quadratic: the
+    audit measured a 4x cost per doubling on a live index of 49,546 events and
+    14,785 episodes (PERF-001).
+
+    The events are already in `seq` order (the bundle schema requires strictly
+    increasing seq), so a span is a bisect and a slice: no copy, no scan.
+    """
+
+    __slots__ = ("events", "_seqs", "_spans")
+
+    def __init__(self, bundle: dict):
+        self.events: list[dict] = list(bundle.get("events") or [])
+        self._seqs: list[int] = [int(event.get("seq", -1)) for event in self.events]
+        self._spans: dict[tuple[int, int], list[dict]] = {}
+
+    def all(self) -> list[dict]:
+        return self.events
+
+    def span(self, start: int, end: int) -> list[dict]:
+        """The events with `start <= seq <= end`, memoized per span."""
+        key = (int(start), int(end))
+        cached = self._spans.get(key)
+        if cached is not None:
+            return cached
+        lo = bisect_left(self._seqs, key[0])
+        hi = bisect_right(self._seqs, key[1])
+        window = self.events[lo:hi]
+        self._spans[key] = window
+        return window
+
+    def first_after(self, seq: int, predicate) -> dict | None:
+        """The first event after `seq` satisfying `predicate`, or None.
+
+        Bounded by the tail rather than the whole stream, and it stops at the
+        first hit: `any(... for event in all_events)` re-walked the entire bundle
+        for every work switch.
+        """
+        for event in self.events[bisect_right(self._seqs, int(seq)):]:
+            if predicate(event):
+                return event
+        return None
+
+
+def event_index(bundle: dict, index: EventIndex | None = None) -> EventIndex:
+    """The caller's index, or a fresh one. Lets every detector accept either."""
+    return index if index is not None else EventIndex(bundle)
+
+
 def _events(bundle: dict) -> list[dict]:
     return list(bundle.get("events") or [])
 
 
-def _span(bundle: dict, episode: dict) -> list[dict]:
-    start = int(episode["start_seq"])
-    end = int(episode["end_seq"])
-    return [
-        event
-        for event in _events(bundle)
-        if start <= int(event["seq"]) <= end
-    ]
+def _span(bundle: dict, episode: dict, index: EventIndex | None = None) -> list[dict]:
+    return event_index(bundle, index).span(
+        int(episode["start_seq"]), int(episode["end_seq"])
+    )
 
 
 def _active_work(event: dict) -> Any:
@@ -192,11 +242,12 @@ def detect_command_route(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> dict | None:
     known = _known_commands(registry)
     if not known:
         return None
-    for event in _span(bundle, episode):
+    for event in _span(bundle, episode, index):
         if event.get("type") != "COMMAND":
             continue
         facts = event.get("facts") or {}
@@ -229,8 +280,9 @@ def detect_phase_illegality(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> dict | None:
-    for event in _span(bundle, episode):
+    for event in _span(bundle, episode, index):
         if event.get("type") != "PHASE_CHANGE":
             continue
         facts = event.get("facts") or {}
@@ -261,8 +313,10 @@ def detect_active_work_preemption(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> dict | None:
-    spans = _span(bundle, episode)
+    view = event_index(bundle, index)
+    spans = _span(bundle, episode, view)
     if not spans:
         return None
 
@@ -286,14 +340,14 @@ def detect_active_work_preemption(
 
     seq_set = {int(event["seq"]) for event in spans}
     for switch_seq, prev, new in work_switches:
-        terminal_follows = any(
-            int(event["seq"]) > switch_seq
-            and (
-                event.get("type") == "SESSION_BOUNDARY"
-                or (event.get("type") == "PHASE_CHANGE" and (event.get("facts") or {}).get("to_phase") == "IDLE")
-            )
-            for event in _events(bundle)
-        )
+        terminal_follows = view.first_after(
+            switch_seq,
+            lambda event: event.get("type") == "SESSION_BOUNDARY"
+            or (
+                event.get("type") == "PHASE_CHANGE"
+                and (event.get("facts") or {}).get("to_phase") == "IDLE"
+            ),
+        ) is not None
         if terminal_follows:
             continue
         if switch_seq + 1 in seq_set or any(
@@ -320,8 +374,9 @@ def detect_false_continue_idle(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> dict | None:
-    spans = _span(bundle, episode)
+    spans = _span(bundle, episode, index)
     if not spans:
         return None
 
@@ -368,8 +423,10 @@ def detect_source_closure_false_green(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> dict | None:
-    spans = _span(bundle, episode)
+    view = event_index(bundle, index)
+    spans = _span(bundle, episode, view)
     if not spans:
         return None
 
@@ -386,11 +443,10 @@ def detect_source_closure_false_green(
         return None
 
     last_source_seq = int(last_source["seq"])
-    has_closure = any(
-        int(event["seq"]) > last_source_seq
-        and event.get("type") in {"SESSION_BOUNDARY", "PHASE_CHANGE"}
-        for event in _events(bundle)
-    )
+    has_closure = view.first_after(
+        last_source_seq,
+        lambda event: event.get("type") in {"SESSION_BOUNDARY", "PHASE_CHANGE"},
+    ) is not None
     if has_closure:
         return None
 
@@ -415,13 +471,22 @@ def detect_all(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> list[dict]:
+    """Run every registered detector over one episode.
+
+    The event index is built once here and shared, so five detectors cost one
+    span resolution instead of five full-bundle scans (PERF-001). A caller
+    analyzing many episodes of one bundle passes its own index and pays once for
+    the whole session.
+    """
+    view = event_index(bundle, index)
     candidates: list[dict] = []
     for name in DETECTOR_REGISTRY:
         detector = globals().get(name)
         if detector is None:
             continue
-        result = detector(episode, bundle, session_record, registry=registry)
+        result = detector(episode, bundle, session_record, registry=registry, index=view)
         if result is not None:
             candidates.append(result)
     return candidates
@@ -433,5 +498,6 @@ def detect_for_episode(
     session_record: dict,
     *,
     registry: dict | None = None,
+    index: EventIndex | None = None,
 ) -> list[dict]:
-    return detect_all(episode, bundle, session_record, registry=registry)
+    return detect_all(episode, bundle, session_record, registry=registry, index=index)

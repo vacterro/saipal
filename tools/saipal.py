@@ -22,6 +22,7 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import json  # noqa: E402
+import os  # noqa: E402
 
 from saipal_engine.commands import (  # noqa: E402
     Options,
@@ -37,7 +38,7 @@ from saipal_engine.dispatcher import dispatch_sources  # noqa: E402
 from saipal_engine.config import load_config, save_config, default_config  # noqa: E402
 from saipal_engine.sink import configured_sink  # noqa: E402
 from saipal_engine.closedloop import import_disposition_file  # noqa: E402
-from saipal_engine.log import append_event, read_events  # noqa: E402
+from saipal_engine.log import append_event, log_stats  # noqa: E402
 from saipal_engine.sessions import (  # noqa: E402
     STATUS_UNRECOVERABLE as INDEX_UNRECOVERABLE,
 )
@@ -87,6 +88,39 @@ def version_text() -> str:
 # --------------------------------------------------------------------------- #
 
 
+def _claim_trigger(home: Path) -> bool:
+    """Take ownership of the pending run request, if there is one.
+
+    The token is renamed rather than read: a rename is atomic, so two cycles
+    cannot both claim one trigger, and a trigger written after this instant stays
+    pending for the next cycle. A claim left by a crashed cycle is adopted here
+    rather than deleted unexamined -- the request was acknowledged, so it is owed
+    a run (audit CORE-010).
+    """
+    paths = home_paths(home)
+    if paths.trigger_claim.exists():
+        return True
+    if not paths.trigger.exists():
+        return False
+    try:
+        os.replace(str(paths.trigger), str(paths.trigger_claim))
+    except OSError:
+        # Another cycle claimed it first, or the token vanished. Either way this
+        # cycle owns nothing and must not delete anything.
+        return paths.trigger_claim.exists()
+    return True
+
+
+def _release_trigger(home: Path) -> None:
+    """Consume only the claim this cycle owns."""
+    claim = home_paths(home).trigger_claim
+    if claim.exists():
+        try:
+            os.unlink(str(claim))
+        except OSError:
+            pass
+
+
 def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
     """One bounded analysis cycle — extracted for --drain reuse."""
     status, state, detail = load_state(home, registry=registry)
@@ -101,6 +135,13 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         )
 
     created = ensure_home(home, registry=registry)
+
+    # Claim the trigger present RIGHT NOW, before any work. A request arriving
+    # later in this cycle must survive it: deleting whatever trigger.json exists
+    # at the end of the cycle acknowledged a trigger and then discarded it
+    # without ever running for it (audit CORE-010).
+    trigger_claimed = _claim_trigger(home)
+
     index_status, session_index, index_detail = load_index(home, registry=registry)
     if index_status == INDEX_UNRECOVERABLE:
         raise PalError(
@@ -137,6 +178,11 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         )
 
     from saipal_engine.pipeline import analyze_sessions
+    from saipal_engine.publications import retry_pending
+
+    # A restored sink receives the backlog BEFORE anything new is produced:
+    # an undelivered audit is older evidence than whatever this cycle finds.
+    republished = retry_pending(home, registry=registry)
 
     analysis = {"sessions_analyzed": 0, "events_analyzed": 0,
                 "findings_created": 0, "findings_rejected": 0,
@@ -162,9 +208,9 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
     state["last_checkpoint"] = utc_now_iso()
     state["next_action"] = _continue_next_action(intake, enabled, analysis)
 
-    trigger_path = home_paths(home).root / "trigger.json"
-    if trigger_path.exists():
-        trigger_path.unlink(missing_ok=True)
+    # Only the claim this cycle owns is consumed. A trigger written while the
+    # cycle ran is still sitting in trigger.json, pending for the next one.
+    _release_trigger(home)
 
     append_event(
         home, "cycle", data={
@@ -177,6 +223,8 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
             "candidates": candidates,
             "findings_rejected": analysis["findings_rejected"],
             "audits_emitted": audits_emitted, "created": created,
+            "trigger_claimed": trigger_claimed,
+            "republished": republished["published"],
         }, registry=registry,
     )
     save_state(home, state, registry=registry)
@@ -192,6 +240,8 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         "candidates": candidates,
         "findings_rejected": analysis["findings_rejected"],
         "audits_emitted": audits_emitted,
+        "trigger_claimed": trigger_claimed,
+        "publication_retry": republished,
         "next_action": state["next_action"],
     }
 
@@ -587,19 +637,24 @@ def cmd_disposition(home: Path, registry: dict, args: list[str]) -> tuple[int, d
 
 
 def cmd_trigger(home: Path, registry: dict) -> tuple[int, dict]:
-    """Register one pending run; multiple rapid triggers coalesce into one."""
-    from saipal_engine import hardening as hard
+    """Register one pending run; multiple rapid triggers coalesce into one.
+
+    Coalescing is against the PENDING token only. A cycle in flight has already
+    renamed its own token away, so a trigger arriving now is a request for the
+    NEXT cycle and must be recorded rather than absorbed into a run that will
+    never see it (audit CORE-010).
+    """
     from saipal_engine.paths import atomic_write_json
 
-    pending_path = home_paths(home).root / "trigger.json"
-    if pending_path.exists():
+    paths = home_paths(home)
+    if paths.trigger.exists():
         return EXIT_OK, {
             "ok": True,
             "command": "trigger",
             "coalesced": True,
             "message": "a run is already pending; this trigger was coalesced",
         }
-    atomic_write_json(pending_path, {"pending": True}, root=home_paths(home).root)
+    atomic_write_json(paths.trigger, {"pending": True}, root=paths.root)
     return EXIT_OK, {"ok": True, "command": "trigger", "coalesced": False, "message": "run scheduled"}
 
 
@@ -640,11 +695,14 @@ def _load_read_only(home: Path, registry: dict) -> dict:
         )
 
     records = index["sessions"] if index else []
-    events, malformed = read_events(home)
+    # Two scalars, streamed: `read_events` decoded and retained the lifetime log
+    # to answer them (PERF-006).
+    log_events, malformed = log_stats(home)
     paths = home_paths(home)
     assert state is not None
     return {
         "ok": True,
+        "_session_index": index,
         "home": str(paths.root),
         "phase": state["phase"],
         "current_session": state["current_session"],
@@ -661,7 +719,7 @@ def _load_read_only(home: Path, registry: dict) -> dict:
         "sessions_conflict": sum(1 for r in records if r["status"] == "CONFLICT"),
         "events_indexed": sum(int(r["event_count"]) for r in records),
         "episodes": sum(len(r["episodes"]) for r in records),
-        "log_events": len(events),
+        "log_events": log_events,
         "malformed_log_lines": malformed,
     }
 
@@ -674,9 +732,11 @@ def cmd_status(home: Path, registry: dict) -> tuple[int, dict]:
 
     # Semantic progress is reported from receipts, not from the watermark flag:
     # a cursor that ran off the end and a session that was actually judged look
-    # identical to `exhausted`, and only one of them is real work.
-    index_status, index, _detail = load_index(home, registry=registry)
-    result["semantic"] = coverage(home, index if index_status == "ok" else None)
+    # identical to `exhausted`, and only one of them is real work. The index the
+    # read-only load already parsed is reused: loading an 11 MB index twice for
+    # one command was measurable on its own (PERF-004).
+    index = result.pop("_session_index", None)
+    result["semantic"] = coverage(home, index, registry=registry)
     return EXIT_OK, result
 
 
@@ -770,7 +830,9 @@ def _verdict(reported: list[dict], coverage: dict, sessions: int) -> str:
 
     "No drift" is only meaningful beside how much was actually judged: a report
     that says clean while every episode is still pending is reporting its own
-    idleness. So an unexamined home says so instead.
+    idleness. So an unexamined home says so instead. A paged episode counts as
+    examined once any slice of it has a final verdict -- partial work is still
+    work, and the slice counts beside the verdict say how much.
     """
     if not sessions:
         return VERDICT_NO_EVIDENCE
@@ -778,7 +840,7 @@ def _verdict(reported: list[dict], coverage: dict, sessions: int) -> str:
         return VERDICT_DRIFT_REPORTED
     if reported:
         return VERDICT_DRIFT_SUSPECTED
-    if int(coverage.get("episodes_final") or 0) == 0:
+    if int(coverage.get("slices_final") or 0) == 0:
         return VERDICT_NOT_EXAMINED
     return VERDICT_NO_DRIFT_SO_FAR
 
@@ -789,8 +851,13 @@ def _report_next_action(verdict: str, coverage: dict, counts: dict) -> str:
     A next action that says "hand the audit(s) to the maintainer" when nothing was
     emitted is worse than no advice: it invites the reader to look for a file that
     does not exist.
+
+    The remainder is counted in SLICES as well as episodes: a paged episode with
+    two of five slices judged is neither pending nor final, so an episode-only
+    remainder would quietly stop pointing at the work that is left.
     """
     pending = int(coverage.get("episodes_pending") or 0)
+    slices_left = int(coverage.get("slices_pending") or 0)
     if verdict == VERDICT_DRIFT_REPORTED:
         return "hand the emitted audit(s) to the SAIPEN Core maintainer"
     if verdict == VERDICT_DRIFT_SUSPECTED:
@@ -800,6 +867,8 @@ def _report_next_action(verdict: str, coverage: dict, counts: dict) -> str:
         )
     if pending:
         return f"saipal continue -- {pending} episode(s) are still unexamined"
+    if slices_left:
+        return f"saipal continue -- {slices_left} episode slice(s) are still unexamined"
     return "saipal continue"
 
 
@@ -809,9 +878,10 @@ def cmd_report(home: Path, registry: dict) -> tuple[int, dict]:
     from saipal_engine.findings import load_index as load_findings
 
     base = _load_read_only(home, registry)
-    index_status, index, _detail = load_index(home, registry=registry)
-    records = list((index or {}).get("sessions") or []) if index_status == "ok" else []
-    coverage = coverage_of(home, index if index_status == "ok" else None)
+    # Reuse the index the read-only load already parsed (PERF-004).
+    index = base.pop("_session_index", None)
+    records = list((index or {}).get("sessions") or [])
+    coverage = coverage_of(home, index, registry=registry)
 
     findings_status, findings_index, findings_detail = load_findings(home, registry=registry)
     if findings_status == "unrecoverable":
@@ -856,6 +926,7 @@ def cmd_report(home: Path, registry: dict) -> tuple[int, dict]:
 
 def cmd_next(home: Path, registry: dict) -> tuple[int, dict]:
     result = _load_read_only(home, registry)
+    session_index = result.pop("_session_index", None)
     (
         idle,
         resume_session,
@@ -867,12 +938,13 @@ def cmd_next(home: Path, registry: dict) -> tuple[int, dict]:
 
     # The analysis carrier (PAL-ANALYSIS-01) is built first, because only it can
     # answer whether indexed sessions actually contain pending analysis work.
-    # Building it is read-only, so `next` keeps its PAL-CMD-02 contract.
+    # Building it is read-only, so `next` keeps its PAL-CMD-02 contract. The
+    # already-parsed index is handed over rather than re-read (PERF-004).
     unit = None
     if result["sessions"]:
         from saipal_engine.carrier import build_carrier
 
-        unit = build_carrier(home, registry=registry)
+        unit = build_carrier(home, registry=registry, index=session_index)
 
     carrier = idle
     if result["current_session"]:
@@ -958,6 +1030,13 @@ def render_human(result: dict) -> str:
                 f"{semantic['episodes_pending']} pending, "
                 f"{semantic['sessions_truly_exhausted']} session(s) complete"
             )
+            # A long episode is judged slice by slice, so the slice line is the
+            # honest unit of progress: 1 of 5 slices judged is not a judged episode.
+            lines.append(
+                "slices: "
+                f"{semantic.get('slices_final', 0)}/{semantic.get('slices_total', 0)} judged, "
+                f"{semantic.get('slices_pending', 0)} pending"
+            )
             if semantic.get("cursor_claims_more_than_receipts"):
                 lines.append(
                     "semantic_discrepancy: "
@@ -977,6 +1056,8 @@ def render_human(result: dict) -> str:
             f"judged: {coverage.get('episodes_final', 0)}/{coverage.get('episodes_total', 0)} "
             f"episodes, {coverage.get('episodes_provisional', 0)} provisional, "
             f"{coverage.get('episodes_pending', 0)} pending",
+            f"slices: {coverage.get('slices_final', 0)}/{coverage.get('slices_total', 0)} "
+            f"judged, {coverage.get('slices_pending', 0)} pending",
             f"findings: {counts.get('total', 0)} "
             f"(emitted {counts.get('emitted', 0)}, qualified {counts.get('qualified', 0)}, "
             f"blocked {counts.get('blocked', 0)}, held {counts.get('held_provisional', 0)})",
@@ -1031,6 +1112,7 @@ def render_human(result: dict) -> str:
         if unit:
             session = unit["session"]
             episode = unit["episode"]
+            window = unit.get("slice") or {}
             law = unit.get("applicable_law") or {}
             surface = unit.get("historical_rule_surface") or {}
             defences = [entry.get("code") for entry in unit.get("defence_surface") or []]
@@ -1044,6 +1126,12 @@ def render_human(result: dict) -> str:
                 f"({episode['event_count']} ev"
                 + (", truncated" if episode.get("events_truncated") else "")
                 + f") {episode.get('finality', 'FINAL')}",
+                # A paged episode is judged slice by slice, so which slice this is
+                # decides what the analyst may cite and when the episode closes.
+                f"slice: {window.get('index', 0) + 1}/{window.get('count', 1)} "
+                f"seq {window.get('start_seq', '-')}-{window.get('end_seq', '-')} "
+                f"of {window.get('span_event_count', episode['event_count'])} ev"
+                + ("" if window.get("final_slice", True) else ", more remain"),
                 f"binding: {unit['protocol']['binding_status']} / "
                 f"{unit['protocol']['proof_level']} "
                 f"claimable={unit['protocol']['violation_claimable']}",
@@ -1130,7 +1218,8 @@ def render_human(result: dict) -> str:
             f"receipt: {result['receipt_id']}"
             + (" [duplicate]" if result.get("duplicate") else ""),
             f"verdict: {result['verdict']} ({result.get('finality', 'FINAL')})",
-            f"session: {result['session_id']} episode {result['episode_index']}",
+            f"session: {result['session_id']} episode {result['episode_index']} "
+            f"slice {int(result.get('slice_index', 0)) + 1}/{result.get('slice_count', 1)}",
             f"finding: {result.get('finding_id') or '-'}",
             f"audit: {(result.get('audit') or {}).get('audit_number', '-')}",
         ]
@@ -1138,6 +1227,7 @@ def render_human(result: dict) -> str:
         if semantic:
             lines.append(
                 f"semantic: next_episode={semantic.get('next_episode_index')} "
+                f"next_slice={semantic.get('next_slice_index')} "
                 f"exhausted={semantic.get('exhausted')} "
                 f"submitted={semantic.get('submitted')} "
                 f"no_drift={semantic.get('no_drift')}"

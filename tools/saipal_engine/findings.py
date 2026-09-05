@@ -137,6 +137,44 @@ def _occ_key(o):
     return (o.get("session_id"), o.get("episode_id"), str(o.get("event_refs") or ""))
 
 
+def _attach_analyst_work(candidate: dict, rec: dict) -> None:
+    """Record the analyst's judgment on a finding it confirmed.
+
+    The analyst does not mint a second finding for an episode the mechanical
+    pass already raised; its verdict, challenge and disposition are work
+    product that belongs ON that finding (PAL-ANALYSIS-05). A confirmation
+    judged against final evidence also releases any PROVISIONAL hold, exactly
+    as a fingerprint merge would.
+    """
+    for optional in ("challenge", "disposition_class", "analyst_reasoning",
+                     "episode_finality", "recurrence_spread"):
+        value = candidate.get(optional)
+        if value:
+            rec[optional] = value
+    if candidate.get("episode_finality") == "FINAL":
+        rec["episode_finality"] = "FINAL"
+        rec.pop("provisional_hold", None)
+
+
+def _occurrence_matches(rec: dict, occ: dict) -> bool:
+    """Does this finding stand on the same session episode this candidate cites?
+
+    Session and episode ids must agree, and event references must overlap when
+    both sides name events: a candidate citing the episode alone must not merge
+    into a finding about a different event inside it.
+    """
+    cand_refs = {int(r) for r in (occ.get("event_refs") or [])}
+    for row in rec.get("occurrences") or []:
+        if row.get("session_id") != occ.get("session_id"):
+            continue
+        if row.get("episode_id") != occ.get("episode_id"):
+            continue
+        row_refs = {int(r) for r in (row.get("event_refs") or [])}
+        if not cand_refs or not row_refs or cand_refs & row_refs:
+            return True
+    return False
+
+
 def find_or_create(index, candidate, session_record):
     target = fingerprint_of(candidate)
     occ = _occ(candidate, session_record)
@@ -149,7 +187,13 @@ def find_or_create(index, candidate, session_record):
                 rec["state"] = "OBSERVED"
             cand_m = candidate.get("mechanical_confidence")
             if cand_m in ("HIGH", "MEDIUM", "LOW"):
-                rec["mechanical_confidence"] = cand_m
+                existing_m = rec.get("mechanical_confidence")
+                rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
+                # Mechanical proof is cumulative: a merge that would weaken it
+                # (an analyst confirmation always carries LOW) must not erase
+                # the detector's HIGH, or Route C qualification silently dies.
+                if rank[cand_m] >= rank.get(existing_m, -1):
+                    rec["mechanical_confidence"] = cand_m
             surface = candidate.get("historical_rule_surface")
             if rec.get("historical_rule_surface") is None and surface is not None:
                 rec["historical_rule_surface"] = surface
@@ -159,12 +203,39 @@ def find_or_create(index, candidate, session_record):
                 and (rec.get("historical_rule_surface") or {}).get("status") != "RESOLVED"
             ):
                 rec["historical_rule_surface"] = surface
-            # A finding first raised against a growing HOT tail becomes final when
-            # the same root cause is re-submitted against final evidence. Keeping
-            # the stale PROVISIONAL marker would hold the audit forever.
-            if candidate.get("episode_finality") == "FINAL":
-                rec["episode_finality"] = "FINAL"
-                rec.pop("provisional_hold", None)
+            # A same-fingerprint confirmation is still a confirmation: the
+            # analyst's challenge, disposition and reasoning belong on the
+            # finding, and a FINAL verdict releases any PROVISIONAL hold.
+            _attach_analyst_work(candidate, rec)
+            return rec
+
+    # An analyst confirmation is a merge, never a re-raise. The deterministic
+    # pass runs before the analyst, so the episode being judged usually already
+    # stands on a mechanical finding (the carrier's `open_candidates` says so).
+    # The fingerprints will not agree -- template prose and analyst prose are
+    # different descriptions of one mechanism -- so identity falls back to the
+    # shared anchor: same session, same episode, same drift class, same event.
+    # Without this fallback every confirmation minted a second finding for the
+    # same event (PAL-ANALYSIS-01: "the analyst does not re-raise them").
+    if str(candidate.get("detector") or "") == "analyst":
+        for rec in index.get("findings", []):
+            if str(rec.get("drift_class") or "") != str(candidate.get("drift_class") or ""):
+                continue
+            if not _occurrence_matches(rec, occ):
+                continue
+            _attach_analyst_work(candidate, rec)
+            if rec.get("state") in TERMINAL:
+                # The finding already left the pipeline (an audit was emitted, a
+                # block or a rejection was recorded): record the confirmation,
+                # never re-emit and never re-advance.
+                return rec
+            keys = {_occ_key(o) for o in rec.get("occurrences", [])}
+            if _occ_key(occ) not in keys:
+                rec.setdefault("occurrences", []).append(occ)
+            # Fold back to OBSERVED so the submission boundary re-runs the
+            # gates (do-no-harm, qualification) on the analyst's disposition.
+            rec["state"] = "OBSERVED"
+            rec.pop("harm_blocks", None)
             return rec
     finding = {"finding_id": next_finding_id(index), "fingerprint": target, "state": "OBSERVED",
                "causal_key": causal_mod.causal_key(candidate),
@@ -296,6 +367,14 @@ def merge_candidates(index, candidates, session_record):
             if after == "OBSERVED":
                 out.append(finding)
         elif _rank(after) > _rank(before[fp]):
+            out.append(finding)
+        elif str(cand.get("detector") or "") == "analyst":
+            # An analyst confirmation is answered with the finding it stood on:
+            # a fold-back of an open finding (regressed to OBSERVED so the gates
+            # re-run on the analyst's disposition) or a terminal finding that
+            # already left the pipeline. Either way the receipt must name the
+            # finding; the caller re-advances open findings and leaves terminal
+            # ones be.
             out.append(finding)
         before[fp] = after
     return out

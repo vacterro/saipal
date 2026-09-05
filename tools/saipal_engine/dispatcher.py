@@ -54,18 +54,14 @@ def dispatch_sources(
             session_id = candidate.get("session_id") or ""
             source_ref = str(candidate["path"])
             inbox_name = f"{adapter_name}-{session_id}-{sha256_text(source_ref)[:12]}.json"
-            if session_id in known_ids:
-                try:
-                    existing_bundle = bundle_mod.load_bundle_file(
-                        paths.session_inbox / inbox_name,
-                        registry=registry
-                    )
-                    if existing_bundle.get("temperature") == "COLD":
-                        report["unchanged"].append({"source": str(session_id), "reason": "already indexed, cold"})
-                        count += 1
-                        continue
-                except (OSError, ValueError, PalError):
-                    pass
+            if session_id in known_ids and _unchanged_cold(
+                adapter, source_ref, paths.session_inbox / inbox_name, registry
+            ):
+                report["unchanged"].append(
+                    {"source": str(session_id), "reason": "already indexed, cold"}
+                )
+                count += 1
+                continue
             try:
                 source_path = source_ref
                 bundle = adapter.normalize(str(source_path))
@@ -98,6 +94,35 @@ def dispatch_sources(
                 report["rejected"].append({"id": candidate.get("session_id") or source.get("id"), "reason": str(exc)})
         report["processed"] += count
     return report
+
+
+def _unchanged_cold(adapter, source_ref: str, staged: Path, registry: dict) -> bool:
+    """May this known COLD candidate be skipped without normalizing it?
+
+    Only when the raw source still hashes to what the staged bundle recorded.
+    A known session id was previously treated as proof that the artifact had not
+    changed, so a COLD session rewritten in place was suppressed before intake
+    could ever see it -- exactly the digest decision `PAL-SESSION-02` reserves for
+    the generation logic (audit W2-003).
+
+    `adapter.identity()` is the cheap content identity the fast path is allowed to
+    trust: it hashes the raw source rather than parsing it. When it cannot be
+    computed, the honest answer is to normalize, not to guess.
+    """
+    try:
+        existing = bundle_mod.load_bundle_file(staged, registry=registry)
+    except (OSError, ValueError, PalError):
+        return False
+    if existing.get("temperature") != "COLD":
+        return False
+    recorded = str(existing.get("raw_source_sha256") or "")
+    if not recorded:
+        return False
+    try:
+        current = str(adapter.identity(source_ref) or "")
+    except Exception:
+        return False
+    return bool(current) and current == recorded
 
 
 def _json_bytes(payload: dict) -> bytes:

@@ -72,12 +72,17 @@ already-analyzed prefix is unchanged.
 
 A **cold** source is complete and immutable. Unchanged digest means skip;
 changed digest means a new generation, because a different artifact arrived.
+"Unchanged" is judged against **every** generation of that session id: a digest
+already seen is never new evidence, whichever generation produced it, and a
+re-imported artifact must not allocate a generation per poll.
 
-One session id may therefore hold several generations. Semantic analysis is
-offered for the **freshest generation only**: a candidate names a session plus an
+One session id may therefore hold several generations, and "the session" always
+means its **freshest generation** — the artifact that arrived last. Semantic
+analysis is offered for that generation only: a candidate names a session plus an
 episode index, so offering a superseded generation would hand out a unit the
-submission boundary cannot address. Older generations keep their receipts as
-history; they are not re-offered.
+submission boundary cannot address. A HOT resume likewise extends the freshest
+generation. Older generations keep their receipts as history; they are not
+re-offered and not re-extended.
 
 ## PAL-SESSION-03 — protocol binding metadata
 
@@ -122,26 +127,24 @@ configured Git authority), `RELEASE_REGISTRY` (version paired with a registry
 digest), `CAPTURED_FINGERPRINT` (a protocol-tree SHA-256 fingerprint),
 `UNKNOWN` (no identity or no authority). This is the same ordering as the
 binding proof levels in `PAL-BINDING-01`; the retrieval layer is a read-only
-fallback chain over the same roots.
-
-The compact surface reaching a finding carries the status, source, identity,
-registry digest and per-rule `document_sha256` digests — never the full rule
-text. An operator re-fetches the text from the same authority using the
-identity and document digest.
+fallback chain over the same roots. The compact surface reaching a finding carries
+the status, source, identity, registry digest and per-rule `document_sha256`
+digests — never the full rule text. An operator re-fetches the text from the same
+authority using the identity and document digest.
 
 ## PAL-SESSION-04 — generic, deterministic intake
 
 `.saipal/session_inbox/` accepts canonical bundles only. An unreadable or
 schema-invalid bundle is **reported and skipped**, never partially imported and
 never repaired.
-
 Import is deterministic: the same inbox in the same order produces the same
-session index, byte for byte. Inbox files are scanned in name order so the
-result does not depend on the filesystem.
-
-Each import appends to the session's `imports` provenance list
-(`source_ref`, `sha256`, `generation`, `imported_at`). Nothing is deleted from
-the inbox — SAIPAL observes, it does not clean up after the operator.
+session index, byte for byte. Inbox files are scanned in name order so the result
+does not depend on the filesystem. Re-importing an inbox whose digests were all
+seen before changes **nothing** and writes nothing, however many generations a
+session already has. Each import appends to the session's `imports` provenance
+list (`source_ref`, `sha256`, `generation`, `imported_at`); a skipped duplicate
+digest appends nothing. Nothing is deleted from the inbox — SAIPAL observes, it
+does not clean up after the operator.
 
 ## PAL-SESSION-05 — episode boundary hooks
 
@@ -149,17 +152,30 @@ Segmentation is **preparation only**. SAIPAL marks boundaries; it does not
 compare, judge or emit anything about them.
 
 Mechanical spans preserve provider markers, including every OpenCode
-`step-start` and `step-finish`. Semantic episodes are a separate conservative
-projection. Boundary kinds: `user_task`, `command`, `work_switch`,
+`step-start` and `step-finish`. They are derived from the bundle on demand, never
+copied into the session index: the bundle is the durable evidence and the spans
+are a deterministic projection of it. Semantic episodes are a separate
+conservative projection. Boundary kinds: `user_task`, `command`, `work_switch`,
 `phase_change`, `source_intake`, `recovery`, `terminal_task`.
 
-A new user request may open a semantic episode. Provider step markers,
-individual tool calls, file writes and bookkeeping do not. Session termination
-closes the trailing episode; it does not fabricate an empty next episode.
+An episode covers `[start_seq, end_seq]` and records the `event_count` actually
+inside that span, so a reader can tell how many bounded analysis windows it needs
+without reloading the bundle. A span longer than one window is handed to the
+analyst in consecutive slices (`ANALYSIS.md` PAL-ANALYSIS-01); the segmenter never
+splits an episode to fit a limit.
 
-The mapping from event types to boundaries is mechanical and declared in the
-runtime, not guessed per session. What happened inside an episode is decided by
-the comparison kernel (detectors plus the analyst), never by the segmenter.
+**The episodes tile the stream: every event belongs to exactly one, including the
+last.** A boundary event opens the episode it belongs to and closes the previous
+one, so a session whose final event is itself a boundary still ends with a
+one-event `terminal_task` — an event in no episode reaches no detector and no
+analyst, which is evidence lost silently rather than reported.
+
+A new user request may open a semantic episode. Provider step markers, individual
+tool calls, file writes and bookkeeping do not. Session termination closes the
+trailing episode; it does not fabricate an empty next episode. The mapping from
+event types to boundaries is mechanical and declared in the runtime, not guessed
+per session. What happened inside an episode is decided by the comparison kernel
+(detectors plus the analyst), never by the segmenter.
 
 ## PAL-SESSION-06 — HOT is provisional, COLD is final
 
@@ -173,8 +189,9 @@ work available, but it is reasoning about an unfinished sentence:
 - the verdict and its finding are recorded, labelled `PROVISIONAL`, with the
   reason it is held;
 - **no audit ever leaves the home**, whatever the confidence or severity;
-- the semantic watermark does **not** advance past it, so the next cycle hands the
-  analyst the grown version of the same episode;
+- the semantic position does **not** advance past the episode, so the next cycle
+  hands the analyst the grown version of it (a paged episode still advances slice
+  by slice inside it, so the same window is not re-read);
 - the receipt records the finality it was judged under, so a later reader can
   tell which conclusions rested on partial evidence.
 
