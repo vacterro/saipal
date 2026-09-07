@@ -25,6 +25,20 @@ def tool_root() -> Path:
     return REPO_ROOT
 
 
+def checkout_audit_entries() -> set[str]:
+    """Names directly under the checkout's `audit/`, empty when there is none.
+
+    SAIPAL must never emit an audit into its own checkout, but `audit/` is also
+    the operator's SAIPEN audit inbox, so an absent directory is not the property
+    to assert -- a run that adds nothing to it is. Comparing the listing across a
+    run proves that in a working checkout as well as a bare one.
+    """
+    directory = REPO_ROOT / "audit"
+    if not directory.is_dir():
+        return set()
+    return {path.name for path in directory.iterdir()}
+
+
 def run_saipal(*args: str, home: Path | str | None = None, cwd: Path | str | None = None):
     """Run the CLI in a subprocess. Returns `(exit_code, stdout, stderr)`."""
     command = [python_exe(), "-B", str(SAIPAL_CLI)]
@@ -285,3 +299,72 @@ def load_registry_copy() -> dict:
 
     registry = load_registry()
     return json.loads(json.dumps(registry))
+
+
+def next_unit(home: Path) -> dict | None:
+    """The pending analysis carrier, or None when the analyst is idle."""
+    code, payload, err = run_saipal_json("next", home=home)
+    if code != 0:
+        return None
+    return (payload or {}).get("analysis_carrier")
+
+
+def drift_candidate(unit: dict, **overrides) -> dict:
+    """A well-formed DRIFT candidate answering the given carrier unit."""
+    payload = {
+        "schema_version": 1,
+        "verdict": "DRIFT",
+        "unit_digest": unit["unit_digest"],
+        "session_id": unit["session"]["session_id"],
+        "episode_index": unit["episode"]["index"],
+        "disposition_class": "ENGINE_ENFORCEMENT_GAP" if "change_target" not in overrides else (
+            "PROTOCOL_DEFECT" if overrides.get("change_target") in
+                ("CORE_PROTOCOL", "COMMANDS", "PHASE_CONTRACT", "SOURCE_CONTRACT",
+                 "EXECUTION_POLICY") else "ENGINE_ENFORCEMENT_GAP"
+        ),
+        "reasoning": "the engine accepted a route outside the closed surface",
+        "rule_ids": ["PAL-CMD-01"],
+        "event_refs": [unit["episode"]["start_seq"]],
+        "drift_class": "COMMAND_ROUTE_DRIFT",
+        "severity": "P1",
+        "confidence": "HIGH",
+        "change_target": "ENGINE",
+        "root_cause": "the closed command surface was not consulted",
+        "challenge": {
+            "prosecutor": "PAL-CMD-01 names the surface; the route is not in it",
+            "defender": "the adapter may have normalized a user alias",
+            "winner": "prosecutor",
+            "loser_rejection": "the canonical token was recorded verbatim",
+        },
+        "alternatives": ["the user invoked a shell alias"],
+        "addressed_defences": [
+            entry["code"] for entry in unit.get("defence_surface") or []
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def submit_drift(home: Path, unit: dict | None = None, **overrides) -> dict:
+    """Create a confirmed finding the sanctioned way: a semantic DRIFT submission.
+
+    The authority pass made this the ONLY path to a finding, so every legacy
+    test that used to get one from `continue` uses this helper instead. Pass a
+    carrier `unit` to answer a specific episode, or omit it to answer the next
+    pending unit.
+    """
+    if unit is None:
+        unit = next_unit(home)
+    assert unit is not None, "no pending analysis unit; run continue first"
+    path = Path(home).parent / f"drift-{unit['session']['session_id']}-{unit['episode']['index']}.json"
+    path.write_text(json.dumps(drift_candidate(unit, **overrides)), encoding="utf-8")
+    code, out, err = run_saipal("--json", "submit", str(path), home=home)
+    if out:
+        try:
+            payload = json.loads(out)
+            err = (err or "") + "\n" + json.dumps(payload, indent=1)
+        except (ValueError, TypeError):
+            pass
+    if code != 0:
+        raise AssertionError(f"submit failed ({code}): {err}")
+    return json.loads(out)

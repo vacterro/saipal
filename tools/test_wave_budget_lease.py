@@ -587,7 +587,8 @@ class BudgetArithmetic(unittest.TestCase):
 
 
 class DriftStillReachesAnAudit(unittest.TestCase):
-    """The control for all of the above: real findings must still be produced."""
+    """The control for all of the above: real findings still reach an audit --
+    through the sanctioned semantic path, never through triage."""
 
     def setUp(self) -> None:
         self.registry = load_registry()
@@ -603,6 +604,11 @@ class DriftStillReachesAnAudit(unittest.TestCase):
         support.put_inbox(self.home, DRIFT)
         code, payload, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
+        self.assertEqual(payload["audits_emitted"], 0, "triage never emits")
+        code, report, err = support.run_saipal_json("report", home=self.home)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(report["verdict"], "NOT_EXAMINED")
+        support.submit_drift(self.home, support.next_unit(self.home))
         code, report, err = support.run_saipal_json("report", home=self.home)
         self.assertEqual(code, 0, err)
         self.assertEqual(report["verdict"], "DRIFT_REPORTED")

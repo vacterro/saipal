@@ -1,6 +1,6 @@
 <!-- OWNER: saipal/FINDINGS.md -->
 <!-- RULES: PAL-FINDING-01, PAL-FINDING-02, PAL-FINDING-03 -->
-<!-- ENUMS: finding_lifecycle=OBSERVED,BOUND,CHALLENGED,QUALIFIED,REJECTED,MERGED,BLOCKED,STALE,EMITTED; confidence_enum=HIGH,MEDIUM,LOW; severity_enum=P0,P1,P2,P3; drift_taxonomy=COMMAND_ROUTE_DRIFT,ACTIVE_WORK_PREEMPTION,BOARD_PRIORITY_DRIFT,PHASE_ILLEGALITY,PHASE_SKIP,SOURCE_AUTHORITY_DRIFT,SOURCE_CLOSURE_FALSE_GREEN,EVIDENCE_FABRICATION,RECOVERY_ORDER_DRIFT,DESTRUCTIVE_GATE_DRIFT,CONTINUE_IDLE_FALSE_POSITIVE,IMPROVE_PRECEDENCE_DRIFT,AUDIT_INBOX_DRIFT,HUSH_NARRATION_DRIFT,HUSH_SAFETY_SUPPRESSION,PROTOCOL_ENGINE_SPLIT,ADAPTER_COMMAND_SPLIT,COLD_RESUME_FAILURE,CHAT_MEMORY_AUTHORITY,FALSE_DONE,ACCIDENTAL_SUCCESS,RULE_LOAD_FAILURE,CONTEXT_OVERLOAD; change_target_enum=CORE_PROTOCOL,COMMANDS,PHASE_CONTRACT,SOURCE_CONTRACT,EXECUTION_POLICY,ENGINE,ADAPTER,HARNESS,CONFORMANCE_TEST,DOCUMENTATION,MODEL_GUIDANCE,NO_CHANGE,UNKNOWN -->
+<!-- ENUMS: finding_lifecycle=SUSPECTED,OBSERVED,BOUND,CHALLENGED,QUALIFIED,REJECTED,MERGED,BLOCKED,STALE,EMITTED; confidence_enum=HIGH,MEDIUM,LOW; severity_enum=P0,P1,P2,P3; drift_taxonomy=COMMAND_ROUTE_DRIFT,ACTIVE_WORK_PREEMPTION,BOARD_PRIORITY_DRIFT,PHASE_ILLEGALITY,PHASE_SKIP,SOURCE_AUTHORITY_DRIFT,SOURCE_CLOSURE_FALSE_GREEN,EVIDENCE_FABRICATION,RECOVERY_ORDER_DRIFT,DESTRUCTIVE_GATE_DRIFT,CONTINUE_IDLE_FALSE_POSITIVE,IMPROVE_PRECEDENCE_DRIFT,AUDIT_INBOX_DRIFT,HUSH_NARRATION_DRIFT,HUSH_SAFETY_SUPPRESSION,PROTOCOL_ENGINE_SPLIT,ADAPTER_COMMAND_SPLIT,COLD_RESUME_FAILURE,CHAT_MEMORY_AUTHORITY,FALSE_DONE,ACCIDENTAL_SUCCESS,RULE_LOAD_FAILURE,CONTEXT_OVERLOAD; change_target_enum=CORE_PROTOCOL,COMMANDS,PHASE_CONTRACT,SOURCE_CONTRACT,EXECUTION_POLICY,ENGINE,ADAPTER,HARNESS,CONFORMANCE_TEST,DOCUMENTATION,MODEL_GUIDANCE,NO_CHANGE,UNKNOWN -->
 # FINDINGS — discipline over volume
 
 This document owns the finding contract. The goal is a small number of findings
@@ -9,8 +9,13 @@ without rediscovering the session.
 
 ## PAL-FINDING-01 — lifecycle and dedupe
 
-Lifecycle states: `OBSERVED`, `BOUND`, `CHALLENGED`, `QUALIFIED`, `REJECTED`,
-`MERGED`, `BLOCKED`, `STALE`, `EMITTED`.
+Lifecycle states: `SUSPECTED`, `OBSERVED`, `BOUND`, `CHALLENGED`, `QUALIFIED`,
+`REJECTED`, `MERGED`, `BLOCKED`, `STALE`, `EMITTED`.
+
+`SUSPECTED` is the pre-semantic floor: the state of every mechanical detector
+signal and every legacy finding that was created before the semantic authority
+boundary. A finding cannot leave `SUSPECTED` for a post-semantic state without
+a semantic DRIFT confirmation tied to its evidence unit.
 
 `EMITTED` means the finding reached an enqueued audit.
 
@@ -92,6 +97,15 @@ Before qualification, search for contrary evidence: a later tool result, a
 later checkpoint, an explicit user override, a recovery event, adapter
 normalization evidence, a missing owner document, or an environment/tool
 failure. Do not stop at the first apparent contradiction.
+
+**No semantic DRIFT verdict, no qualification.** The authority boundary is
+executable, not documentary: `qualification_threshold` refuses every finding
+that does not carry a semantic confirmation tied to its evidence unit
+(receipt id, DRIFT verdict, session, episode, unit digest) — whatever the
+mechanical confidence, severity, recurrence spread, protocol binding or
+current lifecycle state. Mechanical evidence may prioritize investigation and
+travel with a finding as supporting evidence; it can never by itself
+establish protocol drift.
 
 Every qualified finding states its protected invariants. If a proposed fix
 could weaken destructive confirmation, recovery precedence, source closure,

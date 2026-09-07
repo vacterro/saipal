@@ -191,6 +191,7 @@ class EmittedAuditIsAttributable(unittest.TestCase):
         support.run_saipal("continue", home=self.home)
         support.put_inbox(self.home, DRIFT)
         support.run_saipal("continue", home=self.home)
+        support.submit_drift(self.home, support.next_unit(self.home))
 
     def tearDown(self) -> None:
         self._tmp.cleanup()

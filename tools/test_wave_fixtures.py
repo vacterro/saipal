@@ -53,37 +53,33 @@ class GoldenFixtures(unittest.TestCase):
         self.assertEqual(_findings(self.home), [])
 
     def test_agent_noncompliance_command_route_emits_drift(self) -> None:
-        """A non-saipal command outside the closed surface emits a finding."""
+        """A non-saipal command outside the closed surface is investigated."""
         payload = self._cc(COMMAND_ROUTE)
-        self.assertGreaterEqual(payload["candidates"], 1)
-        self.assertEqual(payload["audits_emitted"], 1)
+        self.assertGreaterEqual(int(payload.get("signals_raised") or 0), 1)
+        # The drift becomes a finding only when a semantic DRIFT verdict is
+        # submitted for the episode; the mechanical pass itself stays triage.
+        support.submit_drift(self.home)
         findings = _findings(self.home)
         classes = {f["drift_class"] for f in findings}
         self.assertIn("COMMAND_ROUTE_DRIFT", classes)
         emitted = [f for f in findings if f["state"] == "EMITTED"]
         self.assertEqual(len(emitted), 1)
-        self.assertEqual(emitted[0]["drift_class"], "COMMAND_ROUTE_DRIFT")
 
     def test_source_closure_false_green_emits_low_confidence_finding(self) -> None:
         """A source intake without terminal closure is logged but not emitted."""
         payload = self._cc(SOURCE_CLOSURE)
-        self.assertGreaterEqual(payload["candidates"], 1)
-        self.assertEqual(
-            payload["audits_emitted"], 0,
-            "LOW confidence source-closure drift must not be emitted",
-        )
+        self.assertGreaterEqual(int(payload.get("signals_raised") or 0), 1)
         findings = _findings(self.home)
-        sc = [f for f in findings if f["drift_class"] == "SOURCE_CLOSURE_FALSE_GREEN"]
-        self.assertEqual(len(sc), 1)
-        self.assertEqual(sc[0]["confidence"], "LOW")
-        self.assertNotEqual(sc[0]["state"], "EMITTED")
+        # Without a semantic verdict nothing is a finding yet.
+        self.assertEqual(len(findings), 0)
 
     def test_accidental_success_emits_continue_idle_finding(self) -> None:
-        """A `continue` while active work exists is a CONTINUE_IDLE_FALSE_POSITIVE."""
+        """A `continue` while active work exists is a CONTINUE_IDLE_FALSE_POSITIVE signal."""
         payload = self._cc(FALSE_CONTINUE)
-        self.assertGreaterEqual(payload["candidates"], 1)
-        findings = _findings(self.home)
-        classes = {f["drift_class"] for f in findings}
+        self.assertGreaterEqual(int(payload.get("signals_raised") or 0), 1)
+        ledger = self.home / "signals.json"
+        signals = json.loads(ledger.read_text(encoding="utf-8"))["signals"]
+        classes = {f["drift_class"] for f in signals}
         self.assertIn("CONTINUE_IDLE_FALSE_POSITIVE", classes)
 
 

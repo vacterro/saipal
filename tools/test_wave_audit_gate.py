@@ -183,11 +183,16 @@ class GateHoldsInThePipeline(unittest.TestCase):
         support.put_inbox(self.home, DRIFT)
         code, payload, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
-        self.assertEqual(payload["audits_emitted"], 1, "the gate must not block real work")
+        self.assertEqual(payload["audits_emitted"], 0, "triage never emits")
+        unit = support.next_unit(self.home)
+        self.assertIsNotNone(unit, "the gate must not block real work")
+        receipt = support.submit_drift(self.home, unit)
+        self.assertIsNotNone(receipt["audit"], "the gate must not block real work")
 
     def test_the_emitted_audit_passes_the_gate_it_was_built_for(self) -> None:
         support.put_inbox(self.home, DRIFT)
         support.run_saipal("continue", home=self.home)
+        support.submit_drift(self.home, support.next_unit(self.home))
         staged = sorted((self.home / "audit" / "staging").glob("*.md"))
         self.assertTrue(staged)
         text = staged[0].read_text(encoding="utf-8")

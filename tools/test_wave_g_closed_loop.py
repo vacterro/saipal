@@ -40,13 +40,16 @@ def _drift_bundle(session_id: str = "drift-g-001") -> dict:
 
 
 def _build_audit(home: Path) -> dict:
-    """Run continue over a drift bundle and return the emitted audit record."""
+    """Triage the drift bundle, then confirm it semantically; return the audit record."""
     support.run_saipal("continue", home=home)
     support.write_inbox(home, "drift.json", _drift_bundle())
     code, payload, err = support.run_saipal_json("continue", home=home)
     assert code == 0, err
     assert payload is not None
-    assert payload["audits_emitted"] == 1, f"expected 1 audit, got {payload['audits_emitted']}"
+    assert payload["audits_emitted"] == 0, "triage must not emit"
+    unit = support.next_unit(home)
+    assert unit is not None, "the drift episode must be offered to the analyst"
+    receipt = support.submit_drift(home, unit)
     findings = _findings(home)
     emitted = [f for f in findings if f.get("state") == "EMITTED" and f.get("audit")]
     assert emitted, "an EMITTED finding with an audit must exist"
@@ -57,6 +60,7 @@ def _build_audit(home: Path) -> dict:
         "audit_number": audit["audit_number"],
         "operation_id": audit["operation_id"],
         "finding_id": emitted[0]["finding_id"],
+        "receipt_id": receipt.get("receipt_id"),
     }
 
 
@@ -308,7 +312,7 @@ class LinkFailureResilience(unittest.TestCase):
     def test_link_failure_logs_event_and_keeps_audit(self) -> None:
         """Corrupt closed_loop_links.json → link_finding_audit raises PalError.
 
-        The cycle must complete (exit 0), the audit must be emitted, and a
+        The submission must complete (exit 0), the audit must be emitted, and a
         `closed_loop_link_failure` event must appear in the log.
         """
         # write garbage so load_links returns "unrecoverable"
@@ -316,21 +320,24 @@ class LinkFailureResilience(unittest.TestCase):
             "not valid json at all", encoding="utf-8"
         )
 
-        # inject a drift bundle through the CLI
+        # inject a drift bundle through the CLI, then confirm it semantically
         support.write_inbox(self.home, "drift.json", _drift_bundle())
         code, payload, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
+        support.submit_drift(self.home, support.next_unit(self.home))
         assert payload is not None
 
         # audit still emitted
-        self.assertEqual(payload["audits_emitted"], 1)
+        findings = _findings(self.home)
+        emitted = [f for f in findings if f.get("state") == "EMITTED" and f.get("audit")]
+        self.assertEqual(len(emitted), 1)
 
         # the failure event is in the log
         events = self._log_events()
         failures = [ev for ev in events if ev.get("event") == "closed_loop_link_failure"]
         self.assertEqual(len(failures), 1, f"expected 1 failure event, got {len(failures)}")
         fdata = failures[0].get("data", {})
-        self.assertEqual(fdata["finding_id"], "PAL-0001")
+        self.assertEqual(fdata["finding_id"], emitted[0]["finding_id"])
         self.assertEqual(fdata["audit_number"], 1)
         self.assertIn("reason", fdata)
         self.assertIn("unreadable", fdata["reason"])

@@ -1,10 +1,15 @@
-"""Analysis pipeline: session -> episodes -> detectors -> findings -> audits.
+"""Analysis pipeline: session -> episodes -> detectors -> signals.
 
-Orchestrates Waves C-E for one `continue` cycle. The pipeline is bounded by a
-budget (Wave I); a hit checkpoints and returns a resumable next action.
+Orchestrates the bounded mechanical pass (Layer A) for one `continue` cycle.
+The pipeline is triage-only (PAL-ARCH-01): detector output becomes a durable
+SIGNAL that prioritizes the semantic carrier's work -- it never becomes a
+finding, never advances a finding lifecycle, and never emits an audit. Only
+the semantic submission boundary (`submit.py`) can open the finding
+lifecycle, because only the analyst may decide that protocol drift is real.
 
 Deterministic, stdlib-only, and it never touches an analyzed project or SAIPEN
-Core except through the constrained audit enqueue.
+Core except through the constrained audit enqueue (kept for the submission
+boundary's use).
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ from . import sessions as sessions_mod
 from .analyst import analyze_episode
 from .capability import require_action
 from .errors import PalError
-from .paths import home_paths
+from .paths import atomic_write_json, home_paths
 from .registry import load_registry
 
 ANALYSIS_BUDGET = hardening_mod.Budget()
@@ -207,6 +212,11 @@ def advance_to_qualified(index: dict, finding: dict) -> None:
     invariant without declaring it, from a disposition that does not blame the
     protocol, goes to BLOCKED instead of QUALIFIED -- a warning nobody has to
     act on is not a gate.
+
+    PAL-ARCH-01: this path exists for the SEMANTIC submission boundary only.
+    A finding without a semantic confirmation cannot leave SUSPECTED, and
+    `qualification_threshold` refuses unconfirmed findings, so the lifecycle
+    gates cannot be reached from the mechanical pass.
     """
     findings_mod.advance_lifecycle(finding, "BOUND", registry=None)
     findings_mod.prosecutor_defender_pass(finding, None, None)
@@ -223,6 +233,100 @@ def advance_to_qualified(index: dict, finding: dict) -> None:
     findings_mod.advance_lifecycle(finding, "QUALIFIED", registry=None)
 
 
+def _signal_shape(candidate: dict, record: dict, historical: dict | None) -> dict:
+    """A mechanical detector candidate in its durable signal shape.
+
+    A signal is an investigation hint for the semantic carrier: it names where
+    to look (session, episode, events), what the detector saw, how confident
+    the mechanism is, and which rules would be violated IF the suspicion held.
+    It carries no finding id and no lifecycle state, because it never becomes
+    a finding on its own (PAL-ARCH-01).
+    """
+    drift_class = candidate.get("drift_class", "UNKNOWN")
+    confidence = candidate.get(
+        "confidence_proposal",
+        candidate.get("confidence", "LOW"),
+    )
+    if confidence not in ("HIGH", "MEDIUM", "LOW"):
+        confidence = "LOW"
+    return {
+        "signal_id": candidate.get("signal_id"),
+        "detector": candidate.get("detector", ""),
+        "session_id": record.get("session_id", ""),
+        "episode_index": candidate.get("episode_index", candidate.get("episode_id", -1)),
+        "rule_ids": list(candidate.get("rule_ids") or []),
+        "drift_class": drift_class,
+        "mechanical_confidence": candidate.get("mechanical_confidence", "LOW"),
+        "confidence_proposal": confidence,
+        "root_cause_hypothesis": candidate.get("root_cause_hypothesis", ""),
+        "alternative_explanations": list(
+            candidate.get("alternative_explanations", candidate.get("alternatives", []))
+        ),
+        "missing_evidence": list(candidate.get("missing_evidence") or []),
+        "event_refs": list(candidate.get("event_refs") or []),
+        "expected": candidate.get("expected", {}),
+        "observed": candidate.get("observed", {}),
+        "contrary_evidence_found": bool(candidate.get("contrary_evidence_found")),
+        "contrary_evidence": list(candidate.get("contrary_evidence") or []),
+        "protocol_binding": record.get("protocol") or {},
+        "historical_rule_surface": historical,
+    }
+
+
+def _record_signal(home: Path, signal: dict, *, registry: dict | None) -> dict:
+    """Persist one signal into the deduplicating signal ledger. Returns the row.
+
+    Identity is the evidence the signal stands on (session, episode, detector,
+    class, event refs) hashed into a stable id, so re-analysis of the same
+    episode rewrites its row instead of accumulating copies; a NEW occurrence
+    of the same mechanism elsewhere is a new row. The ledger is the semantic
+    carrier's prioritization input and the durable record that mechanical
+    triage ran -- it is never a finding.
+    """
+    paths = home_paths(home)
+    signals_path = paths.root / "signals.json"
+    payload = _load_signals(signals_path)
+    key = str(signal.get("signal_id") or "")
+    existing = next((row for row in payload["signals"] if row.get("signal_id") == key), None)
+    row = dict(signal)
+    row["signal_id"] = key
+    row["occurrences"] = int((existing or {}).get("occurrences") or 0) + 1
+    row["last_seen_at"] = _now_iso()
+    if existing is None:
+        row["first_seen_at"] = row["last_seen_at"]
+        payload["signals"].append(row)
+    else:
+        existing.update(row)
+    try:
+        require_action("write_own_index", registry=registry)
+        atomic_write_json(signals_path, payload, root=paths.root)
+    except (OSError, PalError):
+        # The signal ledger is an optimization over the session record, not
+        # evidence: a home that cannot hold it still analyzed its sessions.
+        pass
+    return row
+
+
+def _load_signals(signals_path: Path) -> dict:
+    from .paths import read_json
+
+    if not signals_path.exists():
+        return {"schema_version": 1, "signals": []}
+    try:
+        payload = read_json(signals_path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {"schema_version": 1, "signals": []}
+    if not isinstance(payload, dict) or not isinstance(payload.get("signals"), list):
+        return {"schema_version": 1, "signals": []}
+    return payload
+
+
+def _now_iso() -> str:
+    from .paths import utc_now_iso
+
+    return utc_now_iso()
+
+
 def analyze_sessions(
     home: Path,
     index: dict,
@@ -230,34 +334,35 @@ def analyze_sessions(
     registry: dict | None = None,
     budget: hardening_mod.Budget | None = None,
 ) -> dict[str, Any]:
-    """Run one bounded analysis pass over unanalyzed sessions.
+    """Run one bounded MECHANICAL TRIAGE pass over unanalyzed sessions.
 
-    Returns counts and a list of audits enqueued this cycle. Sessions whose
-    episodes are exhausted are marked analyzed so a later cycle skips them.
+    Triage-only (PAL-ARCH-01): detector candidates become signals in the
+    signal ledger -- investigation hints for the semantic carrier, with the
+    protocol binding and historical rule surface attached. No finding is
+    created, no lifecycle advances, no audit is emitted here; those are the
+    semantic submission boundary's. The findings index is only MIGRATED when
+    a legacy index holds pre-boundary mechanical findings.
+
+    Returns counts for the cycle report. Sessions whose episodes are
+    exhausted are marked analyzed so a later cycle skips them.
     """
     data = registry if registry is not None else load_registry()
     budget = budget or ANALYSIS_BUDGET
     paths = home_paths(home)
 
-    findings_status, findings_idx, fdetail = findings_mod.load_index(
-        home, registry=data
-    )
-    if findings_status == "unrecoverable":
-        raise PalError(
-            "VALIDATION_FAILED", f"findings index is unusable: {fdetail}",
-            next_action="repair or remove .saipal/findings/index.json by hand",
-        )
-    if findings_status == "absent" or findings_idx is None:
-        findings_idx = findings_mod.empty_index()
+    # NOTE (PAL-ARCH-01): legacy finding migration does NOT live here. It is an
+    # authority/schema migration that must run at the start of every mutating
+    # cycle -- before publication retry, before analysis, even when no session
+    # index exists. `_continue_cycle` owns it.
 
     telemetry = hardening_mod.load_telemetry(home)
     started = time.monotonic()
     audits_emitted: list[dict] = []
     budget_hit = False
-    findings_created = 0
-    findings_rejected = 0
+    signals_total = 0
     events_analyzed = 0
     sessions_analyzed = 0
+    signals: list[dict] = []
 
     config_status, config, config_detail = config_mod.load_config(home)
     if config_status == "unrecoverable":
@@ -305,7 +410,7 @@ def analyze_sessions(
             # budget-limited cycle reprocess episode 0 forever.
             cursor = _resume_cursor(record, len(episodes))
             analyzed_up_to = int(record.get("analysis", {}).get("analyzed_up_to_seq") or 0)
-            session_findings: list[dict] = []
+            session_signals = 0
             for position in range(cursor, len(episodes)):
                 episode = episodes[position]
                 span = _span_size(episode, bundle)
@@ -323,29 +428,35 @@ def analyze_sessions(
                 analyzed_up_to = max(analyzed_up_to, int(episode.get("end_seq", 0)))
                 cursor = position + 1
 
-                if candidates:
-                    shaped = [
-                        _finding_shape(c, record, c.get("historical_rule_surface"))
-                        for c in candidates
-                    ]
-                    kept = [c for c in shaped if not _candidate_rejected(c)]
-                    findings_rejected += len(shaped) - len(kept)
-                    advanced = findings_mod.merge_candidates(findings_idx, kept, record)
-                    for finding in advanced:
-                        findings_created += 1
-                        session_findings.append(finding)
-                        advance_to_qualified(findings_idx, finding)
-                        if not findings_mod.qualification_threshold(
-                            finding, registry=data
-                        ):
-                            continue
-                        emit_audit(
-                            home, finding, record, bundle, paths, data, audits_emitted
+                # Layer A is triage: a detector candidate is a SIGNAL for the
+                # semantic carrier. It is recorded durably so `next` can
+                # prioritize it, and it never becomes a finding (PAL-ARCH-01).
+                for candidate in candidates:
+                    if _candidate_rejected(candidate):
+                        continue
+                    signal = _signal_shape(
+                        candidate, record, candidate.get("historical_rule_surface")
+                    )
+                    signal["signal_id"] = _signal_id(signal)
+                    recorded = _record_signal(home, signal, registry=data)
+                    signals_total += 1
+                    session_signals += 1
+                    if len(signals) < int(getattr(budget, "max_candidates", 100)):
+                        signals.append(
+                            {
+                                "signal_id": recorded.get("signal_id"),
+                                "session_id": recorded.get("session_id"),
+                                "episode_index": recorded.get("episode_index"),
+                                "drift_class": recorded.get("drift_class"),
+                                "mechanical_confidence": recorded.get(
+                                    "mechanical_confidence"
+                                ),
+                                "rule_ids": recorded.get("rule_ids"),
+                                "event_refs": recorded.get("event_refs"),
+                            }
                         )
 
-                if findings_created >= int(budget.max_candidates) or len(
-                    audits_emitted
-                ) >= int(getattr(budget, "max_audits", 10)):
+                if signals_total >= int(budget.max_candidates):
                     budget_hit = True
                     break
 
@@ -366,62 +477,75 @@ def analyze_sessions(
             # later append-only growth continues instead of a false CONFLICT.
             if analyzed_up_to > 0:
                 record["prefix_sha256"] = bundle_mod.prefix_digest(bundle, analyzed_up_to)
+            # Mechanical exhaustion is NOT semantic completion (PAL-ARCH-01):
+            # a triaged session still owes every episode to the analyst, and
+            # the negative-evidence receipt below records only that the
+            # mechanical pass found nothing worth signaling.
             _record_recurrence(
-                home, record, session_findings, exhausted=exhausted, registry=data
+                home, record, exhausted=exhausted and session_signals == 0, registry=data
             )
 
     # Nothing analyzed means nothing to persist. Rewriting an 11 MB session
-    # index, the findings index and telemetry after a no-work pass was pure
-    # amplification: `status` and every idle cycle paid for it (PERF-004).
+    # index and telemetry after a no-work pass was pure amplification: `status`
+    # and every idle cycle paid for it (PERF-004). The findings index is not
+    # rewritten here at all: this pass never touches it beyond migration.
     if sessions_analyzed:
-        findings_mod.save_index(home, findings_idx, registry=data)
         sessions_mod.save_index(home, index, registry=data)
         hardening_mod.save_telemetry(home, telemetry)
 
     return {
         "sessions_analyzed": sessions_analyzed,
         "events_analyzed": events_analyzed,
-        "findings_created": findings_created,
-        "findings_rejected": findings_rejected,
+        "signals_total": signals_total,
+        "signals": signals,
+        "findings_created": 0,
+        "findings_rejected": 0,
         "audits_emitted": audits_emitted,
-        "candidates_total": findings_created,
+        "candidates_total": signals_total,
     }
 
 
-def _candidate_rejected(finding: dict) -> bool:
-    return bool(finding.get("contrary_evidence_found")) and finding.get(
+def _signal_id(signal: dict) -> str:
+    from .paths import sha256_text
+
+    parts = (
+        str(signal.get("session_id") or ""),
+        str(signal.get("episode_index")),
+        str(signal.get("detector") or ""),
+        str(signal.get("drift_class") or ""),
+        ",".join(str(r) for r in (signal.get("event_refs") or [])),
+    )
+    return "sig-" + sha256_text("\x00".join(parts))[:32]
+
+
+def _candidate_rejected(candidate: dict) -> bool:
+    """A signal contradicted by its own contrary-evidence pass is dropped."""
+    return bool(candidate.get("contrary_evidence_found")) and candidate.get(
         "severity", "P3"
-    ) in ("P3",)
+    ) == "P3"
 
 
 def _record_recurrence(
     home: Path,
     record: dict,
-    session_findings: list[dict],
     *,
     exhausted: bool = True,
     registry: dict | None,
 ) -> None:
-    """Wire the Wave H recurrence ledger into the runtime.
+    """Record mechanical-triage completion for the recurrence ledger.
 
-    Conformant sessions count toward negative evidence; sessions that produced
-    a finding count toward recurrence for that finding's fingerprint. Either
-    path goes through the constrained write action; a corrupt or unwritable
-    recurrence file must not abort the cycle.
-
-    A session that ran out of budget mid-way is NOT negative evidence: "no
-    finding yet" and "no finding in this session" are different claims, and
-    recording the first as the second would let a bounded cycle vote clean on
-    evidence it never read.
+    This is NOT a semantic verdict: it says the deterministic pass ran to the
+    end of the episode cursor and found nothing worth signaling. It must never
+    be read as evidence that a session was semantically examined (PAL-ARCH-01);
+    the semantic receipts own that. A session that ran out of budget mid-way is
+    not negative evidence: "no signal yet" and "no signal in this session" are
+    different claims, and recording the first as the second would let a bounded
+    cycle vote clean on evidence it never read.
     """
     try:
-        if not session_findings:
-            if exhausted:
-                recurrence_mod.record_negative(home, record, registry=registry)
+        if not exhausted:
             return
-        record["conformant"] = False
-        # One transaction for the whole session, not one per finding (PERF-005).
-        recurrence_mod.record_batch(home, record, session_findings, registry=registry)
+        recurrence_mod.record_negative(home, record, registry=registry)
     except (OSError, ValueError, UnicodeDecodeError, PalError) as exc:
         from . import log as log_mod
 
@@ -430,7 +554,6 @@ def _record_recurrence(
             "recurrence_record_failure",
             data={
                 "session_id": record.get("session_id", ""),
-                "finding_count": len(session_findings),
                 "reason": str(exc),
             },
             registry=registry,
@@ -483,6 +606,22 @@ def emit_audit(
     registry: dict,
     audits_emitted: list[dict],
 ) -> None:
+    """Turn a qualified finding into a numbered audit — the external boundary.
+
+    Fail-closed by construction (PAL-ARCH-01): a finding without a semantic
+    DRIFT confirmation tied to a BOUND historical authority cannot stage or
+    publish here, whatever its caller believes. External-effect boundaries
+    defend their own invariants; they do not trust them to the caller.
+    """
+    if not findings_mod.is_semantically_confirmed(finding):
+        raise PalError(
+            "SEMANTIC_CONFIRMATION_REQUIRED",
+            "refusing to stage or publish an audit for a finding without a "
+            "semantic DRIFT confirmation tied to a BOUND historical protocol "
+            "authority (PAL-ARCH-01)",
+            next_action="submit a semantic DRIFT verdict for the finding's "
+                        "evidence unit; nothing was written",
+        )
     body = audits_mod.build_audit_body(finding, record, bundle, registry=registry)
     if not audits_mod.passes_quality_gate(body, finding):
         return

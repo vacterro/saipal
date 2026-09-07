@@ -181,13 +181,23 @@ class DedupeAndRecurrence(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def candidate(self, root_cause: str) -> dict:
+    def candidate(self, root_cause: str, episode_id: int | None = None) -> dict:
+        """An analyst-confirmed candidate: the only shape that may create a finding."""
         return {
+            "detector": "analyst",
+            "episode_id": episode_id,
             "drift_class": "COMMAND_ROUTE_DRIFT",
             "rule_ids": ["PAL-CMD-01"],
             "change_target": "ENGINE",
             "root_cause": root_cause,
-            "mechanical_confidence": "HIGH",
+            "mechanical_confidence": "LOW",
+            "semantic_confirmation": {
+                "receipt_id": "rcp-test",
+                "verdict": "DRIFT",
+                "session_id": "s1",
+                "episode_index": episode_id if episode_id is not None else 0,
+                "unit_digest": "u" * 64,
+            },
         }
 
     def test_two_paraphrases_merge_into_one_finding(self) -> None:
@@ -207,11 +217,11 @@ class DedupeAndRecurrence(unittest.TestCase):
     def test_two_mechanisms_stay_two_findings(self) -> None:
         index = findings_mod.empty_index()
         findings_mod.merge_candidates(
-            index, [self.candidate("the command routed outside the closed surface")],
+            index, [self.candidate("the command routed outside the closed surface", episode_id=0)],
             {"session_id": "s1"},
         )
         findings_mod.merge_candidates(
-            index, [self.candidate("the source receipt never received a closure event")],
+            index, [self.candidate("the source receipt never received a closure event", episode_id=1)],
             {"session_id": "s1"},
         )
         self.assertEqual(len(index["findings"]), 2)
@@ -250,8 +260,10 @@ class DedupeAndRecurrence(unittest.TestCase):
             [self.candidate("Outside the closed surface, a command was routed.")],
             {"session_id": "s2"},
         )
-        # merge returned nothing new: the same finding gained an occurrence.
-        self.assertEqual(second, [])
+        # merge answered with the finding the paraphrase stood on.
+        self.assertEqual(
+            [row["finding_id"] for row in second], [first["finding_id"]]
+        )
         recurrence_mod.record_occurrence(
             self.home, first, {"session_id": "s2", "adapter": "generic", "conformant": False}
         )

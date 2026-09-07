@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from .capability import require_action
 from .errors import PalError
@@ -7,7 +7,11 @@ from .registry import load_registry, require_string_list
 from . import causal as causal_mod
 
 FINDINGS_INDEX_NAME = "findings/index.json"
-LIFECYCLE_ORDER = ("OBSERVED", "BOUND", "CHALLENGED", "QUALIFIED", "EMITTED")
+#: SUSPECTED is the pre-semantic floor of the lifecycle (PAL-ARCH-01): the
+#: state a mechanical detector signal reaches and the state a legacy
+#: mechanical-only finding is demoted to. A finding cannot leave SUSPECTED
+#: forward without a semantic DRIFT confirmation tied to its evidence.
+LIFECYCLE_ORDER = ("SUSPECTED", "OBSERVED", "BOUND", "CHALLENGED", "QUALIFIED", "EMITTED")
 TERMINAL = frozenset({"REJECTED", "MERGED", "BLOCKED", "STALE", "EMITTED"})
 #: Compatibility alias. The authority is REGISTRY.json `protected_invariants`;
 #: this tuple is what a caller with no registry in hand still gets.
@@ -25,6 +29,125 @@ ENUM_FIELDS = ("state", "drift_class", "severity", "confidence", "change_target"
 
 def empty_index() -> dict:
     return {"schema_version": 1, "findings": []}
+
+
+#: The fields a semantic DRIFT confirmation must carry, and what a forged or
+#: partial one is checked against. This is the authority boundary made data:
+#: only `submit_candidate` writes it, and only after re-deriving the evidence
+#: unit from the kernel's own index.
+CONFIRMATION_FIELDS = ("receipt_id", "verdict", "session_id", "episode_index", "unit_digest")
+
+
+def is_semantic_confirmation_tied(
+    confirmation: object, session_id: str, episode_index: int, unit_digest: str
+) -> bool:
+    """Does this confirmation stand on exactly this evidence unit?
+
+    The tie is structural: verdict DRIFT, the named session and episode, and a
+    unit digest that is not empty and not a mismatch. A missing or malformed
+    field is a different confirmation, not a weaker one.
+    """
+    if not isinstance(confirmation, dict):
+        return False
+    for field in CONFIRMATION_FIELDS:
+        value = confirmation.get(field)
+        if value is None or value == "" or not str(value).strip():
+            return False
+    if str(confirmation.get("verdict")) != "DRIFT":
+        return False
+    return (
+        str(confirmation.get("session_id")) == str(session_id)
+        and int(confirmation.get("episode_index", -1)) == int(episode_index)
+        and str(confirmation.get("unit_digest")) == str(unit_digest)
+        and bool(str(confirmation.get("unit_digest")).strip())
+    )
+
+
+def _int_or(value: object, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _confirmation_binding(confirmation: dict) -> str:
+    """The historical authority a confirmation was judged against."""
+    binding = confirmation.get("protocol_binding")
+    if not isinstance(binding, dict):
+        return "UNKNOWN"
+    return str(binding.get("binding_status") or "UNKNOWN")
+
+
+def is_semantically_confirmed(finding: dict) -> bool:
+    """Does this finding carry a semantic confirmation tied to its evidence?
+
+    Mechanical confidence, recurrence, severity, protocol binding and lifecycle
+    state are all irrelevant here by construction: only the confirmation block
+    is consulted, because only it is written by the semantic submission
+    boundary (PAL-ANALYSIS-05). A finding without one is a suspicion. The
+    confirmation must name a session+episode that is one of this finding's own
+    occurrences — so a confirmation of some other unit cannot confirm this one
+    — and it must have been judged against a BOUND historical protocol
+    authority: a drift claim without a verifiable governing protocol is not a
+    drift claim (PAL-ARCH-01).
+    """
+    confirmation = finding.get("semantic_confirmation")
+    if not isinstance(confirmation, dict):
+        return False
+    if str(confirmation.get("verdict") or "") != "DRIFT":
+        return False
+    for field in CONFIRMATION_FIELDS:
+        value = confirmation.get(field)
+        if value is None or value == "" or not str(value).strip():
+            return False
+    if _confirmation_binding(confirmation) != "BOUND":
+        return False
+    occurrences = finding.get("occurrences") or []
+    if not occurrences:
+        return False
+    for occurrence in occurrences:
+        if str(occurrence.get("session_id") or "") == str(confirmation.get("session_id")) and (
+            _int_or(occurrence.get("episode_id"), -1)
+            == _int_or(confirmation.get("episode_index"), -2)
+        ):
+            return True
+    return False
+
+
+def migrate_index(home, *, registry=None) -> dict:
+    """Demote every mechanical-only finding to SUSPECTED. Deterministic, idempotent.
+
+    Findings that reached QUALIFIED/EMITTED through the old mechanical pipeline
+    carry no semantic confirmation, so under the authority boundary they must
+    never qualify externally until a real semantic review occurs. They are not
+    deleted: every field, occurrence and audit reference is preserved, the
+    original state is recorded on the finding, and the state becomes SUSPECTED --
+    the pre-semantic floor of the lifecycle.
+    """
+    status, index, detail = load_index(home, registry=registry)
+    if status == "unrecoverable":
+        raise PalError("VALIDATION_FAILED", detail)
+    if index is None:
+        return {"migrated": 0, "already_migrated": 0, "total": 0}
+    migrated = 0
+    already = 0
+    for finding in index.get("findings") or []:
+        if finding.get("state") == "SUSPECTED":
+            already += 1
+            continue
+        if is_semantically_confirmed(finding):
+            continue
+        finding["pre_semantic_migration"] = {
+            "from_state": finding.get("state"),
+            "reason": "mechanical-only finding predates the semantic authority "
+                      "boundary; requires a semantic DRIFT confirmation before it "
+                      "may qualify externally (PAL-ARCH-01)",
+        }
+        finding["state"] = "SUSPECTED"
+        migrated += 1
+    if migrated:
+        save_index(home, index, registry=registry)
+    return {"migrated": migrated, "already_migrated": already, "total": len(index.get("findings") or [])}
 
 
 def _enums(registry):
@@ -178,20 +301,21 @@ def _occurrence_matches(rec: dict, occ: dict) -> bool:
 def find_or_create(index, candidate, session_record):
     target = fingerprint_of(candidate)
     occ = _occ(candidate, session_record)
+    # A mechanical candidate is a SIGNAL: it may merge onto an existing finding
+    # as a supporting occurrence, but it can never create a finding -- only a
+    # semantic DRIFT submission can open the finding lifecycle (PAL-ARCH-01).
     for rec in index.get("findings", []):
         if rec.get("fingerprint") == target:
             keys = {_occ_key(o) for o in rec.get("occurrences", [])}
             if _occ_key(occ) not in keys:
                 rec.setdefault("occurrences", []).append(occ)
-            if rec.get("state") not in TERMINAL:
-                rec["state"] = "OBSERVED"
             cand_m = candidate.get("mechanical_confidence")
             if cand_m in ("HIGH", "MEDIUM", "LOW"):
                 existing_m = rec.get("mechanical_confidence")
                 rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
                 # Mechanical proof is cumulative: a merge that would weaken it
                 # (an analyst confirmation always carries LOW) must not erase
-                # the detector's HIGH, or Route C qualification silently dies.
+                # the detector's HIGH.
                 if rank[cand_m] >= rank.get(existing_m, -1):
                     rec["mechanical_confidence"] = cand_m
             surface = candidate.get("historical_rule_surface")
@@ -203,10 +327,25 @@ def find_or_create(index, candidate, session_record):
                 and (rec.get("historical_rule_surface") or {}).get("status") != "RESOLVED"
             ):
                 rec["historical_rule_surface"] = surface
-            # A same-fingerprint confirmation is still a confirmation: the
-            # analyst's challenge, disposition and reasoning belong on the
-            # finding, and a FINAL verdict releases any PROVISIONAL hold.
             _attach_analyst_work(candidate, rec)
+            # Only a confirmation tied to this evidence unit AND judged against
+            # a BOUND historical authority lifts a finding out of SUSPECTED: a
+            # mechanical merge is a signal, not a verdict. A confirmed re-merge
+            # folds an open finding back to OBSERVED so the submission boundary
+            # re-runs the gates on the new disposition.
+            confirmation = candidate.get("semantic_confirmation")
+            if (
+                is_semantic_confirmation_tied(
+                    confirmation,
+                    occ.get("session_id"),
+                    _int_or(occ.get("episode_id"), -1),
+                    str((confirmation or {}).get("unit_digest") or ""),
+                )
+                and _confirmation_binding(confirmation or {}) == "BOUND"
+            ):
+                rec["semantic_confirmation"] = confirmation
+                if rec.get("state") in ("SUSPECTED", "BOUND", "CHALLENGED", "QUALIFIED"):
+                    rec["state"] = "OBSERVED"
             return rec
 
     # An analyst confirmation is a merge, never a re-raise. The deterministic
@@ -224,6 +363,21 @@ def find_or_create(index, candidate, session_record):
             if not _occurrence_matches(rec, occ):
                 continue
             _attach_analyst_work(candidate, rec)
+            # The confirmation is tied to the evidence unit it judged and
+            # recorded on the finding it stood on: this is the write that
+            # makes `is_semantically_confirmed` true. Only a BOUND-backed
+            # confirmation counts as one.
+            confirmation = candidate.get("semantic_confirmation")
+            if (
+                is_semantic_confirmation_tied(
+                    confirmation,
+                    occ.get("session_id"),
+                    _int_or(occ.get("episode_id"), -1),
+                    str((confirmation or {}).get("unit_digest") or ""),
+                )
+                and _confirmation_binding(confirmation or {}) == "BOUND"
+            ):
+                rec["semantic_confirmation"] = confirmation
             if rec.get("state") in TERMINAL:
                 # The finding already left the pipeline (an audit was emitted, a
                 # block or a rejection was recorded): record the confirmation,
@@ -237,6 +391,10 @@ def find_or_create(index, candidate, session_record):
             rec["state"] = "OBSERVED"
             rec.pop("harm_blocks", None)
             return rec
+    if str(candidate.get("detector") or "") != "analyst":
+        # A mechanical candidate names no finding of its own: it is a signal
+        # for the semantic carrier, not a finding (PAL-ARCH-01).
+        return None
     finding = {"finding_id": next_finding_id(index), "fingerprint": target, "state": "OBSERVED",
                "causal_key": causal_mod.causal_key(candidate),
                "drift_class": candidate.get("drift_class"), "severity": candidate.get("severity", "P3"),
@@ -254,9 +412,12 @@ def find_or_create(index, candidate, session_record):
                "audit": None}
     # An analyst-submitted candidate arrives with its own challenge, disposition
     # and reasoning. Those are the analyst's work product, so they are recorded
-    # on the finding rather than regenerated from a template.
+    # on the finding rather than regenerated from a template. The semantic
+    # confirmation travels with it: this is the only path that creates a
+    # confirmed finding (PAL-ARCH-01).
     for optional in ("challenge", "disposition_class", "analyst_reasoning",
-                     "episode_finality", "recurrence_spread"):
+                     "episode_finality", "recurrence_spread",
+                     "semantic_confirmation"):
         if candidate.get(optional):
             finding[optional] = candidate[optional]
     index.setdefault("findings", []).append(finding)
@@ -264,6 +425,13 @@ def find_or_create(index, candidate, session_record):
 
 
 def advance_lifecycle(finding, target, *, registry=None):
+    """Move a finding one step forward through the lifecycle.
+
+    Leaving SUSPECTED for a post-semantic state requires the semantic
+    confirmation invariant: SUSPECTED is where mechanical signals and demoted
+    legacy findings live, and only a semantic DRIFT confirmation may carry a
+    finding out of it (PAL-ARCH-01).
+    """
     life, *_ = _enums(registry)
     if target not in life:
         raise PalError("VALIDATION_FAILED", f"unknown lifecycle state {target!r}")
@@ -280,6 +448,12 @@ def advance_lifecycle(finding, target, *, registry=None):
         raise PalError("VALIDATION_FAILED",
                        f"lifecycle cannot go backward from {c!r} to {target!r}",
                        next_action="use REJECTED/MERGED/BLOCKED/STALE to leave the pipeline")
+    if c == "SUSPECTED" and not is_semantically_confirmed(finding):
+        raise PalError(
+            "VALIDATION_FAILED",
+            "a finding without semantic confirmation cannot leave SUSPECTED",
+            next_action="submit a semantic DRIFT verdict for its evidence unit",
+        )
     finding["state"] = target
 
 
@@ -327,6 +501,19 @@ def harm_blocks(finding, *, registry=None):
 
 
 def qualification_threshold(finding, *, registry=None):
+    """Can this finding qualify for an external audit?
+
+    The semantic-confirmation invariant comes first and is absolute: no
+    semantic DRIFT confirmation tied to this finding's evidence, no
+    qualification -- whatever the mechanical confidence, severity, recurrence,
+    binding or current lifecycle state (PAL-ARCH-01). The binding that counts
+    is the one the CONFIRMATION was judged against, kernel-derived at
+    submission: an unrelated BOUND occurrence cannot legitimize a confirmation
+    made against a PARTIAL unit, and several weak bindings do not establish
+    which protocol rule governed the evidence.
+    """
+    if not is_semantically_confirmed(finding):
+        return False
     state = finding.get("state")
     if state not in ("CHALLENGED", "QUALIFIED"):
         return False
@@ -334,18 +521,19 @@ def qualification_threshold(finding, *, registry=None):
         return False
     if finding.get("audit") is not None or finding.get("confidence") != "HIGH":
         return False
-    bind = (finding.get("protocol_bindings") or [{}])[0]
+    confirmation = finding.get("semantic_confirmation") or {}
+    bind_status = _confirmation_binding(confirmation)
+    if bind_status != "BOUND":
+        return False
     sev = finding.get("severity")
     if sev in ("P0", "P1") or finding.get("change_target") == CORE_PROTOCOL:
-        return bind.get("binding_status") == "BOUND"
+        return True
     if sev == "P2":
         return len(finding.get("occurrences") or []) >= 2
-    # Route C: a mechanically proven protocol contradiction qualifies even at
-    # P3 -- the detector proved it, the analyst confirmed it, the binding is
-    # exact. Absent that mechanical proof, a LOW one-off stays internal.
-    if finding.get("mechanical_confidence") == "HIGH":
-        return bind.get("binding_status") == "BOUND"
-    return False
+    # Route C: a confirmed finding with mechanical proof behind it qualifies
+    # even at P3 -- the semantic verdict owns the truth, the mechanical proof
+    # only sharpens it. Absent that proof, a LOW one-off stays internal.
+    return finding.get("mechanical_confidence") == "HIGH"
 
 
 def _rank(state):
@@ -356,12 +544,21 @@ def _rank(state):
 
 
 def merge_candidates(index, candidates, session_record):
+    """Fold candidates into the findings index.
+
+    A mechanical candidate is recorded as a signal and never produces a row
+    here: `find_or_create` returns None for it, because only a semantic DRIFT
+    submission may create a finding (PAL-ARCH-01). An analyst confirmation
+    either merges onto the finding it stood on or creates that finding.
+    """
     before = {r.get("fingerprint"): r.get("state") for r in index.get("findings", [])}
     out = []
     for cand in candidates:
         if not isinstance(cand, dict):
             continue
         finding = find_or_create(index, cand, session_record)
+        if finding is None:
+            continue
         fp, after = finding.get("fingerprint"), finding.get("state")
         if before.get(fp) is None:
             if after == "OBSERVED":

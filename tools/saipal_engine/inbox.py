@@ -85,6 +85,38 @@ def _stat_key(path: Path) -> dict | None:
     return {"size": int(info.st_size), "mtime_ns": int(info.st_mtime_ns)}
 
 
+#: How long intake will wait for the system clock to move past a file's mtime
+#: before it gives up on caching that file. Windows stamps `st_mtime_ns` from the
+#: same coarse tick `time.time_ns()` reads, so a file written moments ago reports
+#: an mtime EQUAL to the current time -- an observation that cannot be proven
+#: later than the change it observed. One scheduler tick is 15.6ms by default,
+#: so the budget covers a tick with slack and nothing longer.
+_SETTLE_BUDGET_NS = 25_000_000
+
+
+def _observation_stamp(mtime_ns: int) -> int | None:
+    """A clock reading provably later than `mtime_ns`, or None if unprovable.
+
+    `_trustworthy` accepts an entry only when its observation is strictly later
+    than the file's mtime, so a stamp taken inside the same tick as the write is
+    worthless: the entry is permanently untrusted and every cycle re-reads the
+    file, which is the whole cost PERF-002 removed. Waiting for the tick to close
+    is what makes the entry usable at all.
+
+    Refusing after the budget is what keeps a clock that will never get there --
+    an mtime in the future, a network share with its own idea of the time -- from
+    stalling intake. An uncached file is only slower, never wrong.
+    """
+    deadline = time.monotonic_ns() + _SETTLE_BUDGET_NS
+    while True:
+        now = time.time_ns()
+        if now > mtime_ns:
+            return now
+        if time.monotonic_ns() >= deadline:
+            return None
+        time.sleep(0)
+
+
 def _trustworthy(remembered: object, stat: dict) -> bool:
     """May this cache entry stand in for reading the file?
 
@@ -181,13 +213,15 @@ def import_inbox(
 
         session_id = bundle["session_id"]
         if stat is not None:
-            cache_files[path.name] = {
-                **stat,
-                "session_id": session_id,
-                "bundle_sha256": bundle_sha256,
-                "observed_at": time.time_ns(),
-            }
-            cache_dirty = True
+            observed_at = _observation_stamp(stat["mtime_ns"])
+            if observed_at is not None:
+                cache_files[path.name] = {
+                    **stat,
+                    "session_id": session_id,
+                    "bundle_sha256": bundle_sha256,
+                    "observed_at": observed_at,
+                }
+                cache_dirty = True
         generations = records_for_session(index, session_id)
         existing = generations[-1] if generations else None
 

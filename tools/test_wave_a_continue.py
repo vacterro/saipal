@@ -198,9 +198,10 @@ class ContinueCycle(unittest.TestCase):
             self.home,
             [{"id": "s1", "kind": "generic", "path": str(source_dir), "enabled": True}],
         )
+        before = support.checkout_audit_entries()
         support.run_saipal("continue", home=self.home)
         self.assertFalse((self.home / "audit").exists())
-        self.assertFalse((support.tool_root() / "audit").exists())
+        self.assertEqual(support.checkout_audit_entries(), before)
 
     # -- command surface --------------------------------------------------- #
 

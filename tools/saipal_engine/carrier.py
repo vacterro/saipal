@@ -93,6 +93,19 @@ def episode_finality(record: dict, episode: dict) -> str:
     return "PROVISIONAL" if int(episode.get("index", -1)) >= last_index else "FINAL"
 
 
+def tail_digest(record: dict, episode: dict, slice_index: int) -> str:
+    """The identity of a provisional-tail review position (PAL-SESSION-06).
+
+    The digest covers exactly the facts that make a re-review pointless: which
+    session generation, which episode, which slice of it, which span. When any
+    of them changes -- the episode grows, a new slice becomes pending, the
+    session re-imports as a new generation -- the digest changes and the unit
+    is offered again. A re-offer without a change would ask the analyst to
+    re-read an unfinished sentence it already read to the end.
+    """
+    return unit_digest(record, episode, int(slice_index))
+
+
 def semantic_state(record: dict) -> dict:
     """The session's SEMANTIC analysis position, distinct from the mechanical one.
 
@@ -104,6 +117,9 @@ def semantic_state(record: dict) -> dict:
 
     The position is an episode AND a slice inside it: a long episode is handed
     over in bounded windows, so the cursor has to name which window comes next.
+    `tail_reviewed_digest` is the material-change watermark: when set, the
+    growing HOT tail has been judged provisionally in its entirety at that
+    position, and the carrier must not re-offer it without a delta.
     """
     raw = record.get("semantic")
     state = raw if isinstance(raw, dict) else {}
@@ -115,6 +131,7 @@ def semantic_state(record: dict) -> dict:
         slice_index = int(state.get("next_slice_index") or 0)
     except (TypeError, ValueError):
         slice_index = 0
+    tail = state.get("tail_reviewed_digest")
     return {
         "next_episode_index": max(0, index),
         "next_slice_index": max(0, slice_index),
@@ -122,6 +139,7 @@ def semantic_state(record: dict) -> dict:
         "submitted": int(state.get("submitted") or 0),
         "no_drift": int(state.get("no_drift") or 0),
         "provisional": int(state.get("provisional") or 0),
+        "tail_reviewed_digest": tail if isinstance(tail, str) and tail else None,
     }
 
 
@@ -225,7 +243,20 @@ def next_unit(
         # legitimately have fewer slices than the position recorded against its
         # predecessor, and an unreachable slice would idle the analyst forever.
         slices = episode_slice_count(record, episode, limit)
-        return record, episode, min(state["next_slice_index"], slices - 1)
+        slice_at = min(state["next_slice_index"], slices - 1)
+        # Material-change rule (PAL-SESSION-06): a HOT tail that was judged
+        # provisionally in its entirety at exactly this position is not handed
+        # out again. The verdict is already recorded; the evidence has not
+        # moved; re-offering the same unfinished sentence is not work. When the
+        # episode grows, a new slice becomes pending, or the session re-imports
+        # as a new generation, the digest changes and the unit returns.
+        if (
+            episode_finality(record, episode) == "PROVISIONAL"
+            and state["tail_reviewed_digest"]
+            and state["tail_reviewed_digest"] == tail_digest(record, episode, slice_at)
+        ):
+            continue
+        return record, episode, slice_at
     return None, None, 0
 
 

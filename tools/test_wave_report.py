@@ -83,6 +83,7 @@ class ReportVerdict(ReportBase):
     def test_an_emitted_audit_reports_drift(self) -> None:
         support.put_inbox(self.home, DRIFT)
         support.run_saipal("continue", home=self.home)
+        support.submit_drift(self.home, support.next_unit(self.home))
         payload = self.report()
         self.assertEqual(payload["verdict"], "DRIFT_REPORTED")
         self.assertEqual(payload["counts"]["emitted"], 1)
@@ -99,9 +100,19 @@ class ReportVerdict(ReportBase):
         self.assertNotIn("maintainer", payload["next_action"])
 
     def test_an_internal_only_finding_reports_suspicion_not_drift(self) -> None:
-        """A LOW one-off stays internal, so the verdict must not claim an audit."""
+        """A MEDIUM-confirmed finding stays internal; the verdict must not claim an audit."""
         support.put_inbox(self.home, "source-closure-false-green.json")
         support.run_saipal("continue", home=self.home)
+        unit = support.next_unit(self.home)
+        self.assertIsNotNone(unit)
+        support.submit_drift(
+            self.home, unit,
+            drift_class="SOURCE_CLOSURE_FALSE_GREEN", severity="P2", confidence="MEDIUM",
+            disposition_class="ENGINE_ENFORCEMENT_GAP",
+            rule_ids=["PAL-EVIDENCE-01"],
+            reasoning="a source intake was accepted without a closure event",
+            root_cause="the intake lacked a closure event",
+        )
         payload = self.report()
         self.assertEqual(payload["verdict"], "DRIFT_SUSPECTED")
         self.assertEqual(payload["counts"]["emitted"], 0)
@@ -113,6 +124,7 @@ class ReportContent(ReportBase):
         super().setUp()
         support.put_inbox(self.home, DRIFT)
         support.run_saipal("continue", home=self.home)
+        support.submit_drift(self.home, support.next_unit(self.home))
         self.payload = self.report()
         self.finding = self.payload["findings"][0]
 

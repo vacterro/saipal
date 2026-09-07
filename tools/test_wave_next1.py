@@ -346,7 +346,10 @@ class DispositionIntake(unittest.TestCase):
         code, payload, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
         assert payload is not None
-        self.assertEqual(payload["audits_emitted"], 1)
+        self.assertEqual(payload["audits_emitted"], 0, "triage never emits")
+        unit = support.next_unit(self.home)
+        self.assertIsNotNone(unit)
+        support.submit_drift(self.home, unit)
         findings = _findings(self.home)
         emitted = [f for f in findings if f["state"] == "EMITTED" and f["audit"]]
         self.audit_number = emitted[0]["audit"]["audit_number"]

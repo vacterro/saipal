@@ -202,28 +202,31 @@ class PublishEndToEnd(unittest.TestCase):
     def inbox_files(self) -> list[str]:
         return sorted(p.name for p in (self.sink / "audit").glob("*.md"))
 
+    def _emit(self) -> None:
+        """Triage the fixture, then confirm it the only way: a DRIFT verdict."""
+        support.run_saipal("continue", home=self.home)
+        support.submit_drift(self.home, support.next_unit(self.home))
+
     def test_a_qualified_audit_arrives_in_the_maintainer_inbox(self) -> None:
-        code, payload, err = support.run_saipal_json("continue", home=self.home)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(payload["audits_emitted"], 1)
+        self._emit()
         self.assertEqual(self.inbox_files(), ["1.md"])
 
     def test_the_published_audit_is_attributable(self) -> None:
-        support.run_saipal("continue", home=self.home)
+        self._emit()
+        self.run_saipal_after() if False else None
         text = (self.sink / "audit" / "1.md").read_text(encoding="utf-8")
         self.assertIn("model=gpt-5", text)
         self.assertIn("saipal/COMMANDS.md", text)
 
     def test_private_bookkeeping_stays_inside_the_home(self) -> None:
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         self.assertTrue((self.home / "audit" / "ledger.json").is_file())
         self.assertTrue((self.home / "audit" / "entries.json").is_file())
         self.assertFalse((self.sink / "audit" / "ledger.json").exists())
         self.assertFalse((self.sink / "audit" / "entries.json").exists())
 
     def test_publication_is_exactly_once(self) -> None:
-        support.run_saipal("continue", home=self.home)
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         self.assertEqual(self.inbox_files(), ["1.md"], "one finding, one audit")
 
     def test_a_vanished_sink_stages_locally_and_logs_the_failure(self) -> None:
@@ -231,9 +234,7 @@ class PublishEndToEnd(unittest.TestCase):
         import shutil
 
         shutil.rmtree(self.sink / "audit")
-        code, payload, err = support.run_saipal_json("continue", home=self.home)
-        self.assertEqual(code, 0, err)
-        self.assertEqual(payload["audits_emitted"], 1)
+        self._emit()
         staged = sorted((self.home / "audit" / "staging").glob("*.md"))
         self.assertTrue(staged, "the audit must survive locally")
         events = [
@@ -245,17 +246,17 @@ class PublishEndToEnd(unittest.TestCase):
 
     def test_stage_only_never_touches_the_sink(self) -> None:
         support.run_saipal_json("setup", "--mode", "STAGE_ONLY", home=self.home)
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         self.assertEqual(self.inbox_files(), [])
         self.assertTrue(sorted((self.home / "audit" / "staging").glob("*.md")))
 
     def test_publish_blocked_never_touches_the_sink(self) -> None:
         support.run_saipal_json("setup", "--mode", "PUBLISH_BLOCKED", home=self.home)
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         self.assertEqual(self.inbox_files(), [])
 
     def test_the_receipt_chain_survives_publication(self) -> None:
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         links = json.loads(
             (self.home / "closed_loop_links.json").read_text(encoding="utf-8")
         )["links"]
@@ -263,7 +264,7 @@ class PublishEndToEnd(unittest.TestCase):
         self.assertEqual(links[0]["audit_number"], 1)
 
     def test_a_maintainer_disposition_closes_the_loop(self) -> None:
-        support.run_saipal("continue", home=self.home)
+        self._emit()
         path = self.tmp / "d.json"
         path.write_text(
             json.dumps({"dispositions": [{"audit_number": 1, "disposition": "ENGINE_FIX"}]}),

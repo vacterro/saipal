@@ -265,23 +265,30 @@ class RecurrencePipelineWiring(unittest.TestCase):
         return recur.load_recurrence(self.home)
 
     def test_pipeline_writes_drift_occurrence(self) -> None:
+        """The mechanical pass signals; only the semantic verdict writes the
+        drift occurrence, and it counts as drift rather than conformance."""
         payload = self._drift_bundle()
         support.write_inbox(self.home, "drift.json", payload)
         code, result, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
         assert result is not None
-        self.assertGreaterEqual(result["candidates"], 1)
+        self.assertGreaterEqual(int(result.get("signals_raised") or 0), 1)
+        self.assertEqual(result["candidates"], 0)
+        self.assertEqual(self._recurrence(), recur.empty_recurrence())
 
+        unit = support.next_unit(self.home)
+        self.assertIsNotNone(unit)
+        support.submit_drift(self.home, unit)
         data = self._recurrence()
         self.assertNotEqual(data, recur.empty_recurrence())
-        # some finding fingerprint carries a non-conformant drift occurrence
+        # the confirmed drift occurrence is recorded non-conformant
         found_drift = any(
             occ.get("session_id") == "pipeline-drift-001"
             and occ.get("conformant") is False
             for bucket in data["by_finding"].values()
             for occ in bucket.get("occurrences", [])
         )
-        self.assertTrue(found_drift, "pipeline must record the drift occurrence")
+        self.assertTrue(found_drift, "submission must record the drift occurrence")
 
     def test_pipeline_writes_negative_evidence(self) -> None:
         support.put_inbox(self.home, "conformant-cold.json")

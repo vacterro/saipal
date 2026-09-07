@@ -180,6 +180,26 @@ class LayerABoundary(unittest.TestCase):
         self.assertIn("submit_candidate", text)
         self.assertIn("cannot call `enqueue_audit` directly", text)
 
+    def test_installed_skill_manifest_is_the_detective_loop(self) -> None:
+        """The Freebuff-installable skill (`skills/saipal/SKILL.md`) must stay
+        the canonical detective + reporter loop: frontmatter for `/saipal`
+        routing, the exact next/submit commands, and the honesty rules that
+        keep a report from overclaiming."""
+        skill = Path(__file__).resolve().parent.parent / "skills" / "saipal" / "SKILL.md"
+        self.assertTrue(skill.exists(), "skills/saipal/SKILL.md must exist")
+        text = skill.read_text(encoding="utf-8")
+        self.assertIn("name: saipal", text)
+        self.assertIn('Trigger on "saipal"', text)
+        for command in (
+            "saipal.py cc",
+            "saipal.py --json next",
+            "saipal.py --json submit candidate.json",
+            "saipal.py report",
+        ):
+            self.assertIn(command, text, f"the skill must name {command}")
+        for honesty in ("DRIFT_SUSPECTED", "NOT_EXAMINED", "NO_DRIFT", "owner"):
+            self.assertIn(honesty, text, f"the skill must bind {honesty}")
+
     def test_manifest_lists_architecture_doc(self) -> None:
         """The runtime manifest must list ARCHITECTURE.md and agent protocol docs."""
         import json

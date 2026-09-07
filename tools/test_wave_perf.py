@@ -12,7 +12,9 @@ and a persisted watermark, not a local optimization.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -158,7 +160,7 @@ class DetectorsShareOneIndex(unittest.TestCase):
         self.assertEqual(spy.call_count, 1, "one index per session, not per episode")
 
     def test_the_detector_verdicts_are_unchanged(self) -> None:
-        """The control: an optimization that changes findings is not one."""
+        """The control: an optimization that changes the verdict is not one."""
         with tempfile.TemporaryDirectory() as tmp:
             home = support.make_home(Path(tmp))
             support.run_saipal("continue", home=home)
@@ -166,8 +168,13 @@ class DetectorsShareOneIndex(unittest.TestCase):
             support.run_saipal("continue", home=home)
             code, report, err = support.run_saipal_json("report", home=home)
             self.assertEqual(code, 0, err)
-            self.assertEqual(report["verdict"], "DRIFT_REPORTED")
-            self.assertEqual(report["counts"]["emitted"], 1)
+            self.assertEqual(report["verdict"], "NOT_EXAMINED", "triage is not a verdict")
+            signals = json.loads((home / "signals.json").read_text(encoding="utf-8"))["signals"]
+            self.assertGreaterEqual(len(signals), 1, "the fixture must still signal")
+            self.assertTrue(
+                any(s["drift_class"] == "COMMAND_ROUTE_DRIFT" for s in signals),
+                "the optimization must not change the detector's verdict",
+            )
 
 
 class InboxSkipsUnchangedFilesWithoutReadingThem(unittest.TestCase):
@@ -217,6 +224,78 @@ class InboxSkipsUnchangedFilesWithoutReadingThem(unittest.TestCase):
         self.assertEqual(
             [entry["reason"] for entry in report["skipped"]], ["duplicate digest"]
         )
+
+    def test_the_recorded_observation_is_provably_later_than_the_write(self) -> None:
+        """The cache only counts if its own entries pass `_trustworthy`.
+
+        `st_mtime_ns` and `time.time_ns()` come off the same coarse Windows tick,
+        so a file imported milliseconds after it was written was stamped with an
+        observation EQUAL to its mtime -- an entry `_trustworthy` rejects forever,
+        which silently turned the whole cache back into a full re-read on roughly
+        a quarter of runs.
+        """
+        support.put_inbox(self.home, COLD)
+        inbox_mod.import_inbox(self.home, registry=self.registry)
+        cache = json.loads(
+            (self.home / inbox_mod.INBOX_CACHE_NAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(list(cache["files"]), [COLD])
+        entry = cache["files"][COLD]
+        mtime_ns = (self.home / "session_inbox" / COLD).stat().st_mtime_ns
+        self.assertGreater(entry["observed_at"], mtime_ns)
+        self.assertTrue(inbox_mod._trustworthy(entry, {**entry}))
+
+    def test_a_write_inside_the_current_tick_is_still_cached(self) -> None:
+        """The defect, forced instead of raced.
+
+        Stamping the file just ahead of the clock reproduces on demand what
+        Windows produces by accident: `st_mtime_ns` not yet behind
+        `time.time_ns()`. A bare clock read then records an observation no later
+        than the change it observed, `_trustworthy` refuses that entry forever,
+        and the cache silently degrades to a full re-read of the whole archive.
+        Waiting out the tick is what makes the entry usable.
+        """
+        support.put_inbox(self.home, COLD)
+        path = self.home / "session_inbox" / COLD
+        just_ahead = (time.time_ns() + 10_000_000) / 1_000_000_000
+        os.utime(path, (just_ahead, just_ahead))
+        inbox_mod.import_inbox(self.home, registry=self.registry)
+        cache = json.loads(
+            (self.home / inbox_mod.INBOX_CACHE_NAME).read_text(encoding="utf-8")
+        )
+        entry = cache["files"][COLD]
+        self.assertGreater(entry["observed_at"], path.stat().st_mtime_ns)
+        with mock.patch.object(
+            bundle_mod, "load_bundle_with_digest", side_effect=AssertionError("re-read")
+        ):
+            report = inbox_mod.import_inbox(self.home, registry=self.registry)
+        self.assertEqual(
+            [row["reason"] for row in report["skipped"]], ["duplicate digest"]
+        )
+
+    def test_an_mtime_in_the_future_is_left_uncached_without_stalling(self) -> None:
+        """Red control for the wait: a clock it can never outrun is refused.
+
+        A file stamped in the future can never be observed later than itself, so
+        waiting for that would hang intake on a bad network share. Not caching it
+        is only slower; hanging is an outage.
+        """
+        support.put_inbox(self.home, COLD)
+        path = self.home / "session_inbox" / COLD
+        future = time.time() + 3600
+        os.utime(path, (future, future))
+        started = time.monotonic()
+        report = inbox_mod.import_inbox(self.home, registry=self.registry)
+        elapsed = time.monotonic() - started
+        self.assertEqual(report["new_sessions"], 1, "the evidence is still imported")
+        cache_path = self.home / inbox_mod.INBOX_CACHE_NAME
+        remembered = (
+            json.loads(cache_path.read_text(encoding="utf-8"))["files"]
+            if cache_path.is_file()
+            else {}
+        )
+        self.assertNotIn(COLD, remembered)
+        self.assertLess(elapsed, 5, "intake may not wait on a clock it cannot outrun")
 
     def test_an_unchanged_inbox_does_not_rewrite_the_index(self) -> None:
         support.put_inbox(self.home, COLD)
@@ -455,16 +534,19 @@ class RecurrenceIsWrittenOncePerSession(unittest.TestCase):
             self.assertEqual(status, "ok")
 
             # In-process, so the patch actually applies: `run_saipal` is a
-            # subprocess and would silently exercise the unpatched module. This is
-            # the FIRST analysis of the session, so the findings are new.
+            # subprocess and would silently exercise the unpatched module. This
+            # is the FIRST analysis of the session: triage raises signals and
+            # writes the negative-evidence receipt in ONE ledger transaction.
             with mock.patch.object(
                 pipeline_mod.recurrence_mod,
-                "record_batch",
-                wraps=recurrence_mod.record_batch,
+                "record_negative",
+                wraps=recurrence_mod.record_negative,
             ) as spy:
                 result = analyze_sessions(home, index, registry=registry)
-            self.assertGreaterEqual(result["findings_created"], 1, "the fixture drifts")
-            self.assertEqual(spy.call_count, 1, "one ledger transaction per session")
+            self.assertGreaterEqual(result["signals_total"], 1, "the fixture drifts")
+            self.assertEqual(result["findings_created"], 0, "triage creates no findings")
+            self.assertEqual(spy.call_count, 0,
+                             "a session with signals is NOT negative evidence")
 
 
 class LogStatsDoesNotMaterializeTheLog(unittest.TestCase):

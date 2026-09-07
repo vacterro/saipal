@@ -48,7 +48,47 @@ def _provider(session: dict) -> str:
     return head or "unknown"
 
 
-def _occurrence(session: dict, finding: dict, *, conformant: bool, occurrence_id: str = "") -> dict:
+def _refs(occurrence: dict) -> str:
+    out = []
+    for ref in occurrence.get("event_refs") or []:
+        try:
+            out.append(int(ref))
+        except (TypeError, ValueError):
+            out.append(str(ref))
+    return ",".join(str(ref) for ref in sorted(out, key=str))
+
+
+def _evidence_anchor(session: dict, finding: dict) -> list[str]:
+    """Which evidence, inside THIS session, this ledger row stands on.
+
+    The finding already dedupes its own occurrences on session + episode +
+    events, so the same anchor is available to the ledger -- and without it a
+    row can only be identified by the identity of the WRITE, which the two
+    writers of one occurrence do not share: the mechanical pass writes unkeyed
+    from the pipeline while the analyst's confirmation of that same episode
+    writes keyed by receipt. Empty (a synthetic or evidence-less finding, or a
+    ledger entry passed back in) means no anchor is claimed and the historical
+    write semantics stand.
+    """
+    session_id = session.get("session_id")
+    tokens = {
+        f"{row.get('episode_id')}:{_refs(row)}"
+        for row in finding.get("occurrences") or []
+        if isinstance(row, dict)
+        and row.get("session_id") == session_id
+        and (row.get("episode_id") is not None or row.get("event_refs"))
+    }
+    return sorted(tokens)
+
+
+def _occurrence(
+    session: dict,
+    finding: dict,
+    *,
+    conformant: bool,
+    occurrence_id: str = "",
+    evidence_anchor: list[str] | None = None,
+) -> dict:
     adapter = str(session.get("adapter") or "")
     model = adapter.split(":", 1)[0].strip().lower() or "unknown"
     entry = {
@@ -69,6 +109,12 @@ def _occurrence(session: dict, finding: dict, *, conformant: bool, occurrence_id
     # W2-002). Absent means an unkeyed caller, which stays append-only.
     if occurrence_id:
         entry["occurrence_id"] = str(occurrence_id)
+    # An identity for the EVIDENCE: one episode confirmed by two writers -- the
+    # mechanical pass and the analyst -- is one occurrence, whatever keys those
+    # writes carried.
+    anchor = evidence_anchor if evidence_anchor is not None else _evidence_anchor(session, finding)
+    if anchor:
+        entry["evidence_anchor"] = list(anchor)
     return entry
 
 
@@ -115,9 +161,14 @@ def _bump_occurrence(
 ) -> bool:
     """Record one occurrence. Returns False when it was already recorded.
 
-    A keyed occurrence is written at most once: the recurrence ledger feeds
-    cross-model conformance rates, so a crashed-then-retried submission counting
-    twice silently changes the numbers a maintainer routes by (audit W2-002).
+    An occurrence is written at most once under EITHER identity it carries: the
+    write key (a crashed-then-retried submission, audit W2-002) or the evidence
+    it stands on. The second matters because one episode has two writers -- the
+    mechanical pass records it unkeyed from the pipeline, and an analyst
+    confirmation of that same episode merges onto the same finding and records
+    it keyed by receipt. Counting that once as two silently inflates the
+    conformance rates, the spread and the carrier projection a maintainer routes
+    by.
     """
     fingerprint = str(finding.get("fingerprint") or finding.get("finding_id")
                       or finding.get("drift_class") or "UNKNOWN")
@@ -140,8 +191,21 @@ def _bump_occurrence(
         for existing in entry["occurrences"]
     ):
         return False
+    anchor = _evidence_anchor(session, finding)
+    if anchor and any(
+        list(existing.get("evidence_anchor") or []) == anchor
+        and existing.get("session_id") == session.get("session_id")
+        for existing in entry["occurrences"]
+    ):
+        return False
     entry["occurrences"].append(
-        _occurrence(session, finding, conformant=conformant, occurrence_id=occurrence_id)
+        _occurrence(
+            session,
+            finding,
+            conformant=conformant,
+            occurrence_id=occurrence_id,
+            evidence_anchor=anchor,
+        )
     )
     for rule in finding.get("rule_ids") or []:
         bucket = data["by_rule"].setdefault(str(rule), {"total": 0, "drift": 0})

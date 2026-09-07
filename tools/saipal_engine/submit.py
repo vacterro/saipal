@@ -154,6 +154,15 @@ def _advance_semantic(
         # skip the tail that made it provisional.
         if not behind and next_slice < slice_count:
             state["next_slice_index"] = max(state["next_slice_index"], next_slice)
+        # The material-change watermark (PAL-SESSION-06): when the WHOLE current
+        # tail has been judged provisionally at this position, the carrier must
+        # not hand the same unfinished sentence out again without a delta. The
+        # digest covers generation, episode, slice and span, so growth, a new
+        # pending slice, or a re-import change it and the unit returns.
+        if next_slice >= slice_count:
+            state["tail_reviewed_digest"] = carrier_mod.tail_digest(
+                record, episode, slice_index
+            )
         record["semantic"] = state
         return state
 
@@ -171,6 +180,11 @@ def _advance_semantic(
     state["next_slice_index"] = 0
     total = len(record.get("episodes") or [])
     state["exhausted"] = state["next_episode_index"] >= total
+    # A final verdict at the tail supersedes the provisional hold: the
+    # position is no longer a reviewed-and-waiting tail, so the watermark
+    # that suppresses re-offer must go with it.
+    if index >= state["next_episode_index"] - 1:
+        state.pop("tail_reviewed_digest", None)
     record["semantic"] = state
     return state
 
@@ -195,12 +209,15 @@ def _shape_finding(
     record: dict,
     historical: dict | None,
     spread: dict | None = None,
+    confirmation: dict | None = None,
 ) -> dict:
     """The analyst's candidate in the finding shape Layer A already knows.
 
     Confidence is the analyst's proposal, but the no-hindsight gate still owns
     the ceiling: an unbound session cannot yield a claimable violation whatever
-    the model asserts.
+    the model asserts. `confirmation` is the semantic DRIFT receipt block that
+    ties the resulting finding to the exact evidence unit it was judged on --
+    without it the finding stays SUSPECTED forever.
     """
     protocol = record.get("protocol") if isinstance(record.get("protocol"), dict) else {}
     claimable = sessions_mod.historical_applicability(
@@ -232,6 +249,7 @@ def _shape_finding(
         "root_cause_hypothesis": candidate.get("root_cause", ""),
         "historical_rule_surface": historical,
         "recurrence_spread": spread,
+        "semantic_confirmation": confirmation,
         "challenge": {
             "pass_a": challenge.get("prosecutor", ""),
             "pass_b": challenge.get("defender", ""),
@@ -379,6 +397,33 @@ def submit_candidate(
     verdict = str(normalized["verdict"])
     finality = carrier_mod.episode_finality(record, episode)
 
+    # The authority gates (PAL-ARCH-01), applied to the kernel's own view of
+    # the unit, never to the analyst's assertions:
+    #
+    # 1. A DRIFT verdict that names no rule cannot identify what it claims was
+    #    violated -- a complaint, not a forensic finding.
+    # 2. A DRIFT verdict whose evidence unit does not stand on a BOUND
+    #    historical protocol authority cannot identify WHICH protocol governed
+    #    it. It is absorbed as INSUFFICIENT_EVIDENCE: the analyst's reasoning
+    #    and the attempted verdict are preserved as provenance, no drift
+    #    finding is created, and no audit can ever leave.
+    downgrade: str | None = None
+    if verdict == cand_mod.VERDICT_DRIFT and not list(normalized.get("rule_ids") or []):
+        downgrade = "no rule ids supplied; the drift claim names no governing rule"
+    unit_binding = unit.get("protocol") or {}
+    if (
+        downgrade is None
+        and verdict == cand_mod.VERDICT_DRIFT
+        and str(unit_binding.get("binding_status") or "UNKNOWN") != "BOUND"
+    ):
+        downgrade = (
+            "insufficient historical protocol binding: the evidence unit is "
+            f"{unit_binding.get('binding_status') or 'UNKNOWN'}, so the governing "
+            "protocol cannot be established for a drift claim"
+        )
+    if downgrade is not None:
+        verdict = cand_mod.VERDICT_INSUFFICIENT
+
     # The intention is durable BEFORE the effects it protects. The receipt is the
     # idempotency authority but it commits last, so a crash in between used to
     # leave durable semantic/recurrence state with no operation identity and the
@@ -430,6 +475,16 @@ def submit_candidate(
         "recorded_at": _now(),
         "recovered": recovered,
     }
+    if downgrade is not None:
+        # Provenance, never a rewrite: the analyst attempted DRIFT, the kernel
+        # absorbed it as INSUFFICIENT_EVIDENCE, and the reason is on record.
+        entry["attempted_verdict"] = "DRIFT"
+        entry["authority_downgrade"] = downgrade
+        entry["protocol_binding"] = {
+            key: unit_binding.get(key)
+            for key in ("binding_status", "proof_level", "version")
+            if unit_binding.get(key) is not None
+        }
     receipts["receipts"].append(entry)
     # The receipt IS the completion, so the intention is retired in the same
     # write: an operation outliving its receipt would invite a second recovery of
@@ -471,6 +526,8 @@ def submit_candidate(
         "semantic": semantic,
         "duplicate": False,
         "recovered": recovered,
+        **({"attempted_verdict": "DRIFT", "authority_downgrade": downgrade}
+           if downgrade is not None else {}),
     }
 
 
@@ -505,12 +562,43 @@ def _absorb_drift(
         )
     if findings_status == "absent" or findings_idx is None:
         findings_idx = findings_mod.empty_index()
+    # The submission boundary is also an authority boundary: a legacy
+    # mechanical-era finding must be demoted before a confirmation can merge
+    # onto it, so a stale QUALIFIED/EMITTED row cannot be acted on. The
+    # migration is deterministic and idempotent.
+    findings_mod.migrate_index(home, registry=registry)
+    findings_status, findings_idx, detail = findings_mod.load_index(home, registry=registry)
+    if findings_status == "unrecoverable":
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"findings index is unusable: {detail}",
+            next_action="repair or remove .saipal/findings/index.json by hand",
+        )
+    if findings_status == "absent" or findings_idx is None:
+        findings_idx = findings_mod.empty_index()
 
     shaped = _shape_finding(
         candidate,
         record,
         unit.get("historical_rule_surface"),
         (unit.get("recurrence") or {}).get("spread"),
+        {
+            "receipt_id": occurrence_id,
+            "verdict": str(candidate.get("verdict") or ""),
+            "session_id": str(record.get("session_id") or ""),
+            "episode_index": int(candidate.get("episode_index", -1)),
+            "unit_digest": str(candidate.get("unit_digest") or ""),
+            # Kernel-derived historical authority for THIS evidence unit: the
+            # confirmation names the binding it was judged against, so
+            # qualification can never borrow an unrelated BOUND occurrence
+            # (PAL-ARCH-01).
+            "protocol_binding": {
+                key: unit.get("protocol", {}).get(key)
+                for key in ("binding_status", "proof_level", "version",
+                            "git_head", "registry_sha256", "tree_fingerprint")
+                if unit.get("protocol", {}).get(key) is not None
+            },
+        },
     )
     shaped["episode_finality"] = finality
     advanced = findings_mod.merge_candidates(findings_idx, [shaped], record)
@@ -519,7 +607,11 @@ def _absorb_drift(
         return None, None
 
     finding = advanced[0]
-    if finding.get("state") in findings_mod.TERMINAL:
+    # A semantically confirmed drift occurrence is drift, not conformance: the
+    # recurrence row must count it as such (the mechanical pass no longer
+    # marks sessions non-conformant, because triage is not a verdict).
+    record["conformant"] = False
+    if finding.get("state") in findings_mod.TERMINAL and finding.get("state") != "EMITTED":
         # A confirmation of a finding that already left the pipeline (an audit
         # was emitted, or a block/rejection was recorded). The analyst's work
         # product was recorded by the merge; nothing re-advances, nothing
@@ -530,6 +622,15 @@ def _absorb_drift(
             home, finding, record, occurrence_id=occurrence_id, registry=registry
         )
         return finding.get("finding_id"), audit
+    # An EMITTED finding is terminal but still needs its confirmation recorded:
+    # a new session occurrence of the same root cause merges as a new
+    # occurrence rather than a re-opening of the lifecycle.
+    if finding.get("state") == "EMITTED":
+        findings_mod.save_index(home, findings_idx, registry=registry)
+        recurrence_mod.record_occurrence(
+            home, finding, record, occurrence_id=occurrence_id, registry=registry
+        )
+        return finding.get("finding_id"), finding.get("audit")
     pipeline_mod.advance_to_qualified(findings_idx, finding)
     audit = None
     emit_allowed = finality == "FINAL"
@@ -557,6 +658,25 @@ def _absorb_drift(
         home, finding, record, occurrence_id=occurrence_id, registry=registry
     )
     return finding.get("finding_id"), audit
+
+
+def pending_final_sessions(home: Path | str) -> list[str]:
+    """Session ids whose growing HOT tail holds provisional judgments.
+
+    When such a session finalizes, every required final semantic unit must
+    receive final review; this list is the observable backlog of that promise
+    (PAL-SESSION-06). A session leaves the list when its tail is re-offered
+    after a material change, or when a new COLD generation replaces it.
+    """
+    status, payload, _detail = load_receipts(home)
+    if status != "ok" or payload is None:
+        return []
+    provisional = {
+        str(entry.get("session_id") or "")
+        for entry in payload.get("receipts") or []
+        if isinstance(entry, dict) and str(entry.get("finality") or "FINAL") == "PROVISIONAL"
+    }
+    return sorted(sid for sid in provisional if sid)
 
 
 def _now() -> str:

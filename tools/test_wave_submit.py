@@ -452,7 +452,7 @@ class MultiGenerationSessionIsAddressable(unittest.TestCase):
 class NoHindsightSurvivesSubmission(SubmitBase):
     """An analyst cannot assert its way past the no-hindsight gate."""
 
-    def test_an_unbound_session_caps_analyst_confidence(self) -> None:
+    def test_an_unbound_session_never_yields_a_drift_finding(self) -> None:
         # A home holding only the unbound fixture, so the pending unit is that
         # session and the assertion is not at the mercy of intake ordering.
         home = support.make_home(self.tmp, ".saipal-unbound")
@@ -468,27 +468,24 @@ class NoHindsightSurvivesSubmission(SubmitBase):
         receipt = submit_mod.submit_candidate(
             home, self.drift(unit, confidence="HIGH"), registry=self.registry
         )
-        findings = json.loads(
-            (home / "findings" / "index.json").read_text(encoding="utf-8")
-        )["findings"]
-        finding = next(f for f in findings if f["finding_id"] == receipt["finding_id"])
-        self.assertEqual(
-            finding["confidence"], "LOW",
-            "an unbound session cannot carry a HIGH-confidence violation claim",
-        )
+        # Fail-closed (PAL-ARCH-01): without a BOUND historical authority the
+        # DRIFT verdict cannot survive as protocol drift.
+        self.assertEqual(receipt["verdict"], "INSUFFICIENT_EVIDENCE")
+        self.assertEqual(receipt.get("attempted_verdict"), "DRIFT")
+        self.assertIn("binding", receipt.get("authority_downgrade", ""))
+        self.assertIsNone(receipt["finding_id"], "no drift finding on an unbound unit")
         self.assertIsNone(receipt["audit"], "no audit may leave on an unbound claim")
+        self.assertFalse((home / "findings" / "index.json").exists())
 
 
 class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
-    """A drifting episode is usually offered with a mechanical finding already
-    in flight; the analyst's own-words DRIFT must confirm it, not re-raise it.
+    """A drift episode may stand on a finding already in flight; the analyst's
+    own-words DRIFT must confirm it, not re-raise it.
 
-    `cc` runs the deterministic pass before the analyst loop, so the episode
-    under judgment commonly already stands on a mechanical finding (the
-    carrier's `open_candidates` says so). Fingerprints will not agree --
-    template prose and analyst prose are different descriptions of one
-    mechanism -- so the merge falls back to the shared occurrence anchor:
-    same session, same episode, same drift class, same event
+    Under the authority boundary the finding is created by a FIRST semantic
+    submission; a SECOND submission over the same episode (different wording,
+    different fingerprint) merges onto it through the shared occurrence
+    anchor: same session, same episode, same drift class, same event
     (PAL-ANALYSIS-01 "the analyst does not re-raise them"; PAL-ANALYSIS-05
     "merged through the existing finding lifecycle").
     """
@@ -509,21 +506,40 @@ class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
         support.run_saipal("continue", home=home)
         return home
 
-    def _stage_unbound(self, home: Path) -> None:
-        """Raw fixture copy: the release claim cannot verify, so the binding is
-        PARTIAL and the mechanical finding stays open (QUALIFIED, no audit)."""
-        inbox = home / "session_inbox"
-        inbox.mkdir(parents=True, exist_ok=True)
-        (inbox / "drift.json").write_bytes(
-            support.fixture("agent-noncompliance-command-route.json").read_bytes()
-        )
-        support.run_saipal("continue", home=home)
-
-    def _stage_bound(self, home: Path) -> None:
-        """Stamped fixture: verified against the declared authority, so the
-        binding is BOUND and the mechanical finding emits its audit."""
+    def _stage_open(self, home: Path) -> None:
+        """Open finding: the first (P3/MEDIUM) submission creates it on a
+        verified BOUND session; a MEDIUM-confidence P3 cannot emit, so the
+        finding stays internal (QUALIFIED, no audit)."""
         support.put_inbox(home, "agent-noncompliance-command-route.json")
         support.run_saipal("continue", home=home)
+        unit = self._unit_for_drift_episode(home)
+        receipt = submit_mod.submit_candidate(
+            home, self._confirmation(unit, self._TEMPLATE_CAUSE,
+                                     reasoning="first-pass template stage"), registry=self.registry
+        )
+        self.assertFalse(receipt["duplicate"])
+
+    # Kept for callers that stage an emitted (P1/HIGH) finding.
+    _stage_unbound = _stage_open
+
+    _TEMPLATE_CAUSE = (
+        "drift class 'COMMAND_ROUTE_DRIFT' raised by detect_command_route "
+        "with no analyst template; mechanical confidence stands on its own"
+    )
+
+    def _stage_bound(self, home: Path) -> None:
+        """Emitted finding: the first (P1/HIGH) submission on a verified BOUND
+        session publishes its audit."""
+        support.put_inbox(home, "agent-noncompliance-command-route.json")
+        support.run_saipal("continue", home=home)
+        unit = self._unit_for_drift_episode(home)
+        receipt = submit_mod.submit_candidate(
+            home,
+            self._confirmation(unit, self._TEMPLATE_CAUSE, severity="P1", confidence="HIGH",
+                               reasoning="first-pass template stage"),
+            registry=self.registry,
+        )
+        self.assertFalse(receipt["duplicate"])
 
     def _findings(self, home: Path) -> list[dict]:
         path = home / "findings" / "index.json"
@@ -544,8 +560,8 @@ class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
         self.assertEqual(unit["carrier"], "analyze-episodes")
         return unit
 
-    def _confirmation(self, unit: dict, root_cause: str) -> dict:
-        return {
+    def _confirmation(self, unit: dict, root_cause: str, **overrides) -> dict:
+        payload = {
             "schema_version": 1,
             "verdict": "DRIFT",
             "unit_digest": unit["unit_digest"],
@@ -553,9 +569,10 @@ class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
             "episode_index": unit["episode"]["index"],
             "slice_index": unit["slice"]["index"],
             "disposition_class": "ENGINE_ENFORCEMENT_GAP",
-            "reasoning": (
+            "reasoning": overrides.pop(
+                "reasoning",
                 "the engine executed an undeclared command with a force flag "
-                "and the edit landed on the protocol core"
+                "and the edit landed on the protocol core",
             ),
             "rule_ids": ["PAL-CMD-01", "PAL-CMD-02", "PAL-CMD-03"],
             "event_refs": [5],
@@ -575,6 +592,8 @@ class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
             "missing_evidence": [],
             "protected_invariants": ["destructive_confirmation"],
         }
+        payload.update(overrides)
+        return payload
 
     def _analyst_fingerprint(self, root_cause: str, rule_ids: list[str]) -> str:
         from saipal_engine import findings as findings_mod
@@ -663,10 +682,11 @@ class AnalystConfirmationMergesIntoTheMechanicalFinding(unittest.TestCase):
         self.assertIsNotNone(
             after[0].get("analyst_reasoning"), "the analyst's judgment was recorded"
         )
-        self.assertEqual(
-            after[0]["mechanical_confidence"], "HIGH",
-            "a confirmation must not erase the detector's mechanical proof",
-        )
+        # Under the authority boundary the finding is analyst-born: both
+        # submissions are semantic confirmations, so mechanical_confidence
+        # stays LOW. (The rank-merge rule that protects a detector's HIGH is
+        # unit-tested in test_wave_causal / findings internals.)
+        self.assertEqual(after[0]["mechanical_confidence"], "LOW")
 
     def test_a_confirmation_of_an_emitted_finding_reuses_its_audit(self) -> None:
         """Red control: a BOUND session already emitted the mechanical audit; a

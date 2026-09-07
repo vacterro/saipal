@@ -163,3 +163,130 @@ def auto_sources() -> list[dict]:
     except (OSError, ValueError, ImportError):
         pass
     return out
+
+
+#: Known vendor session-store locations for every adapter that has one, in
+#: preference order. An adapter with no stable vendor location is absent here
+#: and is only ever driven by explicit configuration.
+_KNOWN_STORES: dict[str, tuple[str, ...]] = {
+    # opencode ships a single SQLite store under its data home.
+    "opencode": (
+        "~/.local/share/opencode",
+        "~/.config/opencode",
+        "~/.opencode",
+    ),
+    # Claude Code writes project-local session transcripts.
+    "claude": ("~/.claude/projects",),
+    # Gemini CLI keeps session history under its state dir.
+    "gemini": ("~/.gemini/tmp", "~/.gemini/sessions"),
+}
+
+
+def _store_candidates(kind: str) -> list[Path]:
+    out: list[Path] = []
+    for raw in _KNOWN_STORES.get(kind, ()):
+        path = Path(raw).expanduser()
+        out.append(path)
+    return out
+
+
+def source_status(kind: str, path: Path, *, enabled: bool) -> str:
+    """The observable state of one source: configured or not, usable or not."""
+    if not enabled:
+        return SOURCE_DISABLED
+    if kind not in ADAPTER_REGISTRY:
+        return "UNSUPPORTED_ADAPTER"
+    if not path.exists():
+        return "UNAVAILABLE"
+    try:
+        sessions = len(ADAPTER_REGISTRY[kind].discover(str(path)))
+    except Exception:
+        return "MISCONFIGURED"
+    return "READY" if sessions else "EMPTY"
+
+
+def sources_report(home: Path | str) -> dict[str, dict]:
+    """Per-adapter discovery state for every supported session producer.
+
+    The report makes the coverage claim honest (PAL-ARCH-01): it shows, for
+    each registered adapter, whether it is auto-discovered, configured in
+    `sources.json`, present on this machine, and yielding sessions. A silent
+    OpenCode-only corpus is visible as exactly that instead of reading as
+    broad coverage.
+    """
+    root = Path(home)
+    status, payload, _detail = load_sources(root)
+    if status == SOURCES_UNRECOVERABLE:
+        raise PalError(
+            "INVALID_SOURCE_REGISTRY",
+            "sources.json is unusable; refusing to guess which sources exist",
+            next_action="repair sources.json by hand, then run `saipal continue`",
+        )
+    configured: dict[str, list[dict]] = {}
+    for source in (payload or {}).get("sources") or []:
+        if isinstance(source, dict) and source.get("kind"):
+            configured.setdefault(str(source["kind"]), []).append(source)
+
+    report: dict[str, dict] = {}
+    auto_found = {row["kind"]: row for row in auto_sources()}
+    for kind in sorted(ADAPTER_REGISTRY):
+        if kind in auto_found:
+            row = dict(auto_found[kind])
+            row["discovery"] = "auto"
+            row["configured"] = False
+        elif kind in configured:
+            # Prefer the first configured source of this kind that is enabled.
+            chosen = next(
+                (s for s in configured[kind] if s.get("enabled")),
+                configured[kind][0],
+            )
+            path = Path(str(chosen.get("path") or "")).expanduser()
+            row = {
+                "id": str(chosen.get("id") or f"{kind}-configured"),
+                "kind": kind,
+                "path": str(path),
+                "enabled": bool(chosen.get("enabled")),
+                "exists": path.exists(),
+                "sessions": 0,
+                "discovery": "configured",
+                "configured": True,
+            }
+        else:
+            # No configuration: report whether a known vendor location exists
+            # on this machine, so an operator can see what COULD be onboarded.
+            candidates = _store_candidates(kind)
+            found = next((p for p in candidates if p.exists()), None)
+            if found is not None:
+                row = {
+                    "id": f"{kind}-vendor",
+                    "kind": kind,
+                    "path": str(found),
+                    "enabled": False,
+                    "exists": True,
+                    "sessions": 0,
+                    "discovery": "vendor-location",
+                    "configured": False,
+                }
+            else:
+                row = {
+                    "id": kind,
+                    "kind": kind,
+                    "path": None,
+                    "enabled": False,
+                    "exists": False,
+                    "sessions": 0,
+                    "discovery": "unconfigured",
+                    "configured": False,
+                }
+        row["status"] = source_status(
+            kind,
+            Path(row["path"]) if row.get("path") else Path("/nonexistent"),
+            enabled=bool(row.get("enabled")),
+        )
+        if row["status"] in ("READY", "EMPTY") and row.get("path"):
+            try:
+                row["sessions"] = len(ADAPTER_REGISTRY[kind].discover(str(row["path"])))
+            except Exception:
+                row["sessions"] = 0
+        report[kind] = row
+    return report

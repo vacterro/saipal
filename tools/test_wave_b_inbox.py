@@ -311,11 +311,12 @@ class InboxImport(unittest.TestCase):
 
     def test_no_audit_is_emitted_after_importing_sessions(self) -> None:
         support.put_inbox(self.home, COLD, HOT)
+        before = support.checkout_audit_entries()
         payload = self._import()
         self.assertEqual(payload["audits_emitted"], 0)
         self.assertEqual(payload["candidates"], 0)
         self.assertFalse((self.home / "audit").exists())
-        self.assertFalse((support.tool_root() / "audit").exists())
+        self.assertEqual(support.checkout_audit_entries(), before)
 
     # -- reporting --------------------------------------------------------- #
 

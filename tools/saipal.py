@@ -178,20 +178,59 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         )
 
     from saipal_engine.pipeline import analyze_sessions
-    from saipal_engine.publications import retry_pending
+    from saipal_engine.publications import (
+        retry_pending, pending as pending_publications, quarantine_unconfirmed,
+    )
+    from saipal_engine.findings import migrate_index
+
+    # The authority/schema migration is the FIRST mutation of the cycle
+    # (PAL-ARCH-01): it runs before publication retry, before analysis, and
+    # even when no session index exists -- so no mechanical-era finding can be
+    # acted on, published, or grandfathered while still claiming an old state.
+    # Deterministic and idempotent; it never depends on session analysis.
+    migration = migrate_index(home, registry=registry)
+
+    # Quarantine BEFORE retry: a pending ledger entry is transport history,
+    # not authority to publish. An audit whose finding lacks a semantic DRIFT
+    # confirmation tied to a BOUND historical authority is held with its bytes
+    # intact instead of being delivered into SAIPEN.
+    quarantined = quarantine_unconfirmed(home, registry=registry)
 
     # A restored sink receives the backlog BEFORE anything new is produced:
     # an undelivered audit is older evidence than whatever this cycle finds.
     republished = retry_pending(home, registry=registry)
 
-    analysis = {"sessions_analyzed": 0, "events_analyzed": 0,
-                "findings_created": 0, "findings_rejected": 0,
+    analysis = {"sessions_analyzed": 0, "events_analyzed": 0, "signals_total": 0,
+                "signals": [], "findings_created": 0, "findings_rejected": 0,
                 "audits_emitted": [], "candidates_total": 0}
     if session_index is not None:
         analysis = analyze_sessions(home, session_index, registry=registry)
 
+    # Local staging is not delivery: the cycle reports what a sink has and has
+    # not confirmed, so "EMITTED" can never silently read as "delivered"
+    # (audit CORE-007).
+    outstanding = pending_publications(home)
+    publication = {
+        "mode": (config or {}).get("publication_mode", "STAGE_ONLY"),
+        "republished": republished.get("published", 0),
+        "delivered": republished.get("published", 0),
+        "pending": len(outstanding),
+        "quarantined": republished.get("quarantined", 0) + len(quarantined),
+        "quarantine_reasons": [
+            {"audit_number": row.get("audit_number"),
+             "reason": "; ".join(row.get("quarantine_problems") or [])}
+            for row in (quarantined or [])[:5]
+        ],
+        "pending_audits": [
+            {"audit_number": row.get("audit_number"), "reason": row.get("reason")}
+            for row in outstanding[:5]
+        ],
+        "legacy_migration": migration,
+    }
+
     candidates = int(analysis["findings_created"])
     audits_emitted = len(analysis["audits_emitted"])
+    signals_raised = int(analysis.get("signals_total") or 0)
 
     if state is None:
         state = fresh_state(registry=registry)
@@ -237,9 +276,11 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         "dispatch": dispatch, "sessions_indexed": intake["new_sessions"],
         "sessions_analyzed": analysis["sessions_analyzed"],
         "events_analyzed": analysis["events_analyzed"],
+        "signals_raised": signals_raised,
         "candidates": candidates,
         "findings_rejected": analysis["findings_rejected"],
         "audits_emitted": audits_emitted,
+        "publication": publication,
         "trigger_claimed": trigger_claimed,
         "publication_retry": republished,
         "next_action": state["next_action"],
@@ -332,10 +373,10 @@ def _continue_next_action(intake: dict, enabled: list, analysis: dict | None = N
             f"{len(analysis['audits_emitted'])} qualified audit(s) emitted; "
             "run `saipal status` for details"
         )
-    if analysis.get("findings_created"):
+    if int(analysis.get("signals_total") or 0):
         return (
-            f"{int(analysis['findings_created'])} candidate finding(s) created; "
-            "run `saipal status` for details"
+            f"{int(analysis['signals_total'])} mechanical signal(s) raised for "
+            "analyst review; run `saipal --json next` for the first unit"
         )
     if intake["conflicts"]:
         return (
@@ -532,6 +573,8 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
     from saipal_engine.closedloop import load_links
     from saipal_engine.sessions import load_index as load_session_index
     from saipal_engine.sink import configured_sink
+    from saipal_engine.sources import sources_report
+    from saipal_engine.publications import pending as pending_publications
 
     config_status, config, detail = load_config(home)
     sources_status, sources_payload, sources_detail = load_sources(home)
@@ -552,6 +595,31 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
 
         for key, value in protocol_authority(home, config).items():
             authority[key] = str(value) if value is not None else None
+
+    # Protocol binding is an observable distribution, not a binary: a drift
+    # claim rests on BOUND sessions, so the doctor names how much of the
+    # indexed corpus actually has one.
+    binding_counts = {"BOUND": 0, "PARTIAL": 0, "UNKNOWN": 0}
+    for record in (session_index or {}).get("sessions") or []:
+        status_value = str((record.get("protocol") or {}).get("binding_status") or "UNKNOWN")
+        binding_counts[status_value] = binding_counts.get(status_value, 0) + 1
+
+    # Every supported session producer is reported, configured or not: a home
+    # that only ever indexed OpenCode must be able to say so (PAL-ARCH-01).
+    try:
+        discovery = sources_report(home)
+    except PalError as exc:
+        discovery = {"_error": exc.message}
+    configured_kinds = sorted(
+        kind for kind, row in discovery.items()
+        if isinstance(row, dict) and row.get("configured")
+    )
+    unconfigured_kinds = sorted(
+        kind for kind, row in discovery.items()
+        if isinstance(row, dict) and not row.get("configured")
+    )
+
+    pending = pending_publications(home)
     result = {
         "ok": True,
         "command": "doctor",
@@ -560,17 +628,33 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
         "sources_status": sources_status,
         "sources_detail": sources_detail,
         "sources_count": len((sources_payload or {}).get("sources", [])) if sources_payload else 0,
+        "sources": discovery,
+        "sources_configured": configured_kinds,
+        "sources_unconfigured": unconfigured_kinds,
         "adapter_available": True,
         "config_status": config_status,
         "config_detail": detail,
         "publication_mode": mode,
+        "saipen_delivery": {
+            "mode": mode,
+            "sink_configured": sink_status == "ok",
+            "sink_status": sink_status,
+            "sink_detail": sink_detail,
+            "staged_audits": staged,
+            "pending_delivery": len(pending),
+            "note": (
+                "PUBLISH_ENABLED delivers into the declared SAIPEN intake; "
+                "STAGE_ONLY keeps every audit inside this home"
+            ),
+        },
         "protocol_authority": authority,
         "protocol_authority_configured": any(authority.values()),
+        "binding_counts": binding_counts,
+        "sessions_indexed": len((session_index or {}).get("sessions", [])) if session_index else 0,
         "sink_status": sink_status,
         "sink_detail": sink_detail,
         "index_status": index_status,
         "index_detail": index_detail,
-        "sessions_indexed": len((session_index or {}).get("sessions", [])) if session_index else 0,
         "links_status": links_status,
         "links_detail": links_detail,
         "staged_audits": staged,

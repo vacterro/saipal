@@ -289,17 +289,18 @@
     "default_before": 3,
     "default_after": 3
   },
-  "finding_lifecycle": [
-    "OBSERVED",
-    "BOUND",
-    "CHALLENGED",
-    "QUALIFIED",
-    "REJECTED",
-    "MERGED",
-    "BLOCKED",
-    "STALE",
-    "EMITTED"
-  ],
+ "finding_lifecycle": [
+  "SUSPECTED",
+  "OBSERVED",
+  "BOUND",
+  "CHALLENGED",
+  "QUALIFIED",
+  "REJECTED",
+  "MERGED",
+  "BLOCKED",
+  "STALE",
+  "EMITTED"
+ ],
   "confidence_enum": ["HIGH", "MEDIUM", "LOW"],
   "severity_enum": ["P0", "P1", "P2", "P3"],
   "drift_taxonomy": [
@@ -560,6 +561,7 @@
     "EVIDENCE_MISMATCH",
     "EVIDENCE_UNSUPPORTED",
     "CANDIDATE_INADMISSIBLE",
-    "CANDIDATE_OUT_OF_SCOPE"
+    "CANDIDATE_OUT_OF_SCOPE",
+    "SEMANTIC_CONFIRMATION_REQUIRED"
   ]
 }

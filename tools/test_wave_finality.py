@@ -247,13 +247,20 @@ class ProvisionalSubmission(unittest.TestCase):
         )
         self.assertEqual(after["provisional"], before["provisional"] + 1)
 
-    def test_the_same_provisional_unit_is_offered_again(self) -> None:
+    def test_the_unchanged_provisional_unit_is_not_re_offered(self) -> None:
+        """Material-change rule (PAL-SESSION-06): a tail judged provisionally
+        at this exact position is not handed out again without a delta."""
         submit_mod.submit_candidate(
             self.home, self.drift(self.unit), registry=self.registry
         )
         again = carrier_mod.build_carrier(self.home, registry=self.registry)
-        self.assertEqual(again["episode"]["index"], self.unit["episode"]["index"])
-        self.assertEqual(again["episode"]["finality"], "PROVISIONAL")
+        if again.get("session"):
+            self.assertNotEqual(
+                again["session"]["session_id"], self.unit["session"]["session_id"],
+                "an unchanged HOT tail must not be re-offered",
+            )
+        else:
+            self.assertEqual(again["carrier"], "idle")
 
     def test_a_provisional_no_drift_receipt_also_holds_position(self) -> None:
         before = carrier_mod.semantic_state(self.record())
@@ -359,11 +366,20 @@ class ProvisionalBecomesFinal(unittest.TestCase):
 
         index = findings_mod.empty_index()
         candidate = {
+            "detector": "analyst",
             "drift_class": "COMMAND_ROUTE_DRIFT",
             "rule_ids": ["PAL-CMD-01"],
             "change_target": "ENGINE",
             "root_cause": "the closed command surface was not consulted",
             "episode_finality": "PROVISIONAL",
+            "semantic_confirmation": {
+                "receipt_id": "rcp-finality",
+                "verdict": "DRIFT",
+                "session_id": record["session_id"],
+                "episode_index": 0,
+                "unit_digest": "f" * 64,
+                "protocol_binding": {"binding_status": "BOUND"},
+            },
         }
         first = findings_mod.merge_candidates(index, [candidate], record)[0]
         self.assertEqual(first["episode_finality"], "PROVISIONAL")

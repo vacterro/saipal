@@ -36,6 +36,26 @@ write, and the part that writes cannot interpret.
 - `saipal/COMMANDS.md` — the operator surface
 - `saipal/INDEX.md` — document map: one question, one owner document
 
+## Install it as a skill
+
+`skills/saipal/SKILL.md` is the Freebuff skill manifest for `/saipal cc`.
+Copy it into your platform skills directory to make the command available to
+any agent:
+
+```bash
+mkdir -p "$HOME/.agents/skills/saipal"
+cp skills/saipal/SKILL.md "$HOME/.agents/skills/saipal/SKILL.md"
+```
+
+`/saipal cc` engages DETECTIVE mode (the bounded analyst loop: `cc` →
+`--json next` → reason prosecutor/defender → `submit` → repeat within
+`SAIPAL_CC_BUDGET`) and ends in REPORTER mode (`report`), so an agent given
+the skill can judge real sessions and report drifts with attribution. The
+engine and protocol stay in this repository; the skill only resolves
+`saipal_root` (env `SAIPAL_ROOT`, then the known checkout, then nearest
+ancestor holding `tools/saipal.py` + `saipal/SKILL.md`) and the `.saipal/`
+home.
+
 ## Run it
 
 ```bash
@@ -94,9 +114,9 @@ is therefore *proved* clean rather than merely unaccused.
 
 ## Status
 
-Version 0.4.1. Waves A–I plus the semantic analyst loop (carrier, candidate
+Version 0.4.2. Waves A–I plus the semantic analyst loop (carrier, candidate
 schema, submission boundary, no-drift receipts, coverage, paged episodes,
-sink retry, trigger coalescing) are implemented and green: 949 unit tests and
+sink retry, trigger coalescing) are implemented and green: 970 unit tests and
 273 validator checks.
 
 Publication defaults to `STAGE_ONLY`; `PUBLISH_ENABLED` requires an explicit

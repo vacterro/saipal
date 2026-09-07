@@ -597,6 +597,8 @@ class DispositionHistoryIsAppendOnly(unittest.TestCase):
         support.run_saipal("continue", home=self.home)
         support.put_inbox(self.home, DRIFT)
         support.run_saipal("continue", home=self.home)
+        # The finding exists only after a semantic DRIFT verdict (PAL-ARCH-01).
+        support.submit_drift(self.home, support.next_unit(self.home))
         links = self.home / "closed_loop_links.json"
         self.assertTrue(links.is_file(), "the drift fixture must have emitted an audit")
         self.audit_number = json.loads(links.read_text(encoding="utf-8"))["links"][0][

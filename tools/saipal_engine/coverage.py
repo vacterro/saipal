@@ -102,6 +102,11 @@ def session_coverage(
         "final": final,
         "provisional": provisional,
         "pending": max(0, total - final - provisional),
+        # Episodes that do not yet carry a FINAL verdict for every slice. On a
+        # HOT session the tail is expected here; on a COLD session this is the
+        # final-review backlog: a provisional receipt is work, never a
+        # conclusion, so finalization turns it into owed review (PAL-SESSION-06).
+        "needs_final_review": max(0, total - final),
         "slices": slices_total,
         "slices_final": slices_final,
         "slices_provisional": slices_provisional,

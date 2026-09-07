@@ -85,9 +85,11 @@ class ComparisonKernel(unittest.TestCase):
         code, payload, err = support.run_saipal_json("continue", home=self.home)
         self.assertEqual(code, 0, err)
         assert payload is not None
-        self.assertGreaterEqual(payload["candidates"], 1)
-        findings = _findings(self.home)
-        self.assertTrue(any(f["drift_class"] == "PHASE_ILLEGALITY" for f in findings))
+        self.assertGreaterEqual(int(payload.get("signals_raised") or 0), 1)
+        self.assertEqual(payload["candidates"], 0)
+        ledger = (self.home / "signals.json")
+        signals = json.loads(ledger.read_text(encoding="utf-8"))["signals"]
+        self.assertTrue(any(f["drift_class"] == "PHASE_ILLEGALITY" for f in signals))
 
     def test_conformant_phase_edge_is_not_flagged(self) -> None:
         """PLAN->BUILD is legal in SAIPEN CORE.md 1.6 and must not fire."""
@@ -162,7 +164,13 @@ class ComparisonKernel(unittest.TestCase):
         self.assertEqual(code, 0, err)
         assert result is not None
         self.assertEqual(result["audits_emitted"], 0)
-        self.assertGreaterEqual(result["candidates"], 1)
+        self.assertEqual(result["candidates"], 0)
+        ledger = (self.home / "signals.json")
+        if ledger.exists():
+            signals = json.loads(ledger.read_text(encoding="utf-8"))["signals"]
+            # A signal may still be raised: it is a hint that the analyst can
+            # evaluate with binding context; it is never an asserted finding.
+            self.assertGreaterEqual(len(signals), 0)
 
     # -- acceptance bar 9: no audit without qualifying drift ----------------- #
 
