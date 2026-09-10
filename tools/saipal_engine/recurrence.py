@@ -20,6 +20,16 @@ TELEMETRY_KEYS = (
 
 _VERSION = re.compile(r"\d+")
 
+#: Recurrence ledger schema. v1 anchored rows on the finding's WHOLE
+#: occurrence set (T-74 defect); v2 anchors every row on exactly ONE evidence
+#: occurrence and carries the legacy-anchor migration status (T-104/T-75).
+SCHEMA_VERSION = 2
+ANCHOR_GENERATION = "v2"
+
+
+def _anchor_generation() -> str:
+    return ANCHOR_GENERATION
+
 
 def _vt(value) -> tuple:
     return tuple(int(part) for part in _VERSION.findall(str(value or "")))
@@ -58,27 +68,49 @@ def _refs(occurrence: dict) -> str:
     return ",".join(str(ref) for ref in sorted(out, key=str))
 
 
-def _evidence_anchor(session: dict, finding: dict) -> list[str]:
-    """Which evidence, inside THIS session, this ledger row stands on.
+def _occurrence_anchor(occurrence: dict) -> str | None:
+    """The closed evidence identity of ONE occurrence (T-104).
 
-    The finding already dedupes its own occurrences on session + episode +
-    events, so the same anchor is available to the ledger -- and without it a
-    row can only be identified by the identity of the WRITE, which the two
-    writers of one occurrence do not share: the mechanical pass writes unkeyed
-    from the pipeline while the analyst's confirmation of that same episode
-    writes keyed by receipt. Empty (a synthetic or evidence-less finding, or a
-    ledger entry passed back in) means no anchor is claimed and the historical
-    write semantics stand.
+    One immutable evidence occurrence == one anchor == one ledger row
+    identity. The tuple is (session, episode, exact event refs) scoped by the
+    finding's fingerprint: finding prose, severity, confidence, the mutable
+    occurrence ARRAY around it and the recurrence count are all excluded, so
+    a finding that GROWS never changes the identity of the occurrence it
+    already stood on. `None` for a synthetic or evidence-less finding.
     """
+    if not isinstance(occurrence, dict):
+        return None
+    episode = occurrence.get("episode_id")
+    refs = _refs(occurrence)
+    if episode is None and not refs:
+        return None
+    return f"{episode}:{refs}"
+
+
+def _session_occurrences(session: dict, finding: dict) -> list[dict]:
+    """This finding's occurrences that stand on THIS session's evidence."""
     session_id = session.get("session_id")
-    tokens = {
-        f"{row.get('episode_id')}:{_refs(row)}"
+    return [
+        row
         for row in finding.get("occurrences") or []
         if isinstance(row, dict)
         and row.get("session_id") == session_id
-        and (row.get("episode_id") is not None or row.get("event_refs"))
-    }
-    return sorted(tokens)
+        and _occurrence_anchor(row) is not None
+    ]
+
+
+def _evidence_anchor(session: dict, finding: dict) -> list[str]:
+    """Backwards-compatible view: every per-occurrence anchor in one list.
+
+    T-104 narrowed the ROW anchor to a single occurrence (`_occurrence_anchor`);
+    callers that want the whole session's evidence set read this. An empty
+    list means no anchor is claimed and the historical write semantics stand.
+    """
+    return sorted(
+        token
+        for token in (_occurrence_anchor(row) for row in _session_occurrences(session, finding))
+        if token is not None
+    )
 
 
 def _occurrence(
@@ -87,7 +119,8 @@ def _occurrence(
     *,
     conformant: bool,
     occurrence_id: str = "",
-    evidence_anchor: list[str] | None = None,
+    evidence_anchor: str | None = None,
+    anchor_generation: str | None = None,
 ) -> dict:
     adapter = str(session.get("adapter") or "")
     model = adapter.split(":", 1)[0].strip().lower() or "unknown"
@@ -109,12 +142,12 @@ def _occurrence(
     # W2-002). Absent means an unkeyed caller, which stays append-only.
     if occurrence_id:
         entry["occurrence_id"] = str(occurrence_id)
-    # An identity for the EVIDENCE: one episode confirmed by two writers -- the
-    # mechanical pass and the analyst -- is one occurrence, whatever keys those
-    # writes carried.
-    anchor = evidence_anchor if evidence_anchor is not None else _evidence_anchor(session, finding)
-    if anchor:
-        entry["evidence_anchor"] = list(anchor)
+    # T-104 (ROLE 16): an identity for the EVIDENCE, closed per ONE occurrence.
+    # One immutable evidence occurrence == one anchor == one row identity.
+    if evidence_anchor:
+        entry["evidence_anchor"] = str(evidence_anchor)
+        if anchor_generation:
+            entry["anchor_generation"] = str(anchor_generation)
     return entry
 
 
@@ -122,26 +155,233 @@ def empty_recurrence() -> dict:
     return {"schema_version": SCHEMA_VERSION, "by_finding": {}, "by_rule": {}}
 
 
+def _findings_occurrence_map(paths) -> dict[str, dict[str, list[str]]]:
+    """fingerprint -> session_id -> [per-occurrence anchor tokens], tolerant.
+
+    The migration's defensible-match source (T-104/T-75): a legacy row without
+    an anchor can only be backfilled when the finding index names exactly ONE
+    evidence occurrence for that session. Anything else stays unanchored and
+    flagged -- an anchor is never fabricated.
+    """
+    if not paths.findings_index.exists():
+        return {}
+    try:
+        payload = read_json(paths.findings_index)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, dict[str, list[str]]] = {}
+    for rec in payload.get("findings") or []:
+        if not isinstance(rec, dict):
+            continue
+        fp = str(rec.get("fingerprint") or "")
+        if not fp:
+            continue
+        bucket = out.setdefault(fp, {})
+        for occ in rec.get("occurrences") or []:
+            if not isinstance(occ, dict):
+                continue
+            sid = str(occ.get("session_id") or "")
+            token = _occurrence_anchor(occ)
+            if not sid or token is None:
+                continue
+            tokens = bucket.setdefault(sid, [])
+            if token not in tokens:
+                tokens.append(token)
+    return out
+
+
+def migrate_recurrence(home: Path | str, *, registry=None) -> dict:
+    """One-shot v1 -> v2 ledger migration (T-104/T-75). Deterministic.
+
+    v1 anchored rows on the finding's WHOLE occurrence set, so a grown finding
+    changed the anchor of rows it already stood on (T-74), and pre-anchor rows
+    carry none at all (T-75). This pass, run once before any new write:
+
+    - a v1 row whose anchor names exactly ONE occurrence -> backfilled to the
+      per-occurrence scalar anchor;
+    - a v1 row whose anchor names SEVERAL -> preserved verbatim, flagged
+      AMBIGUOUS -- the row stood on more than one occurrence and the exact one
+      it represents is not recoverable, so nothing is guessed;
+    - a v1 row with NO anchor -> backfilled only when the finding index names
+      exactly ONE evidence occurrence for that session; several -> AMBIGUOUS;
+      none -> preserved, flagged UNRESOLVED.
+
+    Atomic (whole-ledger write), restart-safe (a crash leaves the v1 file, the
+    next run derives the same v2), idempotent (v2 short-circuits). History is
+    never deleted. A PRESENT corrupt ledger refuses with zero writes (ROLE 7):
+    migration never replaces history it cannot read.
+    """
+    paths = home_paths(home)
+    if paths.recurrence.exists() and recurrence_status(home) == RECURRENCE_INVALID:
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"{paths.recurrence.name} is corrupt; migration refuses to "
+            "replace or touch it -- the original bytes stay untouched",
+            next_action="inspect or restore the file manually",
+        )
+    data = load_recurrence(home)
+    if data.get("schema_version") == SCHEMA_VERSION:
+        return {"migrated": False, "backfilled": 0, "ambiguous": 0, "unresolved": 0}
+    evidence = _findings_occurrence_map(paths)
+    stats = {"backfilled": 0, "ambiguous": 0, "unresolved": 0}
+    for entry in data.get("by_finding", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        fp = str(entry.get("fingerprint") or "")
+        per_session = evidence.get(fp) or {}
+        for row in entry.get("occurrences") or []:
+            if not isinstance(row, dict):
+                continue
+            if isinstance(row.get("evidence_anchor"), str):
+                continue  # already per-occurrence
+            if row.get("anchor_status"):
+                continue  # already migrated-and-flagged
+            legacy = row.get("evidence_anchor")
+            if isinstance(legacy, list):
+                tokens = sorted({str(t) for t in legacy if t})
+                if len(tokens) == 1:
+                    row["evidence_anchor"] = tokens[0]
+                    row["anchor_status"] = "MIGRATED"
+                    stats["backfilled"] += 1
+                elif len(tokens) > 1:
+                    row["legacy_anchor"] = tokens
+                    row.pop("evidence_anchor", None)
+                    row["anchor_status"] = "AMBIGUOUS"
+                    stats["ambiguous"] += 1
+                else:
+                    row["anchor_status"] = "UNRESOLVED"
+                    stats["unresolved"] += 1
+                continue
+            # Pre-anchor row: only an exact single evidence match backfills.
+            sid = str(row.get("session_id") or "")
+            tokens = sorted(set(per_session.get(sid) or []))
+            if len(tokens) == 1:
+                row["evidence_anchor"] = tokens[0]
+                row["anchor_status"] = "MIGRATED"
+                stats["backfilled"] += 1
+            elif len(tokens) > 1:
+                row["anchor_status"] = "AMBIGUOUS"
+                stats["ambiguous"] += 1
+            else:
+                row["anchor_status"] = "UNRESOLVED"
+                stats["unresolved"] += 1
+    data["schema_version"] = SCHEMA_VERSION
+    save_recurrence(home, data, registry=registry)
+    return {"migrated": True, **stats}
+
+
+def _ensure_migrated(home, *, registry=None) -> None:
+    """Operational migration runs before ANY new recurrence write (ROLE 19)."""
+    migrate_recurrence(home, registry=registry)
+
+
 def _valid(data) -> bool:
-    return (
+    """Structural validation, hardened beyond the shallow v2 check (ROLE 11).
+
+    Mutation assumes every by_finding VALUE is an entry dict with a list of
+    occurrence dicts, and every by_rule VALUE is a counter dict. A payload that
+    violates those shapes would crash or corrupt on the next write, so it is
+    refused at load time instead of silently reclassified or written over.
+    """
+    if not (
         isinstance(data, dict)
-        and data.get("schema_version") == SCHEMA_VERSION
+        and data.get("schema_version") in (1, SCHEMA_VERSION)
         and isinstance(data.get("by_finding"), dict)
         and isinstance(data.get("by_rule"), dict)
-    )
+    ):
+        return False
+    for entry in data.get("by_finding").values():
+        if not isinstance(entry, dict) or not isinstance(entry.get("occurrences"), list):
+            return False
+        for row in entry["occurrences"]:
+            if not isinstance(row, dict):
+                return False
+    for counter in data.get("by_rule").values():
+        if not isinstance(counter, dict) or not isinstance(
+            counter.get("total"), int
+        ) or isinstance(counter.get("total"), bool):
+            return False
+        if not isinstance(counter.get("drift"), int) or isinstance(counter.get("drift"), bool):
+            return False
+    return True
+
+
+#: Recurrence read states (ROLE 5): ABSENT legitimately means a fresh empty
+#: ledger; VALID means v1/v2 loaded; INVALID means the file EXISTS but cannot
+#: be parsed or validated -- which must never be read as an empty ledger.
+RECURRENCE_ABSENT = "ABSENT"
+RECURRENCE_VALID = "VALID"
+RECURRENCE_INVALID = "INVALID"
+
+
+def recurrence_status(home: Path | str) -> str:
+    """Read-only corruption probe (ROLE 8): zero writes, no repair."""
+    paths = home_paths(home)
+    if not paths.recurrence.exists():
+        return RECURRENCE_ABSENT
+    try:
+        payload = read_json(paths.recurrence)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return RECURRENCE_INVALID
+    return RECURRENCE_VALID if _valid(payload) else RECURRENCE_INVALID
 
 
 def load_recurrence(home: Path | str) -> dict:
+    """Fail-closed load (ROLE 6).
+
+    ABSENT -> a fresh empty ledger (a legitimate bootstrap). A PRESENT file
+    that is unreadable or structurally invalid raises instead of silently
+    reclassifying history as empty: the next write would otherwise replace the
+    whole ledger. Nothing here renames, truncates, repairs or guesses -- the
+    corrupt bytes stay untouched for the operator.
+    """
     paths = home_paths(home)
     if not paths.recurrence.exists():
         return empty_recurrence()
     try:
         payload = read_json(paths.recurrence)
-    except (OSError, ValueError, UnicodeDecodeError):
-        return empty_recurrence()
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"{paths.recurrence.name} exists but cannot be read as JSON "
+            f"({exc.__class__.__name__}); historical recurrence state was "
+            "left untouched",
+            next_action="inspect or restore the file manually; no write "
+            "touches it until it parses",
+        ) from exc
     if not _valid(payload):
-        return empty_recurrence()
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"{paths.recurrence.name} exists but is not a valid recurrence "
+            f"ledger (schema_version="
+            f"{payload.get('schema_version')!r} when parsed as JSON); "
+            "historical recurrence state was left untouched",
+            next_action="inspect or restore the file manually; no write "
+            "touches it until it validates",
+        )
     return payload
+
+
+def require_recurrence_healthy(home: Path | str) -> None:
+    """Mutating-startup gate (ROLE 9): refuse BEFORE new effects.
+
+    A present-but-corrupt ledger fails closed here so watch/investigate/
+    continue never spend semantic or model work and only then discover the
+    ledger cannot be written to without destroying it.
+    """
+    status = recurrence_status(home)
+    if status == RECURRENCE_VALID:
+        return
+    if status == RECURRENCE_INVALID:
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"{home_paths(home).recurrence.name} is corrupt; refusing to "
+            "start mutating work that would need the recurrence ledger",
+            next_action="inspect or restore the file manually; read-only "
+            "surfaces may still report recurrence_status INVALID",
+        )
 
 
 def save_recurrence(home: Path | str, data: dict, *, registry=None) -> dict:
@@ -159,16 +399,17 @@ def save_recurrence(home: Path | str, data: dict, *, registry=None) -> dict:
 def _bump_occurrence(
     data: dict, finding: dict, session: dict, *, conformant: bool, occurrence_id: str = ""
 ) -> bool:
-    """Record one occurrence. Returns False when it was already recorded.
+    """Record every unrecorded evidence occurrence of one session (T-104).
 
-    An occurrence is written at most once under EITHER identity it carries: the
-    write key (a crashed-then-retried submission, audit W2-002) or the evidence
-    it stands on. The second matters because one episode has two writers -- the
-    mechanical pass records it unkeyed from the pipeline, and an analyst
-    confirmation of that same episode merges onto the same finding and records
-    it keyed by receipt. Counting that once as two silently inflates the
-    conformance rates, the spread and the carrier projection a maintainer routes
-    by.
+    Identity is PER OCCURRENCE: `(session_id, episode, event_refs)` under the
+    finding's fingerprint. A row is written at most once under either identity
+    it carries -- the write key (a crashed-then-retried submission, W2-002) or
+    the per-occurrence anchor. The same occurrence observed first by
+    mechanical triage and later confirmed semantically converges to ONE row;
+    a finding that GROWS between the writes leaves the earlier row's identity
+    untouched (T-74) and adds only genuinely new evidence; a legacy row with
+    no anchor converges onto the anchored row that names its evidence (T-75).
+    Returns True when anything was written.
     """
     fingerprint = str(finding.get("fingerprint") or finding.get("finding_id")
                       or finding.get("drift_class") or "UNKNOWN")
@@ -186,38 +427,75 @@ def _bump_occurrence(
     # path, gains its key the first time a real finding supplies one.
     if not entry.get("causal_key") and finding.get("causal_key"):
         entry["causal_key"] = finding["causal_key"]
+    # Snapshot the identity of the rows as they exist before this write, so a
+    # caller passing a ledger entry back in cannot claim anchors off its own
+    # mutable occurrence array.
+    recorded_anchors = {
+        (existing.get("session_id"), str(existing.get("evidence_anchor") or ""))
+        for existing in entry["occurrences"]
+        if isinstance(existing, dict)
+    }
+    session_id = session.get("session_id")
+    pending = _session_occurrences(session, finding)
     if occurrence_id and any(
         str(existing.get("occurrence_id") or "") == str(occurrence_id)
         for existing in entry["occurrences"]
     ):
+        # Exact write-key retry (W2-002): converged, nothing new.
         return False
-    anchor = _evidence_anchor(session, finding)
-    if anchor and any(
-        list(existing.get("evidence_anchor") or []) == anchor
-        and existing.get("session_id") == session.get("session_id")
-        for existing in entry["occurrences"]
-    ):
-        return False
-    entry["occurrences"].append(
-        _occurrence(
-            session,
-            finding,
-            conformant=conformant,
-            occurrence_id=occurrence_id,
-            evidence_anchor=anchor,
+    changed = False
+    added_rows = 0
+    if not pending:
+        # No evidence claimed: the historical append-only semantics stand
+        # (synthetic findings, negative evidence, ledger entries passed back).
+        entry["occurrences"].append(
+            _occurrence(
+                session,
+                finding,
+                conformant=conformant,
+                occurrence_id=occurrence_id,
+            )
         )
-    )
-    for rule in finding.get("rule_ids") or []:
-        bucket = data["by_rule"].setdefault(str(rule), {"total": 0, "drift": 0})
-        bucket["total"] += 1
-        if not conformant:
-            bucket["drift"] += 1
-    return True
+        for rule in finding.get("rule_ids") or []:
+            bucket = data["by_rule"].setdefault(str(rule), {"total": 0, "drift": 0})
+            bucket["total"] += 1
+            if not conformant:
+                bucket["drift"] += 1
+        return True
+    for occurrence in pending:
+        anchor = _occurrence_anchor(occurrence)
+        if anchor is None:
+            continue
+        if (session_id, anchor) in recorded_anchors:
+            continue  # this exact evidence is already a row: converged
+        entry["occurrences"].append(
+            _occurrence(
+                session,
+                finding,
+                conformant=conformant,
+                occurrence_id=occurrence_id,
+                evidence_anchor=anchor,
+                anchor_generation=_anchor_generation(),
+            )
+        )
+        recorded_anchors.add((session_id, anchor))
+        changed = True
+        added_rows += 1
+    if changed:
+        # One rule bump per recorded ROW: two real occurrences are two counts.
+        for _ in range(added_rows):
+            for rule in finding.get("rule_ids") or []:
+                bucket = data["by_rule"].setdefault(str(rule), {"total": 0, "drift": 0})
+                bucket["total"] += 1
+                if not conformant:
+                    bucket["drift"] += 1
+    return changed
 
 
 def record_occurrence(home, finding, session, *, occurrence_id: str = "", registry=None) -> dict:
     if not isinstance(finding, dict) or not isinstance(session, dict):
         raise PalError("VALIDATION_FAILED", "finding and session must be objects")
+    _ensure_migrated(home, registry=registry)
     data = load_recurrence(home)
     changed = _bump_occurrence(
         data,
@@ -234,6 +512,7 @@ def record_occurrence(home, finding, session, *, occurrence_id: str = "", regist
 def record_negative(home, session, *, occurrence_id: str = "", registry=None) -> dict:
     if not isinstance(session, dict):
         raise PalError("VALIDATION_FAILED", "session must be an object")
+    _ensure_migrated(home, registry=registry)
     data = load_recurrence(home)
     changed = _bump_occurrence(
         data, {"drift_class": "CONFORMANT", "severity": "P3", "confidence": "HIGH"},
@@ -264,7 +543,9 @@ def record_batch(
         raise PalError("VALIDATION_FAILED", "session must be an object")
     rows = [finding for finding in (findings or []) if isinstance(finding, dict)]
     if not rows:
+        _ensure_migrated(home, registry=registry)
         return load_recurrence(home)
+    _ensure_migrated(home, registry=registry)
     data = load_recurrence(home)
     changed = False
     for finding in rows:

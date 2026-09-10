@@ -27,8 +27,11 @@ from saipal_engine import inbox as inbox_mod
 from saipal_engine import log as log_mod
 from saipal_engine import recurrence as recurrence_mod
 from saipal_engine import sessions as sessions_mod
+from saipal_engine.adapters import ADAPTER_REGISTRY
+from saipal_engine.dispatcher import dispatch_sources
 from saipal_engine.pipeline import analyze_sessions
 from saipal_engine.registry import load_registry
+from types import SimpleNamespace
 
 COLD = "conformant-cold.json"
 DRIFT = "agent-noncompliance-command-route.json"
@@ -502,24 +505,24 @@ class RecurrenceIsWrittenOncePerSession(unittest.TestCase):
         self.assertEqual(batched["by_rule"], singly["by_rule"])
 
     def test_a_corrupt_ledger_is_not_initialized_over_by_a_batch(self) -> None:
-        """W2-008's guardrail: batching must not become a reset."""
+        """W2-008's guardrail: batching must not become a reset.
+
+        T-119 closed the audit item this test used to pin as unfixed: an
+        unsupported-schema ledger is corruption, not an empty ledger, so the
+        batch now REFUSES with zero writes instead of rewriting over it.
+        """
         path = self.home / "recurrence.json"
         path.write_text(
             json.dumps({"schema_version": 999, "by_finding": {"old": {}}, "by_rule": {}}),
             encoding="utf-8",
         )
         before = path.read_bytes()
-        recurrence_mod.record_batch(self.home, self.session(), self.findings(2))
-        # The loader still treats unsupported schema as empty (a separate audit
-        # item, W2-008/T-0xx), so this pins the CURRENT behaviour rather than
-        # claiming a fix: the batch must at least not multiply the damage.
-        after = path.read_bytes()
-        if after != before:
-            data = json.loads(after.decode("utf-8"))
-            self.assertEqual(
-                data["schema_version"], recurrence_mod.SCHEMA_VERSION,
-                "a rewrite must at least be a valid current-schema ledger",
-            )
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError) as ctx:
+            recurrence_mod.record_batch(self.home, self.session(), self.findings(2))
+        self.assertEqual(ctx.exception.code, "VALIDATION_FAILED")
+        self.assertEqual(path.read_bytes(), before)
 
     def test_a_session_with_findings_writes_the_ledger_once(self) -> None:
         from saipal_engine import pipeline as pipeline_mod
@@ -597,6 +600,389 @@ class LogStatsDoesNotMaterializeTheLog(unittest.TestCase):
         self.write(3)
         events, _malformed = log_mod.read_events(self.home)
         self.assertEqual([event["seq"] for event in events], [1, 2, 3])
+
+
+class HotWatermarkSkipsNormalization(unittest.TestCase):
+    """T-103/T-72: unchanged HOT histories are not re-normalized (50-106x).
+
+    Work-counting red controls over a stub adapter with normalize call
+    counts, never wall-clock. The watermark is advisory operational metadata.
+    ROLE 20260908/2-3: an append-only watermark (max seq / row count) NEVER
+    suppresses normalization on its own -- it detects appends, not historical
+    mutation. The skip needs the raw source identity to prove the provider
+    bytes unchanged; any doubt normalizes (fail-open).
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = support.make_home(Path(self._tmp.name))
+        self.calls = {"normalize": 0}
+
+    def _hot_bundle(self, session_id: str, *, events: int, mutate_seq_one: bool = False) -> dict:
+        rows = []
+        for seq in range(1, events + 1):
+            facts = {"n": seq}
+            if mutate_seq_one and seq == 1:
+                facts = {"n": seq, "tampered": "historical rewrite"}
+            rows.append({"seq": seq, "type": "TOOL_CALL", "facts": facts})
+        return {
+            "schema_version": 1,
+            "session_id": session_id,
+            "adapter": "generic",
+            "project": {"name": "P"},
+            "runtime": {"provider": "p", "model": "m"},
+            "temperature": "HOT",
+            "protocol": {"version": "7.231.9", "registry_sha256": "a" * 64},
+            "events": rows,
+        }
+
+    def _source_path(self, name: str) -> Path:
+        return (Path(self._tmp.name) / name).with_suffix(".json")
+
+    def _write_source(self, name: str, rows: int, **kw) -> Path:
+        source = self._source_path(name)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        bundle = self._hot_bundle(source.stem, events=rows, **kw)
+        source.write_text(json.dumps(bundle), encoding="utf-8")
+        return source
+
+    def _rewrite_source(self, name: str, rows: int, **kw) -> Path:
+        return self._write_source(name, rows, **kw)
+
+    def _stub_adapter(self, *, watermark: int | None, adapter=None):
+        """Full adapter surface: delegate every unstubbed method (ROLE 1)."""
+        adapter = adapter or ADAPTER_REGISTRY["generic"]
+        calls = self.calls
+
+        def counting_normalize(path: str) -> dict:
+            calls["normalize"] += 1
+            return adapter.normalize(path)
+
+        return SimpleNamespace(
+            discover=adapter.discover,
+            normalize=counting_normalize,
+            identity=adapter.identity,
+            stable_watermark=lambda path: watermark,
+            protocol_binding=adapter.protocol_binding,
+            WATERMARK_CAPABILITY=adapter.WATERMARK_CAPABILITY,
+        )
+
+    def _dispatch(self, source_path: Path, *, watermark: int | None, import_now: bool = True, source_id: str = "stub-main"):
+        stub = self._stub_adapter(watermark=watermark)
+        source = {
+            "id": source_id,
+            "kind": "generic",
+            "path": str(source_path.parent),
+            "enabled": True,
+        }
+        with mock.patch.dict(
+            ADAPTER_REGISTRY, {"generic": stub}
+        ):
+            report = dispatch_sources(
+                self.home,
+                [source],
+                registry=load_registry(),
+                authority={k: None for k in ("git_repository", "release_root", "snapshot_root")},
+            )
+        if import_now:
+            from saipal_engine.inbox import import_inbox
+
+            import_inbox(self.home, registry=load_registry())
+        return report
+
+    def test_first_hot_observation_normalizes(self) -> None:
+        source = self._write_source("hot-store/sess-hot.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        self.assertEqual(self.calls["normalize"], 1)
+
+    def test_unchanged_hot_with_identity_proof_skips_normalize(self) -> None:
+        source = self._write_source("hot-store/sess-hot.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        first = self.calls["normalize"]
+        self.assertEqual(first, 1)
+        # Same watermark AND same raw bytes: normalize is NEVER called again.
+        report = self._dispatch(source, watermark=5)
+        self.assertEqual(self.calls["normalize"], 1, "unchanged HOT must skip normalize")
+        self.assertEqual(len(report["unchanged_hot"]), 1)
+        self.assertEqual(report["unchanged_hot"][0]["watermark"], 5)
+
+    def test_changed_watermark_normalizes(self) -> None:
+        source = self._write_source("hot-store/sess-grow.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        # The provider history grew: watermark advances -> normalize.
+        self._write_source("hot-store/sess-grow.jsonl", 8)
+        report = self._dispatch(source, watermark=8)
+        self.assertEqual(self.calls["normalize"], 2)
+        self.assertEqual(report["unchanged_hot"], [])
+
+    def test_no_or_invalid_watermark_always_normalizes(self) -> None:
+        source = self._write_source("hot-store/sess-nwm.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        self._dispatch(source, watermark=None)
+        self.assertEqual(self.calls["normalize"], 2, "missing watermark normalizes")
+        self._dispatch(source, watermark=0)
+        self.assertEqual(self.calls["normalize"], 3, "invalid watermark normalizes")
+        self._dispatch(source, watermark="seven")
+        self.assertEqual(self.calls["normalize"], 4, "malformed watermark normalizes")
+
+    def test_historical_rewrite_preserving_max_seq_is_not_skipped(self) -> None:
+        """ROLE 8 negative control: the P0 mutation-suppression bug.
+
+        Event 1 changes, max(seq) stays 5. The append-only watermark is
+        unchanged -- and it must not hide the mutation. The dispatcher must
+        normalize (the raw identity changed), the inbox must see the mutated
+        prefix, and the session must become CONFLICT.
+        """
+        source = self._write_source("hot-store/sess-rw.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        # Pretend the mechanical pipeline analyzed the first two events so
+        # the analyzed-prefix guard is armed.
+        status, index, _detail = sessions_mod.load_index(self.home)
+        self.assertEqual(status, "ok")
+        record = sessions_mod.find_session(index, "sess-rw")
+        record["last_analyzed_seq"] = 2
+        record["prefix_sha256"] = bundle_mod.prefix_digest(
+            self._hot_bundle("sess-rw", events=5), 2
+        )
+        sessions_mod.save_index(self.home, index)
+
+        self._rewrite_source("hot-store/sess-rw.jsonl", 5, mutate_seq_one=True)
+        report = self._dispatch(source, watermark=5)
+        self.assertGreaterEqual(
+            self.calls["normalize"], 2,
+            "a same-watermark historical rewrite MUST normalize",
+        )
+        self.assertEqual(report["unchanged_hot"], [])
+
+        from saipal_engine.inbox import import_inbox
+
+        intake = import_inbox(self.home, registry=load_registry())
+        record = sessions_mod.find_session(sessions_mod.load_index(self.home)[1], "sess-rw")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(
+            record["status"], "CONFLICT",
+            "the mutated historical prefix must reach the conflict detector",
+        )
+        self.assertEqual(len(intake["conflicts"]), 1)
+
+    def test_append_hint_alone_cannot_suppress_normalization(self) -> None:
+        """ROLE 13 control 6: an APPEND_ONLY_HINT with changed bytes normalizes.
+
+        The stub vouches for a matching watermark, but the raw source changed
+        under it. The identity check -- not the hint -- decides, and it must
+        fail open toward normalization.
+        """
+        source = self._write_source("hot-store/sess-hint.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        self._rewrite_source("hot-store/sess-hint.jsonl", 5, mutate_seq_one=True)
+        report = self._dispatch(source, watermark=5)
+        self.assertGreaterEqual(self.calls["normalize"], 2)
+        self.assertEqual(report["unchanged_hot"], [])
+
+    def test_conflict_is_surfaced_not_called_clean(self) -> None:
+        """ROLE 12: a skipped conflicted artifact reports the conflict."""
+        source = self._write_source("hot-store/sess-conf.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        # Arm the prefix guard, then mutate, then import: CONFLICT.
+        status, index, _detail = sessions_mod.load_index(self.home)
+        record = sessions_mod.find_session(index, "sess-conf")
+        record["last_analyzed_seq"] = 2
+        record["prefix_sha256"] = bundle_mod.prefix_digest(
+            self._hot_bundle("sess-conf", events=5), 2
+        )
+        sessions_mod.save_index(self.home, index)
+        self._rewrite_source("hot-store/sess-conf.jsonl", 5, mutate_seq_one=True)
+        self._dispatch(source, watermark=5)
+
+        # The provider now serves exactly the conflicted artifact B and it
+        # never changes again: re-normalization is unnecessary (identity
+        # proves B), but the cycle must NOT answer `unchanged_hot`.
+        report = self._dispatch(source, watermark=5)
+        self.assertEqual(report["unchanged_hot"], [])
+        self.assertEqual(len(report["conflict"]), 1)
+        self.assertEqual(report["conflict"][0]["status"], "CONFLICT")
+        record = sessions_mod.find_session(sessions_mod.load_index(self.home)[1], "sess-conf")
+        assert record is not None
+        self.assertEqual(record["status"], "CONFLICT", "the conflict stands")
+
+    def test_restart_preserves_the_accepted_watermark(self) -> None:
+        source = self._write_source("hot-store/sess-restart.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        # A "restart" is just a fresh dispatcher call: the checkpoint lives in
+        # the durable staged bundle, not in any process state.
+        report = self._dispatch(source, watermark=5)
+        self.assertEqual(self.calls["normalize"], 1)
+        self.assertEqual(len(report["unchanged_hot"]), 1)
+
+    def test_cold_identity_stays_digest_driven(self) -> None:
+        """A COLD source never uses the watermark fast path."""
+        source = self._write_source("cold-store/sess-cold.jsonl", 5)
+        source_bundle = self._hot_bundle("sess-cold", events=5)
+        source_bundle["temperature"] = "COLD"
+        source.write_text(json.dumps(source_bundle), encoding="utf-8")
+        self._dispatch(source, watermark=5)
+        self._dispatch(source, watermark=5)
+        # COLD unchanged is decided by the raw content digest, and normalize
+        # is not called -- but the decision path is the COLD probe, not the
+        # watermark (unchanged_hot stays empty).
+        self.assertGreaterEqual(self.calls["normalize"], 1)
+        staged = list((self.home / "session_inbox").glob("generic-sess-cold-*.json"))
+        self.assertTrue(staged)
+
+    def test_one_source_cannot_suppress_another(self) -> None:
+        a = self._write_source("mix-store/a.jsonl", 5)
+        b = self._write_source("mix-store/b.jsonl", 5)
+        a.parent.mkdir(parents=True, exist_ok=True)
+        real = ADAPTER_REGISTRY["generic"]
+        source = {"id": "mix", "kind": "generic", "path": str(a.parent), "enabled": True}
+
+        def dispatch_with(mapping: dict):
+            calls = self.calls
+
+            def counting_normalize(path: str) -> dict:
+                calls["normalize"] += 1
+                return real.normalize(path)
+
+            def wm(path: str):
+                for suffix, value in mapping.items():
+                    if str(path).replace("\\", "/").endswith(suffix.replace("\\", "/")):
+                        return value
+                return None
+
+            stub = SimpleNamespace(
+                discover=real.discover,
+                normalize=counting_normalize,
+                identity=real.identity,
+                stable_watermark=wm,
+                protocol_binding=real.protocol_binding,
+                WATERMARK_CAPABILITY=real.WATERMARK_CAPABILITY,
+            )
+            with mock.patch.dict(ADAPTER_REGISTRY, {"generic": stub}):
+                return dispatch_sources(
+                    self.home, [source], registry=load_registry(),
+                    authority={k: None for k in ("git_repository", "release_root", "snapshot_root")},
+                )
+
+        # Both first-cycle candidates normalize: a (wm 5) and b (wm 3) each
+        # stage their own checkpoint.
+        dispatch_with({"a.json": 5, "b.json": 3})
+        self.assertEqual(self.calls["normalize"], 2)
+        # Second cycle: both probes match their own staged checkpoints and
+        # their raw bytes are unchanged: both skip, independently.
+        report = dispatch_with({"a.json": 5, "b.json": 3})
+        self.assertEqual(self.calls["normalize"], 2)
+        self.assertEqual(
+            sorted(row["source"] for row in report["unchanged_hot"]), ["a", "b"]
+        )
+        # b's watermark ADVANCES while a's stays put: only b normalizes. a's
+        # skip decision never suppresses b, and b's change never touches a.
+        self._rewrite_source("mix-store/b.jsonl", 8)
+        report = dispatch_with({"a.json": 5, "b.json": 9})
+        self.assertEqual(self.calls["normalize"], 3)
+        self.assertEqual(
+            [row["source"] for row in report["unchanged_hot"]], ["a"]
+        )
+
+    def test_staged_but_unimported_artifact_survives_restart(self) -> None:
+        """ROLE 11: normalize -> staged bundle -> crash before import.
+
+        A fresh dispatcher call must not lose the staged artifact, and the
+        optimization checkpoint must not make it vanish from processing.
+        """
+        source = self._write_source("hot-store/sess-crash.jsonl", 5)
+        # Dispatch WITHOUT the import step: staged, never imported.
+        self._dispatch(source, watermark=5, import_now=False)
+        staged = list((self.home / "session_inbox").glob("generic-sess-crash-*.json"))
+        self.assertTrue(staged, "the staged bundle exists before the crash")
+        self.assertEqual(self.calls["normalize"], 1)
+        # Restart: dispatch again (no change), then import: the staged
+        # artifact is still there and is still imported.
+        self._dispatch(source, watermark=5, import_now=False)
+        from saipal_engine.inbox import import_inbox
+
+        intake = import_inbox(self.home, registry=load_registry())
+        self.assertEqual(intake["new_sessions"], 1, "staged artifact still imports after restart")
+
+    def test_mutant_ignoring_persistence_fails(self) -> None:
+        """A dispatcher that never persists the watermark cannot skip twice."""
+        source = self._write_source("hot-store/sess-mutant.jsonl", 5)
+        self._dispatch(source, watermark=5)
+        staged = list((self.home / "session_inbox").glob("generic-sess-mutant-*.json"))
+        self.assertTrue(staged)
+        bundle = bundle_mod.load_bundle_file(staged[0], registry=load_registry())
+        self.assertEqual(
+            bundle.get("observed_watermark"), 5,
+            "the observed watermark must be persisted with the bundle state",
+        )
+        # And the identity never changed because of it: the digest excludes
+        # the watermark (advisory metadata, not forensic truth).
+        digest = bundle_mod.bundle_digest(bundle)
+        bundle.pop("observed_watermark")
+        self.assertEqual(bundle_mod.bundle_digest(bundle), digest)
+
+    def test_watermark_capability_declared_by_every_adapter(self) -> None:
+        """ROLE 4/5: every adapter declares its probe semantics, closed set."""
+        from saipal_engine.adapters import watermark_capability
+        from saipal_engine.adapters import (
+            WATERMARK_APPEND_ONLY_HINT,
+            WATERMARK_MUTATION_SAFE_CHANGE_TOKEN,
+            WATERMARK_NONE,
+        )
+
+        for name, module in ADAPTER_REGISTRY.items():
+            with self.subTest(adapter=name):
+                declared = getattr(module, "WATERMARK_CAPABILITY", None)
+                self.assertIn(
+                    declared,
+                    (WATERMARK_NONE, WATERMARK_APPEND_ONLY_HINT, WATERMARK_MUTATION_SAFE_CHANGE_TOKEN),
+                    "watermark capability must come from the closed vocabulary",
+                )
+                # No shipped adapter is mutation-safe on evidence: every
+                # declared probe is max-seq or a row count.
+                cap = watermark_capability(module)
+                self.assertFalse(
+                    cap["mutation_safe"],
+                    "no adapter may claim a mutation-safe token without evidence",
+                )
+
+    def test_generic_same_max_seq_rewrite_reaches_conflict(self) -> None:
+        """ROLE 8 end-to-end through the REAL generic adapter (no stub).
+
+        This is the direct reproduction from the targeted audit: rewrite
+        event 1 while preserving event count, max seq, session id and
+        temperature. The real dispatcher must not answer unchanged_hot.
+        """
+        source = self._write_source("real-store/sess-real.jsonl", 5)
+        real = ADAPTER_REGISTRY["generic"]
+        source = {"id": "real-main", "kind": "generic", "path": str(source.parent), "enabled": True}
+
+        def run():
+            return dispatch_sources(
+                self.home, [source], registry=load_registry(),
+                authority={k: None for k in ("git_repository", "release_root", "snapshot_root")},
+            )
+
+        run()
+        from saipal_engine.inbox import import_inbox
+
+        import_inbox(self.home, registry=load_registry())
+        status, index, _detail = sessions_mod.load_index(self.home)
+        record = sessions_mod.find_session(index, "sess-real")
+        record["last_analyzed_seq"] = 2
+        record["prefix_sha256"] = bundle_mod.prefix_digest(
+            self._hot_bundle("sess-real", events=5), 2
+        )
+        sessions_mod.save_index(self.home, index)
+
+        self._rewrite_source("real-store/sess-real.jsonl", 5, mutate_seq_one=True)
+        report = run()
+        self.assertEqual(report["unchanged_hot"], [])
+        intake = import_inbox(self.home, registry=load_registry())
+        record = sessions_mod.find_session(sessions_mod.load_index(self.home)[1], "sess-real")
+        assert record is not None
+        self.assertEqual(record["status"], "CONFLICT")
 
 
 if __name__ == "__main__":

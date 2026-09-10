@@ -360,8 +360,11 @@ class ConfiguredAuthority(unittest.TestCase):
             code, payload, _err = support.run_saipal_json(
                 "setup", "--protocol-git", str(missing), home=home
             )
-            self.assertEqual(code, 2)
-            self.assertEqual(payload["code"], "USAGE")
+            # T-99: setup routes through the canonical enrollment gate, so the
+            # refusal is the enrollment refusal (exit 1), not the old direct
+            # write path's USAGE (exit 2).
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["code"], "VALIDATION_FAILED")
             status, config, _detail = config_mod.load_config(home)
             self.assertEqual(status, "ok")
             self.assertIsNone((config["protocol_authority"] or {}).get("git_repository"))

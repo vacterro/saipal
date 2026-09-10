@@ -180,7 +180,8 @@ class LeaseOwnership(LockCase):
             payload = json.loads(lease.path.read_text(encoding="utf-8"))
             self.assertEqual(lease.token, token)
             self.assertEqual(payload["owner"], token)
-            self.assertEqual(payload["ttl"], 60)
+            # T-110: renewal is sidecar-only; the node stays immutable.
+            self.assertEqual(lease._lock._read_lease_freshness()["ttl"], 60)
         finally:
             lease.release()
 

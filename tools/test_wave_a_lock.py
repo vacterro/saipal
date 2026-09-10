@@ -85,7 +85,12 @@ class HomeLockContract(unittest.TestCase):
             "created_at": time.time() - 10_000,
             "owner": "x",
         }
-        (locks / "saipal.lock").write_text(json.dumps(payload), encoding="utf-8")
+        lock_file = locks / "saipal.lock"
+        lock_file.write_text(json.dumps(payload), encoding="utf-8")
+        # T-110: the immutable payload no longer carries renewal; age derives
+        # from the node's own mtime, so age the file like a crashed owner.
+        old = time.time() - 10_000
+        os.utime(lock_file, (old, old))
 
         lock = HomeLock(self.home)
         self.assertTrue(lock.acquire())
@@ -287,7 +292,10 @@ class OwnershipFencing(unittest.TestCase):
             self.assertEqual(lock.token, token)
             payload = self._payload()
             self.assertEqual(payload["owner"], token)
-            self.assertEqual(payload["ttl"], 99)
+            # T-110: the lock node is the immutable fencing identity; the TTL
+            # renewal lives on the sidecar freshness record, never the node.
+            self.assertEqual(lock._read_lease_freshness()["ttl"], 99)
+            self.assertEqual(lock._read_lease_freshness()["owner"], token)
         finally:
             lock.release()
 

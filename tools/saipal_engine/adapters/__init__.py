@@ -19,6 +19,44 @@ ADAPTER_REGISTRY = {
 }
 
 
+#: T-103 closed vocabulary for watermark probe semantics. Every adapter
+#: declares exactly one of these. The probe never independently suppresses
+#: forensic normalization unless it is a MUTATION_SAFE_CHANGE_TOKEN.
+WATERMARK_NONE = "NONE"
+WATERMARK_APPEND_ONLY_HINT = "APPEND_ONLY_HINT"
+WATERMARK_MUTATION_SAFE_CHANGE_TOKEN = "MUTATION_SAFE_CHANGE_TOKEN"
+
+
+#: Adapters that ship with a probe the dispatcher may trust to hide
+#: historical mutation. Empty today: all shipped probes are append hints.
+#: A future adapter earns a place here only with a defensible, documented
+#: provider guarantee -- never because a function exists.
+
+
+def watermark_capability(module) -> dict:
+    """The capability declaration for an adapter module.
+
+    The dispatcher uses this to decide whether the probe alone is enough to
+    skip normalization, or whether a stronger identity check is required.
+    Returns a closed-shape dict so callers cannot reach for undeclared
+    metadata (T-103, ROLE 4/5).
+    """
+    declared = getattr(module, "WATERMARK_CAPABILITY", WATERMARK_NONE)
+    if declared == WATERMARK_MUTATION_SAFE_CHANGE_TOKEN:
+        return {
+            "available": True,
+            "mutation_safe": True,
+            "kind": WATERMARK_MUTATION_SAFE_CHANGE_TOKEN,
+        }
+    if declared == WATERMARK_APPEND_ONLY_HINT:
+        return {
+            "available": True,
+            "mutation_safe": False,
+            "kind": WATERMARK_APPEND_ONLY_HINT,
+        }
+    return {"available": False, "mutation_safe": False, "kind": WATERMARK_NONE}
+
+
 def read_evidence(
     adapter: str,
     source_ref: str,
@@ -43,6 +81,10 @@ __all__ = [
     "ADAPTER_REGISTRY",
     "read_evidence",
     "jsonl_window",
+    "watermark_capability",
+    "WATERMARK_NONE",
+    "WATERMARK_APPEND_ONLY_HINT",
+    "WATERMARK_MUTATION_SAFE_CHANGE_TOKEN",
     "generic",
     "claude",
     "codex",

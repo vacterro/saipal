@@ -10,13 +10,29 @@ NAME = "generic"
 
 CANONICAL_SUFFIX = ".json"
 
+#: T-103 watermark capability contract. `stable_watermark` here is the max
+#: event seq -- it detects APPENDS only. The provider store is an ordinary
+#: file SAIPAL does not control, so an existing event can be rewritten in
+#: place without moving max(seq). This probe is an APPEND hint, never a
+#: mutation-safe change token, and it may never independently suppress
+#: forensic normalization.
+WATERMARK_CAPABILITY = "APPEND_ONLY_HINT"
+
 
 def discover(source_path: str) -> list[dict]:
     root = Path(source_path)
     if not root.is_dir():
         return []
     return [
-        {"path": str(p), "name": p.name, "size": p.stat().st_size}
+        {
+            "path": str(p),
+            "name": p.name,
+            "size": p.stat().st_size,
+            # The canonical bundle's session id is authoritative at normalize
+            # time, but the file stem is the honest per-candidate handle every
+            # other adapter carries (T-97 provenance; opencode does the same).
+            "session_id": p.stem,
+        }
         for p in sorted(root.iterdir())
         if p.is_file() and p.suffix == CANONICAL_SUFFIX and not p.name.startswith(".")
     ]

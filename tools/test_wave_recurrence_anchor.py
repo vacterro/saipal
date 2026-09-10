@@ -127,7 +127,9 @@ class OneEventIsOneRow(LedgerBase):
         )
         rows = self.rows()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["evidence_anchor"], [f"{DRIFT_EPISODE}:{DRIFT_EVENT}"])
+        # T-104: the row anchor names the ONE occurrence it stands on.
+        self.assertEqual(rows[0]["evidence_anchor"], f"{DRIFT_EPISODE}:{DRIFT_EVENT}")
+        self.assertEqual(rows[0]["anchor_generation"], "v2")
 
     def test_an_analyst_confirmation_adds_no_second_row(self) -> None:
         """One event, two writers would be the double count; the confirmation

@@ -268,16 +268,47 @@ def submit_candidate(
     candidate: object,
     *,
     registry: dict | None = None,
+    publication_ceiling: str | None = None,
 ) -> dict[str, Any]:
     """Validate and absorb one analyst candidate. Returns the submission receipt.
 
     Refuses -- with zero writes -- when the candidate is malformed, out of scope,
     or answers a unit whose evidence has since changed. A refusal is a result.
+
+    T-111: `publication_ceiling` is orchestration authority threaded to the
+    audit external-effect boundary ("STAGE_ONLY" from a shadow supervisor);
+    the analyst/model output can never set or weaken it.
     """
     data = registry if registry is not None else load_registry()
     require_analyst_action("submit_candidate", registry=data)
     root = Path(home)
 
+    # CORE-001: the common writer fence. The analyst worker calls this outside
+    # HomeLock; without the fence its stale index save could erase a concurrent
+    # HomeLock-protected intake (verified durable data loss). Semantic model
+    # work has already happened by the time we get here -- reasoning stays
+    # outside the fence; only the commit transaction is serialized. Reentrant
+    # for callers that legitimately arrive already holding the fence.
+    from saipal_engine.paths import writer_fence
+
+    with writer_fence(root):
+        return _submit_candidate_locked(
+            root,
+            candidate,
+            registry=data,
+            publication_ceiling=publication_ceiling,
+        )
+
+
+def _submit_candidate_locked(
+    root: Path,
+    candidate: object,
+    *,
+    registry: dict,
+    publication_ceiling: str | None,
+) -> dict[str, Any]:
+    """Commit path, called with the common writer fence held."""
+    data = registry
     if not isinstance(candidate, dict):
         raise PalError(
             "VALIDATION_FAILED",
@@ -449,7 +480,8 @@ def submit_candidate(
 
     if verdict == cand_mod.VERDICT_DRIFT:
         finding_id, audit = _absorb_drift(
-            root, normalized, record, unit, data, finality=finality, occurrence_id=key
+            root, normalized, record, unit, data, finality=finality,
+            occurrence_id=key, publication_ceiling=publication_ceiling,
         )
     else:
         finding_id, audit = None, None
@@ -540,6 +572,7 @@ def _absorb_drift(
     *,
     finality: str = "FINAL",
     occurrence_id: str = "",
+    publication_ceiling: str | None = None,
 ) -> tuple[str | None, dict | None]:
     """Merge a DRIFT candidate through the existing finding lifecycle.
 
@@ -648,7 +681,8 @@ def _absorb_drift(
             bundle = {"adapter": record.get("adapter"), "project": record.get("project") or {}}
         emitted: list[dict] = []
         pipeline_mod.emit_audit(
-            home, finding, record, bundle, home_paths(home), registry, emitted
+            home, finding, record, bundle, home_paths(home), registry, emitted,
+            publication_ceiling=publication_ceiling,
         )
         if emitted:
             audit = finding.get("audit")

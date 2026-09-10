@@ -57,8 +57,10 @@ No arbitrary detector-selected paths.
 - `python -B tools/test_runner.py` — canonical suite (unit + validator), clean checkout.
 - `python -B tools/validate.py` — protocol/registry drift gate.
 - `python -B -m compileall tools` — bytecode compile check.
-- Suite: 690 unit tests across waves A-I, the semantic analyst loop and the drift
-  report; 271 validator checks.
+- Suite size is recorded in exactly one place — the **Current verification
+  truth** block of `WAVE_I_CHECKPOINT.md`, stamped with its `checkpoint_id`.
+  This handoff deliberately carries no independent counter; re-derive from the
+  two commands above instead of trusting a copied number.
 
 ## Measurements
 

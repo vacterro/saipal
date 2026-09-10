@@ -10,6 +10,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -311,6 +312,7 @@ def next_unit(home: Path) -> dict | None:
 
 def drift_candidate(unit: dict, **overrides) -> dict:
     """A well-formed DRIFT candidate answering the given carrier unit."""
+    """A well-formed DRIFT candidate answering the given carrier unit."""
     payload = {
         "schema_version": 1,
         "verdict": "DRIFT",
@@ -368,3 +370,230 @@ def submit_drift(home: Path, unit: dict | None = None, **overrides) -> dict:
     if code != 0:
         raise AssertionError(f"submit failed ({code}): {err}")
     return json.loads(out)
+
+
+# --------------------------------------------------------------------------- #
+# T-120 shared proof helpers: doctor parity, corpus truth, doctor/watch parity
+# --------------------------------------------------------------------------- #
+
+
+class DoctorParityMixin:
+    """The required T-120 doctor acceptance matrix, as reusable controls.
+
+    A. human `saipal doctor` exits 0 (the MARKHUNT E-772 red control)
+    B. `saipal --json doctor` exits 0
+    C. human and JSON agree on the truth-model fields
+    D. missing authority renders cleanly
+    E. no configured sources renders cleanly
+    F. corrupt durable state reports INVALID/MIGRATION_REQUIRED without a
+       traceback
+    G. both variants are read-only (state digests before/after)
+    """
+
+    def _fresh_home(self) -> Path:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = make_home(Path(self._tmp.name))
+        return self.home
+
+    def test_a_human_doctor_exits_zero(self) -> None:
+        home = self._fresh_home()
+        support_run = run_saipal("doctor", home=home)
+        code, out, err = support_run
+        self.assertEqual(code, 0, f"human doctor crashed: {err}")
+        self.assertIn("indexed_records:", out)
+        self.assertIn("current_sessions:", out)
+
+    def test_b_json_doctor_exits_zero(self) -> None:
+        home = self._fresh_home()
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(payload)
+        self.assertEqual(payload["command"], "doctor")
+
+    def test_c_human_and_json_agree_on_truth_model(self) -> None:
+        home = self._fresh_home()
+        put_inbox(home, "conformant-cold.json")
+        run_saipal("continue", home=home)
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        code_h, out, err_h = run_saipal("doctor", home=home)
+        self.assertEqual(code_h, 0, err_h)
+        # The same truth model, not two hand-maintained renderers drifting.
+        self.assertIn(f"indexed_records: {payload['indexed_records_total']}", out)
+        self.assertIn(f"current_sessions: {payload['current_sessions_total']}", out)
+        self.assertNotIn(
+            "\nsessions: ", out, "the ambiguous pre-T-114 field must stay gone"
+        )
+        bindings = payload["current_binding_counts"] or {}
+        for key in ("BOUND", "PARTIAL", "UNKNOWN"):
+            self.assertIn(f"{key}={bindings.get(key)}", out)
+        blockers = (payload.get("binding_blockers") or {}).get("blockers") or []
+        for row in blockers[:5]:
+            self.assertIn(f"binding_blocker: {row['reason']} x{row['count']}", out)
+
+    def test_d_missing_authority_renders_cleanly(self) -> None:
+        home = self._fresh_home()
+        # make_home declares an authority; strip it to prove the none-configured
+        # path renders without crashing on either surface.
+        config_path = Path(home) / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["protocol_authority"] = {
+            "git_repository": None,
+            "release_root": None,
+            "snapshot_root": None,
+        }
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(payload["protocol_authority_configured"])
+        code_h, out, err_h = run_saipal("doctor", home=home)
+        self.assertEqual(code_h, 0, err_h)
+        self.assertIn("protocol_authority: none configured", out)
+        self.assertIn("current binding: BOUND=0 PARTIAL=0 UNKNOWN=0", out)
+
+    def test_e_no_configured_sources_renders_cleanly(self) -> None:
+        home = self._fresh_home()
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(payload["sources_count"], 0)
+        self.assertEqual(payload["sources_configured"], [])
+        code_h, out, err_h = run_saipal("doctor", home=home)
+        self.assertEqual(code_h, 0, err_h)
+        self.assertIn("sources: 0", out)
+
+    def test_f_corrupt_state_diagnosed_not_traceback(self) -> None:
+        home = self._fresh_home()
+        # Corrupt the recurrence ledger: doctor may diagnose it but must never
+        # traceback, and the read-only surfaces report INVALID/MIGRATION_REQUIRED.
+        recurrence = Path(home) / "recurrence.json"
+        if not recurrence.is_file():
+            recurrence.write_text("{}", encoding="utf-8")
+        recurrence.write_text("{corrupt", encoding="utf-8")
+        code_h, out, err_h = run_saipal("doctor", home=home)
+        self.assertEqual(code_h, 0, err_h or out)
+        self.assertNotIn("Traceback", err_h)
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        from saipal_engine.recurrence import recurrence_status
+
+        self.assertIn(recurrence_status(home), ("INVALID", "MIGRATION_REQUIRED"))
+
+    def test_g_both_doctor_variants_are_read_only(self) -> None:
+        home = self._fresh_home()
+        put_inbox(home, "conformant-cold.json")
+        run_saipal("continue", home=home)
+        before = tree_digest(home)
+        code, _out, err = run_saipal("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tree_digest(home), before, "human doctor mutated the home")
+        code, _payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(tree_digest(home), before, "json doctor mutated the home")
+
+
+class CorpusTruthMixin:
+    """#10: the required generation-truth corpus control."""
+
+    def assert_corpus_truth_control(self) -> None:
+        from saipal_engine.sessions import (
+            find_session,
+            load_index,
+            save_index,
+        )
+
+        home = self._truth_home()
+        # Session A generation 1: imported with the home's authority, then the
+        # record's binding is demoted to PARTIAL (index surgery, the same
+        # pattern the hardening suite uses to arm state). Session A generation
+        # 2 = BOUND arrives as a COLD copy with a real authority digest.
+        # Session B = UNKNOWN (no protocol claim, never stamped).
+        put_inbox(home, "hot-partial.json")
+        run_saipal("continue", home=home)
+        status, index, _detail = load_index(home)
+        record = find_session(index, "golden-hot-001")
+        record["protocol"]["binding_status"] = "PARTIAL"
+        record["protocol"]["confidence"] = "MEDIUM"
+        save_index(home, index)
+        clear_inbox(home)
+        import copy
+
+        gen2 = copy.deepcopy(load_fixture("conformant-cold.json"))
+        gen2["session_id"] = "golden-hot-001"
+        gen2["temperature"] = "COLD"
+        write_inbox(home, "golden-hot-001-gen2.json", gen2)
+        put_inbox(home, "unknown-protocol.json")  # session B = UNKNOWN
+        run_saipal("continue", home=home)
+
+        # Sanity: the corpus really is A gen1 PARTIAL, A gen2 BOUND, B UNKNOWN.
+        status, index, _detail = load_index(home)
+        by_key = {
+            (rec["session_id"], int(rec.get("generation") or 0)): (
+                rec.get("protocol") or {}
+            ).get("binding_status")
+            for rec in index["sessions"]
+        }
+        self.assertEqual(by_key.get(("golden-hot-001", 1)), "PARTIAL")
+        self.assertEqual(by_key.get(("golden-hot-001", 2)), "BOUND")
+        self.assertEqual(by_key.get(("golden-unbound-001", 1)), "UNKNOWN")
+
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(payload["indexed_records_total"], 3)
+        self.assertEqual(payload["current_sessions_total"], 2)
+        current = payload["current_binding_counts"] or {}
+        self.assertEqual(current.get("BOUND"), 1, "session A gen 2 is BOUND")
+        self.assertEqual(current.get("UNKNOWN"), 1, "session B is UNKNOWN")
+        self.assertEqual(current.get("PARTIAL"), 0, "gen 1 PARTIAL is history")
+        # Historical generations keep their own explicitly named distribution.
+        history = payload.get("binding_counts") or {}
+        self.assertEqual(history.get("PARTIAL"), 1)
+        self.assertEqual(history.get("BOUND"), 1)
+        self.assertEqual(history.get("UNKNOWN"), 1)
+        # And watch-status agrees with doctor on the current population.
+        from saipal_analyst import supervisor as sup_mod
+
+        corpus = sup_mod.watch_status(home)["corpus"]
+        self.assertEqual(corpus["current_binding_counts"], {"BOUND": 1, "UNKNOWN": 1})
+
+    def _truth_home(self) -> Path:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        home = make_home(Path(self._tmp.name))
+        return home
+
+
+class DoctorWatchParityMixin:
+    """#11: doctor and watch must agree on the CURRENT population."""
+
+    def test_doctor_and_watch_agree_on_current_population(self) -> None:
+        from saipal_analyst import supervisor as sup_mod
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        home = make_home(Path(self._tmp.name))
+        put_inbox(home, "conformant-cold.json", "unknown-protocol.json")
+        run_saipal("continue", home=home)
+        code, payload, err = run_saipal_json("doctor", home=home)
+        self.assertEqual(code, 0, err)
+        corpus = sup_mod.watch_status(home)["corpus"]
+        self.assertEqual(
+            payload["indexed_records_total"], corpus["indexed_records_total"]
+        )
+        self.assertEqual(
+            payload["current_sessions_total"], corpus["current_sessions_total"]
+        )
+        # Normalize the key set for comparison: watch omits zero classes when
+        # no session ever carried them, doctor always names all three.
+        doctor_counts = {
+            key: int(value or 0)
+            for key, value in (payload["current_binding_counts"] or {}).items()
+            if int(value or 0) > 0
+        }
+        self.assertEqual(doctor_counts, corpus["current_binding_counts"])
+        # Both must partition the same population: the counts sum to the
+        # current total, not to history.
+        current_sum = sum(
+            int(v or 0) for v in (payload["current_binding_counts"] or {}).values()
+        )
+        self.assertEqual(current_sum, payload["current_sessions_total"])

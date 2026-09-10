@@ -69,28 +69,116 @@
     "cc": "saipal continue"
   },
   "commands": {
-    "saipal": ["continue", "status", "next", "report", "evidence", "doctor", "setup", "submit", "disposition", "trigger", "sessions"]
+    "saipal": [
+      "continue",
+      "status",
+      "next",
+      "report",
+      "evidence",
+      "doctor",
+      "setup",
+      "submit",
+      "disposition",
+      "trigger",
+      "sessions",
+      "analyst-setup",
+      "analyst-doctor",
+      "analyst-status",
+      "investigate",
+      "watch",
+      "authority",
+      "sources",
+      "rebind",
+      "coverage"
+    ]
   },
   "observed_command_tokens": [
-    "saipal continue", "saipal status", "saipal next", "saipal report",
-    "saipal evidence", "saipal setup", "saipal doctor", "saipal disposition", "saipal trigger",
-    "saipal sessions", "saipal submit", "saipal cc",
-    "saipen continue", "saipen status", "saipen next",
-    "saipen goal", "saipen plan", "saipen scout", "saipen build",
-    "saipen verify", "saipen review", "saipen ship", "saipen done",
-    "saipen validate", "saipen hunt", "saipen markhunt", "saipen add",
-    "saipen clean", "saipen translate", "saipen prepare",
-    "saipen userperson", "saipen context", "saipen brief", "saipen focus",
-    "saipen build", "saipen cut", "saipen undo", "saipen stop",
-    "saipen push", "saipen scope", "saipen claim", "saipen transition",
-    "saipen ticket", "saipen improve", "saipen runtime", "saipen rebind-home",
-    "saipen recover", "saipen attempt", "saipen collect", "saipen crew",
-    "saipen test", "saipen sub", "saipen source", "saipen cc",
-    "gg", "hh", "ff", "xx", "vv", "zz", "cc", "ccc", "ss", "sss",
-    "dd", "aa", "qq", "qqq", "ee", "eee", "pp", "tt", "sc",
-    "сс", "ссс", "аа", "ее", "еее", "рр", "хх"
+    "saipal continue",
+    "saipal status",
+    "saipal next",
+    "saipal report",
+    "saipal evidence",
+    "saipal setup",
+    "saipal doctor",
+    "saipal disposition",
+    "saipal trigger",
+    "saipal sessions",
+    "saipal submit",
+    "saipal cc",
+    "saipen continue",
+    "saipen status",
+    "saipen next",
+    "saipen goal",
+    "saipen plan",
+    "saipen scout",
+    "saipen build",
+    "saipen verify",
+    "saipen review",
+    "saipen ship",
+    "saipen done",
+    "saipen validate",
+    "saipen hunt",
+    "saipen markhunt",
+    "saipen add",
+    "saipen clean",
+    "saipen translate",
+    "saipen prepare",
+    "saipen userperson",
+    "saipen context",
+    "saipen brief",
+    "saipen focus",
+    "saipen build",
+    "saipen cut",
+    "saipen undo",
+    "saipen stop",
+    "saipen push",
+    "saipen scope",
+    "saipen claim",
+    "saipen transition",
+    "saipen ticket",
+    "saipen improve",
+    "saipen runtime",
+    "saipen rebind-home",
+    "saipen recover",
+    "saipen attempt",
+    "saipen collect",
+    "saipen crew",
+    "saipen test",
+    "saipen sub",
+    "saipen source",
+    "saipen cc",
+    "gg",
+    "hh",
+    "ff",
+    "xx",
+    "vv",
+    "zz",
+    "cc",
+    "ccc",
+    "ss",
+    "sss",
+    "dd",
+    "aa",
+    "qq",
+    "qqq",
+    "ee",
+    "eee",
+    "pp",
+    "tt",
+    "sc",
+    "сс",
+    "ссс",
+    "аа",
+    "ее",
+    "еее",
+    "рр",
+    "хх"
   ],
-  "carrier_phases": ["IDLE", "RECOVER", "BLOCKED"],
+  "carrier_phases": [
+    "IDLE",
+    "RECOVER",
+    "BLOCKED"
+  ],
   "next_carriers": [
     "idle",
     "resume-session",
@@ -131,7 +219,11 @@
     "max_open_candidates": 20
   },
   "candidate_schema_version": 1,
-  "candidate_verdicts": ["DRIFT", "NO_DRIFT", "INSUFFICIENT_EVIDENCE"],
+  "candidate_verdicts": [
+    "DRIFT",
+    "NO_DRIFT",
+    "INSUFFICIENT_EVIDENCE"
+  ],
   "candidate_fields": [
     "schema_version",
     "verdict",
@@ -179,19 +271,49 @@
     "source_digest",
     "role"
   ],
-  "evidence_source_kinds": ["opencode", "claude", "codex", "gemini"],
-  "evidence_roles": ["user", "assistant", "tool", "unknown"],
+  "evidence_source_kinds": [
+    "opencode",
+    "claude",
+    "codex",
+    "gemini"
+  ],
+  "evidence_roles": [
+    "user",
+    "assistant",
+    "tool",
+    "unknown"
+  ],
   "evidence_locator_limits": {
     "max_source_kind_chars": 32,
     "max_source_id_chars": 512,
     "max_source_digest_chars": 64,
     "max_role_chars": 16
   },
-  "temperature_enum": ["HOT", "COLD"],
-  "adapters": ["generic", "claude", "codex", "opencode", "termisai", "gemini"],
-  "session_status": ["IMPORTED", "CONFLICT"],
-  "episode_finality": ["FINAL", "PROVISIONAL"],
-  "binding_status": ["BOUND", "PARTIAL", "UNKNOWN"],
+  "temperature_enum": [
+    "HOT",
+    "COLD"
+  ],
+  "adapters": [
+    "generic",
+    "claude",
+    "codex",
+    "opencode",
+    "termisai",
+    "gemini"
+  ],
+  "session_status": [
+    "IMPORTED",
+    "CONFLICT"
+  ],
+  "episode_finality": [
+    "FINAL",
+    "PROVISIONAL"
+  ],
+  "binding_status": [
+    "BOUND",
+    "PARTIAL",
+    "UNKNOWN"
+  ],
   "binding_proof_levels": [
     "EXACT_COMMIT",
     "RELEASE_REGISTRY",
@@ -199,7 +321,10 @@
     "INSTALLED_RELEASE",
     "UNKNOWN"
   ],
-  "historical_rule_status": ["RESOLVED", "UNAVAILABLE"],
+  "historical_rule_status": [
+    "RESOLVED",
+    "UNAVAILABLE"
+  ],
   "historical_rule_sources": [
     "EXACT_COMMIT",
     "RELEASE_REGISTRY",
@@ -213,7 +338,11 @@
     "max_surface_documents": 64,
     "max_surface_bytes": 2097152
   },
-  "historical_protection": ["PROTECTED", "STILL_VULNERABLE", "UNKNOWN"],
+  "historical_protection": [
+    "PROTECTED",
+    "STILL_VULNERABLE",
+    "UNKNOWN"
+  ],
   "event_types": [
     "USER_MESSAGE",
     "ASSISTANT_MESSAGE",
@@ -256,9 +385,21 @@
     "started_at",
     "ended_at",
     "raw_source_ref",
-    "raw_source_sha256"
+    "raw_source_sha256",
+    "source_id",
+    "source_enqueued_at",
+    "watermark",
+    "observed_watermark"
   ],
-  "event_fields": ["seq", "type", "ts", "loc", "digest", "facts", "evidence_ref"],
+  "event_fields": [
+    "seq",
+    "type",
+    "ts",
+    "loc",
+    "digest",
+    "facts",
+    "evidence_ref"
+  ],
   "protocol_binding_fields": [
     "git_head",
     "version",
@@ -289,20 +430,29 @@
     "default_before": 3,
     "default_after": 3
   },
- "finding_lifecycle": [
-  "SUSPECTED",
-  "OBSERVED",
-  "BOUND",
-  "CHALLENGED",
-  "QUALIFIED",
-  "REJECTED",
-  "MERGED",
-  "BLOCKED",
-  "STALE",
-  "EMITTED"
- ],
-  "confidence_enum": ["HIGH", "MEDIUM", "LOW"],
-  "severity_enum": ["P0", "P1", "P2", "P3"],
+  "finding_lifecycle": [
+    "SUSPECTED",
+    "OBSERVED",
+    "BOUND",
+    "CHALLENGED",
+    "QUALIFIED",
+    "REJECTED",
+    "MERGED",
+    "BLOCKED",
+    "STALE",
+    "EMITTED"
+  ],
+  "confidence_enum": [
+    "HIGH",
+    "MEDIUM",
+    "LOW"
+  ],
+  "severity_enum": [
+    "P0",
+    "P1",
+    "P2",
+    "P3"
+  ],
   "drift_taxonomy": [
     "COMMAND_ROUTE_DRIFT",
     "ACTIVE_WORK_PREEMPTION",
@@ -338,22 +488,66 @@
     "cold_continuation"
   ],
   "protected_invariant_surfaces": {
-    "destructive_confirmation": ["CORE_PROTOCOL", "EXECUTION_POLICY"],
-    "recovery_precedence": ["CORE_PROTOCOL", "PHASE_CONTRACT"],
-    "source_closure": ["CORE_PROTOCOL", "SOURCE_CONTRACT"],
-    "verify": ["CORE_PROTOCOL", "PHASE_CONTRACT"],
-    "review": ["CORE_PROTOCOL", "PHASE_CONTRACT"],
-    "provenance": ["CORE_PROTOCOL", "SOURCE_CONTRACT", "EXECUTION_POLICY"],
-    "cold_continuation": ["CORE_PROTOCOL", "PHASE_CONTRACT"]
+    "destructive_confirmation": [
+      "CORE_PROTOCOL",
+      "EXECUTION_POLICY"
+    ],
+    "recovery_precedence": [
+      "CORE_PROTOCOL",
+      "PHASE_CONTRACT"
+    ],
+    "source_closure": [
+      "CORE_PROTOCOL",
+      "SOURCE_CONTRACT"
+    ],
+    "verify": [
+      "CORE_PROTOCOL",
+      "PHASE_CONTRACT"
+    ],
+    "review": [
+      "CORE_PROTOCOL",
+      "PHASE_CONTRACT"
+    ],
+    "provenance": [
+      "CORE_PROTOCOL",
+      "SOURCE_CONTRACT",
+      "EXECUTION_POLICY"
+    ],
+    "cold_continuation": [
+      "CORE_PROTOCOL",
+      "PHASE_CONTRACT"
+    ]
   },
   "protected_invariant_rules": {
-    "destructive_confirmation": ["PAL-DONOHARM-01", "PAL-WRITE-01"],
-    "recovery_precedence": ["PAL-BOOT-01", "PAL-BOOT-02"],
-    "source_closure": ["PAL-EVIDENCE-01", "PAL-FINDING-01"],
-    "verify": ["PAL-FINDING-02", "PAL-FINDING-03"],
-    "review": ["PAL-FINDING-03", "PAL-AUDIT-03"],
-    "provenance": ["PAL-EVIDENCE-01", "PAL-EVIDENCE-02", "PAL-OWNERSHIP-01"],
-    "cold_continuation": ["PAL-SESSION-02", "PAL-SESSION-05"]
+    "destructive_confirmation": [
+      "PAL-DONOHARM-01",
+      "PAL-WRITE-01"
+    ],
+    "recovery_precedence": [
+      "PAL-BOOT-01",
+      "PAL-BOOT-02"
+    ],
+    "source_closure": [
+      "PAL-EVIDENCE-01",
+      "PAL-FINDING-01"
+    ],
+    "verify": [
+      "PAL-FINDING-02",
+      "PAL-FINDING-03"
+    ],
+    "review": [
+      "PAL-FINDING-03",
+      "PAL-AUDIT-03"
+    ],
+    "provenance": [
+      "PAL-EVIDENCE-01",
+      "PAL-EVIDENCE-02",
+      "PAL-OWNERSHIP-01"
+    ],
+    "cold_continuation": [
+      "PAL-SESSION-02",
+      "PAL-SESSION-05"
+    ]
   },
   "change_target_enum": [
     "CORE_PROTOCOL",
@@ -398,8 +592,15 @@
       "DOCUMENTATION",
       "CONFORMANCE_TEST"
     ],
-    "ENGINE_ENFORCEMENT_GAP": ["ENGINE", "CONFORMANCE_TEST", "HARNESS"],
-    "ADAPTER_EVIDENCE_GAP": ["ADAPTER", "CONFORMANCE_TEST"],
+    "ENGINE_ENFORCEMENT_GAP": [
+      "ENGINE",
+      "CONFORMANCE_TEST",
+      "HARNESS"
+    ],
+    "ADAPTER_EVIDENCE_GAP": [
+      "ADAPTER",
+      "CONFORMANCE_TEST"
+    ],
     "MODEL_NONCOMPLIANCE": [
       "ENGINE",
       "CONFORMANCE_TEST",
@@ -407,12 +608,29 @@
       "DOCUMENTATION",
       "NO_CHANGE"
     ],
-    "MODEL_GUIDANCE_GAP": ["MODEL_GUIDANCE", "DOCUMENTATION", "CONFORMANCE_TEST"],
-    "USER_OVERRIDE": ["NO_CHANGE", "DOCUMENTATION"],
-    "ENVIRONMENT_FAILURE": ["HARNESS", "NO_CHANGE"],
-    "EXPECTED_VARIATION": ["NO_CHANGE", "DOCUMENTATION"],
-    "INSUFFICIENT_EVIDENCE": ["NO_CHANGE"],
-    "NO_DRIFT": ["NO_CHANGE"]
+    "MODEL_GUIDANCE_GAP": [
+      "MODEL_GUIDANCE",
+      "DOCUMENTATION",
+      "CONFORMANCE_TEST"
+    ],
+    "USER_OVERRIDE": [
+      "NO_CHANGE",
+      "DOCUMENTATION"
+    ],
+    "ENVIRONMENT_FAILURE": [
+      "HARNESS",
+      "NO_CHANGE"
+    ],
+    "EXPECTED_VARIATION": [
+      "NO_CHANGE",
+      "DOCUMENTATION"
+    ],
+    "INSUFFICIENT_EVIDENCE": [
+      "NO_CHANGE"
+    ],
+    "NO_DRIFT": [
+      "NO_CHANGE"
+    ]
   },
   "non_drift_dispositions": [
     "USER_OVERRIDE",
@@ -511,14 +729,23 @@
       "updated",
       "note"
     ],
-    "queue_fields": ["hot", "recent", "cold", "candidates"],
-    "phase_enum": ["IDLE", "RECOVER", "BLOCKED"],
+    "queue_fields": [
+      "hot",
+      "recent",
+      "cold",
+      "candidates"
+    ],
+    "phase_enum": [
+      "IDLE",
+      "RECOVER",
+      "BLOCKED"
+    ],
     "schema_version": 1
   },
   "doc_budgets": {
     "saipal/BOOT.md": 110,
     "saipal/CORE.md": 170,
-    "saipal/COMMANDS.md": 200,
+    "saipal/COMMANDS.md": 209,
     "saipal/SESSIONS.md": 200,
     "saipal/FINDINGS.md": 150,
     "saipal/AUDITS.md": 130,
@@ -530,11 +757,18 @@
   "deferred_semantics": {
     "WAVE_H_HUSH": {
       "introduced_in": "7.120.0",
-      "rules": ["PAL-FINDING-01", "PAL-FINDING-02"]
+      "rules": [
+        "PAL-FINDING-01",
+        "PAL-FINDING-02"
+      ]
     },
     "WAVE_H_AUDIT_INBOX": {
       "introduced_in": "7.180.0",
-      "rules": ["PAL-AUDIT-01", "PAL-AUDIT-02", "PAL-AUDIT-03"]
+      "rules": [
+        "PAL-AUDIT-01",
+        "PAL-AUDIT-02",
+        "PAL-AUDIT-03"
+      ]
     }
   },
   "error_codes": [
@@ -542,6 +776,8 @@
     "HOME_UNRESOLVED",
     "STATE_UNRECOVERABLE",
     "WRITER_BUSY",
+    "AUTHORITY_SUBSTITUTION",
+    "AUTHORITY_ENROLLMENT_INCOMPLETE",
     "VALIDATION_FAILED",
     "USAGE",
     "UNKNOWN_COMMAND",

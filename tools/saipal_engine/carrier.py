@@ -370,9 +370,20 @@ def _historical(home: Path, record: dict, rule_ids: list[str], registry: dict) -
 
 
 def _recurrence(home: Path, drift_class: str | None, limit: int) -> dict:
+    # Read-only surface (ROLE 8): a corrupt ledger surfaces as INVALID instead
+    # of a clean-looking empty packet, and is never repaired here.
+    from .recurrence import RECURRENCE_VALID, recurrence_status
+
+    status = recurrence_status(home)
+    if not drift_class or status != RECURRENCE_VALID:
+        return {
+            "by_model": [],
+            "by_project": [],
+            "known_findings": 0,
+            "spread": None,
+            "recurrence_status": status,
+        }
     data = recurrence_mod.load_recurrence(home)
-    if not drift_class:
-        return {"by_model": [], "by_project": [], "known_findings": 0, "spread": None}
     return {
         "by_model": recurrence_mod.cross_model_recurrence(data, drift_class)[:limit],
         "by_project": recurrence_mod.cross_project_recurrence(data, drift_class)[:limit],
@@ -384,6 +395,7 @@ def _recurrence(home: Path, drift_class: str | None, limit: int) -> dict:
         # The spread is the part the analyst must actually reason with: one model
         # drifting where another complied is not evidence about the protocol.
         "spread": recurrence_mod.spread(data, drift_class),
+        "recurrence_status": status,
     }
 
 

@@ -12,6 +12,10 @@ NAME = "claude"
 
 SOURCE_SUFFIX = ".jsonl"
 
+#: T-103: max parsed seq detects appends only; a rewritten historical line
+#: keeps the watermark. Append hint, never a mutation-safe change token.
+WATERMARK_CAPABILITY = "APPEND_ONLY_HINT"
+
 TYPE_MAP = {
     "user": "USER_MESSAGE",
     "assistant": "ASSISTANT_MESSAGE",

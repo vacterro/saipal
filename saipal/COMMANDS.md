@@ -31,6 +31,14 @@ The executable surface is exactly these commands plus the alias below.
 | `saipal disposition` | — | yes | import maintainer disposition JSON |
 | `saipal trigger` | — | yes | request one pending run (coalescing) |
 | `saipal sessions [N]` | — | never | list known sessions, freshest first (N = limit, default 25) |
+| `saipal analyst-setup` | — | yes | create/adjust the analyst runtime config (disabled by default) |
+| `saipal analyst-doctor` | — | never | read-only analyst readiness report (no network, no tokens) |
+| `saipal analyst-status` | — | never | read-only worker state: journal, budgets, last run |
+| `saipal investigate` | — | yes | autonomous semantic loop: allocate, deliberate, submit, repeat within budget; `--calibrate [--seed S]` runs the bounded shadow calibration through the same worker (explicit `--max-units N` required, never drains, STAGE_ONLY only) |
+| `saipal watch` | — | yes | foreground unattended supervisor: bounded semantic cycles through the real worker, durable checkpoint, adaptive wake, single-owner lock; `--status` is read-only and works while the supervisor runs; `--max-cycles N` bounds it; refuses non-STAGE_ONLY publication loudly |
+| `saipal authority doctor\|discover` | — | never | read-only protocol authority health and candidates; discovery never trusts |
+| `saipal authority enroll (--git-repository\|--release-root\|--snapshot-root) PATH` | — | yes | the ONE explicit trust action: persists the root plus pinning metadata (substitution detected, HEAD free to advance) |
+| `saipal rebind [--dry-run]` | — | yes | deterministic historical rebinding: recomputes binding proof from enrolled authority, writes only strengthening transitions, reports newly eligible units; downgrade attempts recorded never applied |
 
 Bare `saipal` means `saipal continue`, and `/saipal cc` is the same command where
 slash routing exists. Aliases live in `REGISTRY.json` under `shortcuts`, never in
@@ -47,7 +55,8 @@ inside a subcommand still exits `2`.
 read-only. They must not create or materialize the home, normalize sessions,
 create/merge/qualify findings, enqueue audits, append to the log, or touch an
 analyzed project or SAIPEN Core. All refuse with `NO_HOME` when no home exists, and
-say so with a next action rather than silently creating one.
+say so with a next action rather than silently creating one. `analyst-doctor` and `analyst-status`
+are read-only and never call a network; `analyst-setup` writes only `.saipal/analyst.json`; only `investigate` may call a model (config- and egress-gated); `continue` never does.
 
 `status` prints a compact summary only. It never dumps transcripts, event
 payloads, or full finding text.

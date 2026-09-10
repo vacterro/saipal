@@ -531,6 +531,73 @@ def check_status_freshness(report: Report) -> None:
         )
 
 
+def check_verification_truth(report: Report) -> None:
+    """T-120: test/validator counts have exactly one sourced truth.
+
+    Test counts are not collectibles: a number copied into several documents
+    rots independently in each (README once claimed 970 while the real suite
+    had grown past it, and founding checkpoints carried 225/241 as if current).
+    The contract: `WAVE_I_CHECKPOINT.md` owns the **Current verification truth**
+    block, stamped with a `checkpoint_id`; every other document either carries
+    NO unittest/validator count or names the checkpoint id it repeats.
+    """
+    print("[verification truth]")
+    checkpoint_path = _ROOT / "WAVE_I_CHECKPOINT.md"
+    if not checkpoint_path.is_file():
+        report.check(False, "checkpoint owns the verification truth", "WAVE_I_CHECKPOINT.md is missing")
+        return
+    checkpoint_text = checkpoint_path.read_text(encoding="utf-8")
+    has_truth_block = "## Current verification truth" in checkpoint_text
+    has_id = bool(re.search(r"checkpoint_id:\s*\S+", checkpoint_text))
+    has_counts = bool(
+        re.search(r"unittest_cases:\s*\d+", checkpoint_text)
+        and re.search(r"validator_checks:\s*\d+", checkpoint_text)
+    )
+    report.check(
+        has_truth_block and has_id and has_counts,
+        "WAVE_I_CHECKPOINT.md carries the checkpointed verification truth",
+        "needs a 'Current verification truth' block with checkpoint_id + counts",
+    )
+    checkpoint_id = ""
+    match = re.search(r"checkpoint_id:\s*(\S+)", checkpoint_text)
+    if match:
+        checkpoint_id = match.group(1)
+
+    # Any other repo document that quotes suite counts must name the same
+    # checkpoint identity. Audits under docs/audits/ are exempt: they are
+    # dated external artifacts, archaeology by definition.
+    counted = re.compile(r"(\d[\d,]*)\s*(unittest cases|unit tests|validator checks)", re.I)
+    for path in sorted(_ROOT.glob("*.md")) + sorted((_ROOT / "saipal").glob("*.md")):
+        if path.name == "WAVE_I_CHECKPOINT.md":
+            continue
+        text = path.read_text(encoding="utf-8")
+        if path.name == "README.md":
+            # README may repeat counts only WITH the checkpoint identity line.
+            for occurrence in counted.finditer(text):
+                report.check(
+                    checkpoint_id and checkpoint_id in text,
+                    f"{path.name} count carries the checkpoint identity",
+                    f"count {occurrence.group(0)!r} without checkpoint_id {checkpoint_id!r}",
+                )
+            report.check(
+                "Current verification truth" in text
+                or counted.search(text) is None,
+                f"{path.name} points at the canonical verification truth",
+                "carries a count with no source",
+            )
+        else:
+            hits = [occurrence.group(0) for occurrence in counted.finditer(text)]
+            stale = [
+                hit for hit in hits
+                if not (checkpoint_id and checkpoint_id in text)
+            ]
+            report.check(
+                not stale,
+                f"{path.name} carries no unsourced verification counts",
+                f"counts without the {checkpoint_id!r} identity: {', '.join(stale)}",
+            )
+
+
 def check_law_coverage(report: Report, registry: dict) -> None:
     """Every drift class the taxonomy declares resolves to a real owner.
 
@@ -588,6 +655,7 @@ def main(argv: list[str] | None = None) -> int:
         check_wave_guards(report, registry)
         check_law_coverage(report, registry)
         check_status_freshness(report)
+        check_verification_truth(report)
     else:
         report.check(False, "registry-driven checks ran", "registry did not load")
 

@@ -605,6 +605,7 @@ def emit_audit(
     paths: Any,
     registry: dict,
     audits_emitted: list[dict],
+    publication_ceiling: str | None = None,
 ) -> None:
     """Turn a qualified finding into a numbered audit — the external boundary.
 
@@ -612,6 +613,13 @@ def emit_audit(
     DRIFT confirmation tied to a BOUND historical authority cannot stage or
     publish here, whatever its caller believes. External-effect boundaries
     defend their own invariants; they do not trust them to the caller.
+
+    T-111: `publication_ceiling` is orchestration-owned execution authority.
+    A supervisor running in shadow mode passes "STAGE_ONLY", and then THIS
+    boundary stages locally no matter what the mutable config says LATER --
+    a mode flip during one semantic batch can never reach the external sink
+    through the shadow run. When the ceiling and the live config disagree the
+    mismatch is recorded as a loud event, never delivered.
     """
     if not findings_mod.is_semantically_confirmed(finding):
         raise PalError(
@@ -630,6 +638,32 @@ def emit_audit(
         raise PalError("VALIDATION_FAILED", config_detail)
     mode = (config or {}).get("publication_mode", "STAGE_ONLY")
     delivery = None
+    if publication_ceiling == "STAGE_ONLY" and mode == "PUBLISH_ENABLED":
+        # The shadow ceiling outranks mutable config at the external-effect
+        # boundary: stage locally, record the mismatch, never deliver.
+        from . import log as ceiling_log_mod
+
+        ceiling_log_mod.append_event(
+            home,
+            "shadow_ceiling_mismatch",
+            data={
+                "finding_id": str(finding.get("finding_id") or ""),
+                "publication_mode": mode,
+                "publication_ceiling": publication_ceiling,
+                "action": "staged locally; the shadow run never publishes externally",
+            },
+            registry=registry,
+        )
+        result = enqueue_mod.enqueue_audit(home, finding, body, registry=registry, maintainer_root=None)
+        finding["audit"] = {
+            "audit_number": result["audit_number"],
+            "audit_path": result["audit_path"],
+            "audit_sha256": result["audit_sha256"],
+            "operation_id": result["operation_id"],
+        }
+        findings_mod.advance_lifecycle(finding, "EMITTED", registry=registry)
+        audits_emitted.append(result)
+        return
     if mode == "PUBLISH_ENABLED":
         try:
             sink_status, sink, sink_detail = configured_sink(home)

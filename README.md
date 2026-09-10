@@ -116,8 +116,18 @@ is therefore *proved* clean rather than merely unaccused.
 
 Version 0.4.2. Waves A–I plus the semantic analyst loop (carrier, candidate
 schema, submission boundary, no-drift receipts, coverage, paged episodes,
-sink retry, trigger coalescing) are implemented and green: 970 unit tests and
-273 validator checks.
+sink retry, trigger coalescing) are implemented and green.
+
+Verification counts live in ONE place: the **Current verification truth**
+block of `WAVE_I_CHECKPOINT.md`, re-derived from the real suite after every
+material change and stamped with its `checkpoint_id`. This README does not
+keep its own counters — a count copied into a second document rots silently.
+Run the two commands any time you want the live numbers:
+
+```bash
+python -B -m unittest discover -s tools -p "test_*.py"   # canonical unittest suite
+python -B tools/validate.py                              # protocol/registry checks
+```
 
 Publication defaults to `STAGE_ONLY`; `PUBLISH_ENABLED` requires an explicit
 operator-reviewed shadow pass **and** a validated sink root in the same call.

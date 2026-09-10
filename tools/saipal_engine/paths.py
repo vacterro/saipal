@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -403,6 +404,71 @@ class FencedLockFile:
         payload.update(extra or {})
         return (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
 
+    def _lease_fresh_bytes(self) -> dict:
+        """The sidecar freshness record a refresh may write.
+
+        Refreshing must never rewrite the lock node: the owner payload is the
+        FENCING IDENTITY and is immutable once acquired (T-110). Lease freshness
+        lives beside the lock in `.<name>.lease`, carrying the owning token --
+        so a stale touch from a dethroned owner can be recognized and ignored,
+        and takeover can discard freshness that does not name the current owner.
+        """
+        return {"owner": self.token, "ttl": self.ttl, "renewed_at": time.time()}
+
+    def _lease_side_path(self) -> Path:
+        return self.path.parent / f".{self.path.name}.lease"
+
+    def _write_lease_freshness(self) -> bool:
+        """Publish the sidecar heartbeat. Never touches the lock node itself."""
+        try:
+            tmp = self._lease_side_path().with_name(
+                f".{self.path.name}.lease.{uuid.uuid4().hex}"
+            )
+            tmp.write_bytes(
+                (json.dumps(self._lease_fresh_bytes(), sort_keys=True) + "\n").encode(
+                    "utf-8"
+                )
+            )
+            os.replace(str(tmp), str(self._lease_side_path()))
+            return True
+        except OSError:
+            return False
+
+    def _read_lease_freshness(self) -> dict | None:
+        try:
+            raw = self._lease_side_path().read_bytes()
+        except (FileNotFoundError, OSError):
+            return None
+        try:
+            payload = json.loads(raw.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _lease_age_seconds(self) -> float | None:
+        """Age of the freshest lease record naming the CURRENT on-disk owner.
+
+        None means "no usable freshness surface": the caller falls back to the
+        lock file's own mtime, which is the pre-sidecar behavior and stays
+        crash-recoverable (a crashed holder's mtime simply ages past the TTL).
+        """
+        payload = self._read_lease_freshness()
+        if not payload:
+            return None
+        try:
+            renewed_at = float(payload.get("renewed_at") or 0)
+        except (TypeError, ValueError):
+            return None
+        state, on_disk, _raw = self._inspect()
+        if state != _LOCK_OK:
+            return None
+        if str(on_disk.get("owner") or "") != str(payload.get("owner") or ""):
+            # The freshness record does not name the lock's current owner:
+            # a dethroned old owner's last touch, or debris. Ignore it --
+            # a stale touch must never make a successor look fresh.
+            return None
+        return max(0.0, time.time() - renewed_at)
+
     def _inspect(self) -> tuple[str, dict | None, bytes]:
         """`(state, payload, raw)` for the lock file as it is right now."""
         try:
@@ -420,6 +486,16 @@ class FencedLockFile:
         return _LOCK_OK, payload, raw
 
     def _age_on_disk(self) -> float:
+        """How long ago the CURRENT owner last proved it is alive.
+
+        The sidecar lease record is authoritative while it names the current
+        on-disk owner; the lock node's own mtime is the fallback (the
+        pre-sidecar behavior) and keeps staleness crash-recoverable when no
+        sidecar exists yet.
+        """
+        lease_age = self._lease_age_seconds()
+        if lease_age is not None:
+            return lease_age
         try:
             return max(0.0, time.time() - self.path.stat().st_mtime)
         except OSError:
@@ -430,8 +506,6 @@ class FencedLockFile:
     def _payload_is_stale(self, payload: dict) -> bool:
         try:
             pid = int(payload.get("pid", 0))
-            age = time.time() - float(payload.get("created_at", 0))
-            ttl = float(payload.get("ttl", self.ttl))
         except (TypeError, ValueError):
             return True
         host = str(payload.get("host") or "")
@@ -442,7 +516,12 @@ class FencedLockFile:
             return True
         if host == socket.gethostname() and not _pid_alive(pid):
             return True
-        return age >= ttl
+        # Liveness/age goes through the sidecar-aware clock: while the current
+        # owner keeps refreshing its sidecar record the lock is not stale, and
+        # once a dethroned owner's record no longer names the current owner the
+        # node's own mtime decides (T-110: the payload is immutable, so the old
+        # `created_at` field can no longer be relied on for renewal).
+        return self._age_on_disk() >= float(payload.get("ttl", self.ttl) or self.ttl)
 
     def _stale_now(self) -> tuple[bool, bytes]:
         """`(is_stale, raw)` -- the bytes are what the verdict was formed on."""
@@ -475,6 +554,11 @@ class FencedLockFile:
             claimed = b""
         if claimed == judged:
             _unlink_lock(claim)
+            # The old owner's freshness record is dead with its node: takeover
+            # discards it so the new owner's lease age derives from its own
+            # acquisition (mtime fallback until its first refresh).
+            with _suppress_os_error():
+                os.unlink(str(self._lease_side_path()))
             return True
         # The node changed between the verdict and the rename, so what we moved
         # aside was somebody else's live lock. Put it back if the slot is still
@@ -513,6 +597,11 @@ class FencedLockFile:
             self.token = token
             self._held = True
             self.detail = "acquired"
+            # Our acquisition owns the freshness surface from this moment: any
+            # previous owner's sidecar record is discarded so lease age derives
+            # from our own heartbeat cadence, never a ghost's.
+            with _suppress_os_error():
+                os.unlink(str(self._lease_side_path()))
             return True
         self.detail = self.busy_detail
         return False
@@ -525,11 +614,24 @@ class FencedLockFile:
         return state == _LOCK_OK and str((payload or {}).get("owner") or "") == self.token
 
     def refresh(self, ttl: float | None = None) -> bool:
-        """Rewrite our own payload, keeping the SAME token.
+        """Renew lease freshness WITHOUT rewriting the lock node (T-110).
 
-        A refresh that mints a new owner throws away the only thing that makes
-        release safe, so the token is preserved and a lock we no longer own is
-        refused rather than stolen back.
+        The lock node's owner payload is the fencing identity and is immutable
+        once acquired. The old implementation re-wrote the node after an
+        `owns_on_disk()` check, so a successor that took the path between the
+        check and the destructive `O_TRUNC` write had its owner token destroyed
+        -- the old owner stole the lease back (TOCTOU). Refresh therefore only:
+
+        1. re-checks ownership (cheap early exit for the common case);
+        2. writes the SIDEcar freshness record naming our token -- losing the
+           path at worst delays or touches harmless metadata, it can never
+           overwrite a successor's owner identity;
+        3. re-reads ownership AFTER the touch and returns False if a successor
+           has the node (the successor's takeover replaces/deletes the node and
+           its own next acquisition refreshes the sidecar under its token).
+
+        A dethroned owner's stale sidecar touch is ignored by staleness
+        (`_lease_age_seconds` requires the record to name the current owner).
         """
         if not self._held or self.token is None:
             return False
@@ -537,16 +639,10 @@ class FencedLockFile:
             return False
         if ttl is not None:
             self.ttl = float(ttl)
-        data = self._payload_bytes(self.token, {"ttl": self.ttl})
-        try:
-            descriptor = os.open(str(self.path), os.O_WRONLY | os.O_TRUNC, 0o600)
-        except OSError:
+        if not self._write_lease_freshness():
             return False
-        try:
-            os.write(descriptor, data)
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        if not self.owns_on_disk():
+            return False
         return True
 
     def release(self) -> None:
@@ -570,6 +666,9 @@ class FencedLockFile:
             return
         if _unlink_lock(self.path):
             self.detail = "released"
+            # Our own release: the freshness sidecar dies with the lease.
+            with _suppress_os_error():
+                os.unlink(str(self._lease_side_path()))
         else:
             # The file could not be removed (a contender holds it open). It is
             # still ours by content, so the create grace and TTL recover it; what
@@ -630,3 +729,101 @@ class HomeLock:
     def __exit__(self, exc_type, exc, tb) -> bool:
         self.release()
         return False
+
+
+# --------------------------------------------------------------------------- #
+# CORE-001: one common writer fence for every mutation of shared .saipal state
+# --------------------------------------------------------------------------- #
+
+#: Reentrancy guard for the common writer fence (audit CORE-001).
+#:
+#: The OS-level FencedLockFile already refuses a second acquirer from ANY
+#: process; the one hazard it cannot see is the SAME THREAD nesting a second
+#: acquisition of the same node (lock files are not reentrant). Intake callers
+#: legitimately arrive already holding HomeLock, so the shared session-index
+#: transactions below must not deadlock against them. The depth is tracked
+#: PER THREAD: the owning thread reenters freely, while any other thread --
+#: even in this process -- must take the real file fence or fail WRITER_BUSY,
+#: exactly like a foreign process.
+_WRITER_FENCE_DEPTH: dict[tuple[str, int], int] = {}
+
+
+class WriterFence:
+    """The common mutation lease over one home's shared durable state.
+
+    CORE-001 proved the durable data loss: the analyst worker called
+    `submit_candidate` with NO writer lock while a concurrent HomeLock-protected
+    `continue` imported a new generation; the worker's stale index save then
+    erased the intake. One shared mutation lease now covers every transaction
+    that touches shared state -- submit, intake, rebind, analyst config --
+    while paid model/network reasoning stays OUTSIDE it.
+
+    Semantics:
+
+    - Cross-process: the underlying HomeLock/FencedLockFile fence. A second
+      process either serializes behind it or fails WRITER_BUSY.
+    - Same-process: reentrant via a depth counter, so HomeLock callers can
+      drive shared transactions without deadlocking (nested acquisition of
+      the same node is what the file lock cannot express).
+    - Stale-save defense: when the holder of the OUTER process fence is a
+      long-lived section (a whole watch cycle), inner transactions verify at
+      commit time that the session index was not replaced under them and
+      re-merge instead of blindly overwriting (see
+      `saipal_engine.submit.submit_candidate`).
+    """
+
+    def __init__(self, home: Path | str):
+        self.paths = home_paths(home)
+        self._home = Path(home)
+        self._lock: HomeLock | None = None
+        self._depth = 0
+        self._thread_key: tuple[str, int] | None = None
+
+    def acquire(self) -> bool:
+        key = (str(self.paths.lock), threading.get_ident())
+        depth = _WRITER_FENCE_DEPTH.get(key, 0)
+        if depth > 0:
+            _WRITER_FENCE_DEPTH[key] = depth + 1
+            self._depth = depth + 1
+            self._thread_key = key
+            return True
+        lock = HomeLock(self._home)
+        if not lock.acquire():
+            return False
+        self._lock = lock
+        self._depth = 1
+        self._thread_key = key
+        _WRITER_FENCE_DEPTH[key] = 1
+        return True
+
+    def release(self) -> None:
+        key = self._thread_key or (str(self.paths.lock), threading.get_ident())
+        depth = _WRITER_FENCE_DEPTH.get(key, 0)
+        if depth <= 1:
+            _WRITER_FENCE_DEPTH.pop(key, None)
+            if self._lock is not None:
+                self._lock.release()
+                self._lock = None
+            self._depth = 0
+            self._thread_key = None
+        else:
+            _WRITER_FENCE_DEPTH[key] = depth - 1
+            self._depth = depth - 1
+
+    def __enter__(self) -> "WriterFence":
+        if not self.acquire():
+            raise PalError(
+                "WRITER_BUSY",
+                HomeLock.BUSY,
+                next_action="wait for the running cycle, or remove a wedged lock by hand",
+            )
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.release()
+        return False
+
+
+def writer_fence(home: Path | str) -> WriterFence:
+    """Acquire the common writer fence for one mutating transaction."""
+    return WriterFence(home)

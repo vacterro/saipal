@@ -34,6 +34,11 @@ NAME = "opencode"
 HOME_DIRNAME = "opencode"
 DB_NAME = "opencode.db"
 
+#: T-103: `count(*) from part` is a row count. An UPDATE to an existing
+#: part preserves the count, so this probe detects appends only. Append
+#: hint, never a mutation-safe change token.
+WATERMARK_CAPABILITY = "APPEND_ONLY_HINT"
+
 REF_SEP = "#"
 
 EXCERPT_LIMIT = 2000

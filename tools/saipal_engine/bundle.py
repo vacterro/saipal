@@ -48,9 +48,17 @@ def canonical_bytes(payload: dict) -> bytes:
 
     `session_sha256` is normalized away: a bundle cannot contain its own
     digest, so the digest is computed over the document with that field blank
-    and later verified against the declared value.
+    and later verified against the declared value. `watermark` and
+    `observed_watermark` are likewise operational metadata BESIDE the evidence
+    (T-103): they must never change the evidence identity -- otherwise
+    stamping the watermark would alter the digest and every import would fail
+    its own verification.
     """
-    stripped = {key: value for key, value in payload.items() if key != "session_sha256"}
+    stripped = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("session_sha256", "watermark", "observed_watermark")
+    }
     stripped["session_sha256"] = None
     return json.dumps(
         stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=False

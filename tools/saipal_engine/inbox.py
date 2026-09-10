@@ -198,7 +198,11 @@ def import_inbox(
         ):
             # Same bytes as last time, and that content is already indexed. There
             # is nothing this file can contribute, so it is not read at all.
-            skipped.append({"source_ref": source_ref, "reason": "duplicate digest"})
+            skipped.append({
+                "source_ref": source_ref,
+                "reason": "duplicate digest",
+                "source_id": remembered.get("source_id"),
+            })
             continue
 
         try:
@@ -212,6 +216,7 @@ def import_inbox(
             continue
 
         session_id = bundle["session_id"]
+        bundle_source_id = bundle.get("source_id")
         if stat is not None:
             observed_at = _observation_stamp(stat["mtime_ns"])
             if observed_at is not None:
@@ -219,6 +224,7 @@ def import_inbox(
                     **stat,
                     "session_id": session_id,
                     "bundle_sha256": bundle_sha256,
+                    "source_id": bundle_source_id,
                     "observed_at": observed_at,
                 }
                 cache_dirty = True
@@ -228,28 +234,34 @@ def import_inbox(
         if existing is None:
             record = _create(index, bundle, source_ref, path, bundle_sha256, timestamp, data, authority=authority)
             index["sessions"].append(record)
-            imported.append(_report(record, "new-session"))
+            imported.append(_report(record, "new-session", source_id=bundle_source_id))
             index_dirty = True
             continue
 
         # Dedupe BEFORE any generation decision, and across every generation:
         # a digest that already produced generation 2 must not produce a third.
         if already_imported(generations, bundle_sha256):
-            skipped.append({"source_ref": source_ref, "reason": "duplicate digest"})
+            skipped.append({
+                "source_ref": source_ref,
+                "reason": "duplicate digest",
+                "source_id": bundle_source_id,
+            })
             continue
 
         if bundle["temperature"] == "COLD":
             record = _create(index, bundle, source_ref, path, bundle_sha256, timestamp, data, authority=authority)
             index["sessions"].append(record)
-            imported.append(_report(record, "new-generation"))
+            imported.append(_report(record, "new-generation", source_id=bundle_source_id))
             index_dirty = True
             continue
 
         outcome = _extend_hot(existing, bundle, source_ref, path, bundle_sha256, timestamp, data)
         index_dirty = True
         if outcome["conflict"]:
+            outcome["entry"]["source_id"] = bundle_source_id
             conflicts.append(outcome["entry"])
         else:
+            outcome["entry"]["source_id"] = bundle_source_id
             imported.append(outcome["entry"])
 
     # An unchanged inbox is a no-op: rewriting the session index after a pass that
@@ -394,8 +406,8 @@ def _extend_hot(
     }
 
 
-def _report(record: dict, outcome: str) -> dict:
-    return {
+def _report(record: dict, outcome: str, *, source_id: object = None) -> dict:
+    entry = {
         "session_id": record["session_id"],
         "generation": record["generation"],
         "source_ref": record["source_ref"],
@@ -403,3 +415,7 @@ def _report(record: dict, outcome: str) -> dict:
         "outcome": outcome,
         "events": record["event_count"],
     }
+    if source_id:
+        # T-97: durable per-source provenance, never a filename inference.
+        entry["source_id"] = str(source_id)
+    return entry

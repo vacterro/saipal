@@ -51,6 +51,7 @@ from saipal_engine.paths import (  # noqa: E402
     resolve_tool_root,
     sha256_text,
     utc_now_iso,
+    writer_fence,
 )
 from saipal_engine.registry import load_registry, require_string_list  # noqa: E402
 from saipal_engine.sources import (  # noqa: E402
@@ -71,7 +72,7 @@ EXIT_REFUSED = 1
 EXIT_USAGE = 2
 EXIT_NO_HOME = 3
 
-READ_ONLY_COMMANDS = ("status", "next", "doctor", "report")
+READ_ONLY_COMMANDS = ("status", "next", "doctor", "report", "analyst-doctor")
 READ_ONLY_WITH_ARGS = ("sessions", "evidence")
 
 
@@ -157,6 +158,20 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
     if not configured and home == resolve_tool_root() / HOME_DIRNAME:
         from saipal_engine.sources import auto_sources
         configured = auto_sources()
+
+    # ROLE 9 (T-119): corrupt durable recurrence state fails closed BEFORE
+    # the cycle's first new effect (intake/analysis/publication), never after.
+    from saipal_engine.recurrence import recurrence_status
+
+    if recurrence_status(home) == "INVALID":
+        raise PalError(
+            "VALIDATION_FAILED",
+            ".saipal/recurrence.json exists but cannot be parsed or validated; "
+            "historical recurrence state was left untouched",
+            next_action="inspect or restore the file manually; SAIPAL will not "
+            "overwrite it",
+        )
+
     # Load protocol authority for binding verification during intake.
     authority: dict = {}
     config_status, config, config_detail = load_config(home)
@@ -405,6 +420,7 @@ def _continue_next_action(intake: dict, enabled: list, analysis: dict | None = N
 
 
 def _read_sources(home: Path) -> dict:
+    """Legacy helper retained for read paths only (T-112: setup never pre-writes)."""
     from saipal_engine.sources import empty_sources, load_sources
 
     status, payload, _detail = load_sources(home)
@@ -425,7 +441,6 @@ _AUTHORITY_FLAGS = {
 
 def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
     """Explicit one-time configuration: sources, sink, publication mode."""
-    from saipal_engine.sources import save_sources
     from saipal_engine.state import load_state, save_state, fresh_state
     from saipal_engine.config import save_config
 
@@ -435,6 +450,7 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
     mode: str | None = None
     maintainer_root: str | None = None
     shadow_reviewed: bool | None = None
+    authority_requested: dict[str, str] = {}
     authority: dict[str, str] = {}
 
     index = 0
@@ -469,10 +485,12 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
             index += 2
             continue
         if token in _AUTHORITY_FLAGS and index + 1 < len(args):
-            authority[_AUTHORITY_FLAGS[token]] = args[index + 1]
+            authority_requested[_AUTHORITY_FLAGS[token]] = args[index + 1]
             index += 2
             continue
         raise PalError("USAGE", f"unknown setup option {token!r}")
+
+    authority = dict(authority_requested)
 
     if not any(
         (source_root, source_kind, sink_root, mode, maintainer_root, authority)
@@ -483,18 +501,22 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
             "--shadow-reviewed/--protocol-git/--protocol-releases/--protocol-snapshots",
         )
 
-    sources = _read_sources(home)
     if source_root is not None or source_kind is not None:
         kind = source_kind or "generic"
         if source_root is None:
             raise PalError("USAGE", "--source is required when configuring a source")
-        sources["sources"] = [
-            s for s in sources.get("sources", []) if s.get("path") != source_root
-        ]
-        sources["sources"].append(
-            {"id": f"src{len(sources['sources']) + 1}", "kind": kind, "path": source_root, "enabled": True}
-        )
-        save_sources(home, sources)
+        # T-112: setup is a compatibility shim, NOT a bypass and NOT a
+        # pre-writer. The canonical enroll_source is the SINGLE write gate:
+        # it validates structure BEFORE any persistence, treats identical
+        # re-enrollment (same canonical path + kind) as an idempotent no-op
+        # that preserves id and enabled state, refuses a same-path kind
+        # conflict with zero writes, and never deletes a valid source during
+        # a refused operation. (The old shim pre-deleted matching entries and
+        # saved the registry before validation, so a refused setup destroyed
+        # a good source and a successful one silently re-minted its id.)
+        from saipal_engine.source_health import enroll_source
+
+        enroll_source(home, kind=kind, path=Path(source_root).expanduser())
 
     if mode is not None:
         from saipal_engine.config import PUBLICATION_MODES
@@ -502,13 +524,29 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
         if mode not in PUBLICATION_MODES:
             raise PalError("USAGE", f"mode must be one of {', '.join(PUBLICATION_MODES)}")
 
-    # Config is one transaction. Applying mode, sink and authority as three
-    # separate saves made PUBLISH_ENABLED unreachable: the mode was validated
-    # before the sink root it requires existed, so `--mode PUBLISH_ENABLED
-    # --sink PATH` always failed on its own first step.
-    if mode is not None or sink_root is not None or authority or shadow_reviewed is not None:
+    # Config writes. The mode/sink/shadow_reviewed triple is ONE transaction
+    # (applying them separately made PUBLISH_ENABLED unreachable: the mode was
+    # validated before the sink root it required existed). Authority roots are
+    # enrolled through the canonical gate, which owns its own transaction.
+    if authority:
+        # T-99: trust enrollment has ONE gate. The setup flags are a
+        # compatibility shim routed through authority.enroll() -- the exact
+        # validation (existence, git-repository check for git_repository,
+        # registry fingerprint) and pinning record as the canonical
+        # `authority-enroll` surface. No CLI path may write an authority root
+        # into config directly.
+        from saipal_engine.authority import enroll as enroll_authority
         from saipal_engine.config import AUTHORITY_KEYS
 
+        for key in AUTHORITY_KEYS:
+            if key not in authority:
+                continue
+            enroll_authority(home, key, Path(authority[key]).expanduser())
+
+    if mode is not None or sink_root is not None or shadow_reviewed is not None:
+        # Re-read AFTER any enrollment: authority.enroll() owns its own
+        # config transaction, and a stale pre-enrollment snapshot must never
+        # overwrite the freshly enrolled trust state (T-99).
         config_status, config, detail = load_config(home)
         if config_status == "unrecoverable":
             raise PalError("VALIDATION_FAILED", detail)
@@ -524,21 +562,7 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
             config.setdefault("sink", {"kind": "termisai-file", "root": None})
             config["sink"] = dict(config["sink"])
             config["sink"]["root"] = str(root)
-        if authority:
-            declared = dict(config.get("protocol_authority") or {})
-            for key in AUTHORITY_KEYS:
-                declared.setdefault(key, None)
-            for key, value in authority.items():
-                root = Path(value).expanduser()
-                if not root.is_dir():
-                    raise PalError(
-                        "USAGE",
-                        f"protocol authority {key} {value!r} is not an existing directory",
-                    )
-                declared[key] = str(root)
-            config["protocol_authority"] = declared
         save_config(home, config)
-
     if maintainer_root is not None:
         from saipal_engine.state import load_state
 
@@ -558,7 +582,7 @@ def cmd_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
         "sink": sink_root,
         "maintainer_root": maintainer_root,
         "shadow_reviewed": shadow_reviewed,
-        "protocol_authority": authority or None,
+        "protocol_authority": authority_requested or None,
         "next_action": "saipal doctor",
     }
 
@@ -598,11 +622,44 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
 
     # Protocol binding is an observable distribution, not a binary: a drift
     # claim rests on BOUND sessions, so the doctor names how much of the
-    # indexed corpus actually has one.
+    # Indexed corpus binding truth (T-114): ALL indexed records/generations
+    # and the CURRENT (freshest generation per session) population are
+    # different numbers and must be named differently. The historical counts
+    # cover every record; `binding_blockers_report` carries the current-
+    # session breakdown under explicitly named keys.
+    indexed_records_total = len((session_index or {}).get("sessions", [])) if session_index else 0
     binding_counts = {"BOUND": 0, "PARTIAL": 0, "UNKNOWN": 0}
     for record in (session_index or {}).get("sessions") or []:
         status_value = str((record.get("protocol") or {}).get("binding_status") or "UNKNOWN")
         binding_counts[status_value] = binding_counts.get(status_value, 0) + 1
+
+    try:
+        from saipal_engine.blockers import binding_blockers
+
+        binding_blockers_report = binding_blockers(
+            home, registry=registry, index=session_index
+        )
+    except PalError as exc:
+        binding_blockers_report = {"ok": False, "code": exc.code, "message": exc.message}
+
+    # T-121 clause 3 (ROLE 11/32): the conflict triage consistency control is
+    # read-only doctor truth, sharing the supervisor's single derivation so
+    # doctor and watch --status can never disagree about triage staleness.
+    try:
+        from saipal_analyst.supervisor import _corpus_state
+
+        triage_report = {
+            key: _corpus_state(home)[key]
+            for key in (
+                "conflicts_current",
+                "conflicts_triaged",
+                "conflicts_untriaged",
+                "triage_stale",
+                "operator_review_required",
+            )
+        }
+    except Exception as exc:  # noqa: BLE001 - read-only truth must never crash doctor
+        triage_report = {"error": str(exc)}
 
     # Every supported session producer is reported, configured or not: a home
     # that only ever indexed OpenCode must be able to say so (PAL-ARCH-01).
@@ -650,7 +707,23 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
         "protocol_authority": authority,
         "protocol_authority_configured": any(authority.values()),
         "binding_counts": binding_counts,
-        "sessions_indexed": len((session_index or {}).get("sessions", [])) if session_index else 0,
+        "binding_blockers": binding_blockers_report,
+        "conflict_triage": triage_report,
+        "indexed_records_total": indexed_records_total,
+        "current_sessions_total": (
+            binding_blockers_report.get("counts", {}).get("current_sessions_total")
+            if isinstance(binding_blockers_report, dict) and binding_blockers_report.get("ok")
+            else None
+        ),
+        "current_binding_counts": (
+            {
+                "BOUND": binding_blockers_report["counts"].get("bound"),
+                "PARTIAL": binding_blockers_report["counts"].get("partial"),
+                "UNKNOWN": binding_blockers_report["counts"].get("unknown"),
+            }
+            if isinstance(binding_blockers_report, dict) and binding_blockers_report.get("ok")
+            else None
+        ),
         "sink_status": sink_status,
         "sink_detail": sink_detail,
         "index_status": index_status,
@@ -666,6 +739,462 @@ def cmd_doctor(home: Path, registry: dict) -> tuple[int, dict]:
 # --------------------------------------------------------------------------- #
 # disposition -- closed-loop intake
 # --------------------------------------------------------------------------- #
+
+
+def cmd_analyst_setup(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Create or adjust the Layer-B analyst config; never enables by silence."""
+    from saipal_analyst import config as analyst_config
+    # CORE-001: this is a home mutation and runs under the common writer fence
+    # (reentrant with the dispatcher's HomeLock when invoked through the CLI).
+    from saipal_engine.paths import writer_fence
+
+    with writer_fence(home):
+        return _analyst_setup_locked(home, registry, args)
+
+
+def _analyst_setup_locked(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """analyst-setup body, called with the common writer fence held."""
+    from saipal_analyst import config as analyst_config
+
+    force = False
+    enable: bool | None = None
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--force":
+            force = True
+        elif token == "--enable":
+            enable = True
+        elif token == "--disable":
+            enable = False
+        else:
+            raise PalError(
+                "USAGE",
+                "analyst-setup accepts --enable, --disable and --force only",
+            )
+        index += 1
+
+    path = analyst_config.analyst_config_path(home)
+    if path.exists() and not force and enable is None:
+        status, payload, detail = analyst_config.load_analyst_config(home)
+        if status == "unrecoverable":
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"analyst.json is invalid: {detail}",
+                next_action="fix or recreate it with `saipal analyst-setup --force`",
+            )
+        return EXIT_OK, {
+            "analyst_setup": "present",
+            "enabled": bool((payload or {}).get("enabled")),
+            "path": str(path),
+            "note": "no change; pass --enable/--disable or --force to alter it",
+        }
+
+    if path.exists() and force:
+        payload = analyst_config.default_analyst_config()
+    else:
+        status, payload, detail = analyst_config.load_analyst_config(home)
+        if status == "unrecoverable":
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"analyst.json is invalid: {detail}",
+                next_action="fix or recreate it with `saipal analyst-setup --force`",
+            )
+        if payload is None:
+            payload = analyst_config.default_analyst_config()
+    if enable is not None:
+        payload["enabled"] = enable
+    saved = analyst_config.save_analyst_config(home, payload)
+    return EXIT_OK, {
+        "analyst_setup": "written",
+        "enabled": bool(saved.get("enabled")),
+        "path": str(path),
+        "note": (
+            "analyst runtime stays OFF until enabled explicitly; the model "
+            "endpoint must also satisfy the egress policy"
+        ),
+    }
+
+
+def cmd_analyst_doctor(home: Path, registry: dict) -> tuple[int, dict]:
+    """Read-only analyst readiness report: no network, no tokens, no writes."""
+    from saipal_analyst.doctor import doctor_report
+
+    report = doctor_report(home, registry=registry)
+    return (EXIT_OK if report.get("ok") else EXIT_REFUSED), report
+
+
+def cmd_analyst_status(home: Path, registry: dict) -> tuple[int, dict]:
+    """Read-only worker state: journal, budgets, last run, telemetry."""
+    from saipal_analyst import jobs as analyst_jobs
+    from saipal_analyst.config import load_analyst_config as _load_analyst_config
+    from saipal_analyst.doctor import doctor_report
+
+    jobs_detail = ""
+    jobs = None
+    jobs_status = "absent"
+    try:
+        jobs = analyst_jobs.load_journal(home)
+        jobs_status = "ok"
+    except Exception as exc:
+        jobs_status = "unrecoverable"
+        jobs_detail = str(exc)
+
+    report = {
+        "analyst_status": True,
+        "ok": True,
+        "journal_status": jobs_status,
+        "journal_detail": jobs_detail,
+        "jobs_summary": {},
+        "lock_present": analyst_jobs.worker_lock_path(home).is_file(),
+    }
+    if isinstance(jobs, dict):
+        by_stage: dict[str, int] = {}
+        for job in (jobs.get("jobs") or {}).values():
+            by_stage[str(job.get("stage"))] = by_stage.get(str(job.get("stage")), 0) + 1
+        report["jobs_summary"] = by_stage
+        report["jobs_count"] = len(jobs.get("jobs") or {})
+        report["worker"] = _analyst_worker_view(home, jobs)
+    report["doctor"] = doctor_report(home, registry=registry)
+    return EXIT_OK, report
+
+
+def _analyst_worker_view(home: Path, jobs: dict) -> dict:
+    """Read-only worker telemetry: journal stages, provenance coverage, usage.
+
+    Zero network calls, zero writes, no key required -- and a receipt whose
+    provenance link is missing is surfaced as the discrepancy it is.
+    """
+    from saipal_analyst import provenance as provenance_mod
+
+    stage = jobs_mod_job_stage = (jobs.get("jobs") or {})
+    calls = {
+        "transport_attempts": 0,
+        "investigator_repairs": 0,
+        "critic_repairs": 0,
+        "finalizer_repairs": 0,
+        "submit_attempts": 0,
+    }
+    deliberation = {
+        "critic_engaged": 0,
+        "critic_agree": 0,
+        "critic_disagree": 0,
+        "critic_insufficient": 0,
+        "finalizer_invoked": 0,
+    }
+    semantic = {"done": 0, "stale": 0, "blocked": 0, "blocked_binding": 0, "retry_wait": 0}
+    for job in jobs_mod_job_stage.values():
+        for key in calls:
+            calls[key] += int(job.get(key) or 0)
+        critic = job.get("critic_payload")
+        if isinstance(critic, dict):
+            deliberation["critic_engaged"] += 1
+            decision = str(critic.get("decision") or "").lower()
+            if decision in ("agree", "disagree", "insufficient"):
+                deliberation[f"critic_{decision}"] += 1
+        if job.get("finalizer_response_text") or job.get("finalizer_digest"):
+            deliberation["finalizer_invoked"] += 1
+        for key in semantic:
+            if str(job.get("stage")).lower() == key:
+                semantic[key] += 1
+
+    view: dict = {"jobs": dict(semantic), "calls": calls, "deliberation": deliberation}
+    try:
+        ledger = provenance_mod.load_ledger(home)
+        records = ledger.get("records") or {}
+        view["provenance"] = {
+            "receipts_with_provenance": len(records),
+            "missing_links": provenance_mod.missing_links(jobs, ledger),
+        }
+    except Exception as exc:  # noqa: BLE001
+        view["provenance"] = {"error": str(exc)}
+    return view
+
+
+def cmd_rebind(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Deterministic historical rebinding of indexed sessions (T-87)."""
+    from saipal_engine.rebind import rebind
+
+    dry_run = "--dry-run" in args
+    try:
+        result = rebind(home, dry_run=dry_run)
+    except PalError as exc:
+        return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+    if result.get("suspicious_downgrades"):
+        return EXIT_REFUSED, result
+    return EXIT_OK, result
+
+
+def cmd_authority(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Authority bootstrap surface: doctor | discover | enroll (T-86).
+
+    CORE-001 ROLE 18 (revised, ROLE 20260910): doctor/discover are READ-ONLY
+    and take NO fence at all -- a diagnostic must create zero files/dirs,
+    change zero durable bytes, and stay available while a writer holds the
+    fence (a lock acquisition itself materializes locks/, so fencing a pure
+    read was a documented-contract violation). Every mutating subcommand
+    fences at the CANONICAL transaction inside authority.enroll (reentrant),
+    so a direct library caller gets the same serialization as the CLI.
+    """
+    from saipal_engine import authority as authority_mod
+
+    sub = args[0] if args else "doctor"
+    if sub in ("doctor", "discover"):
+        result = authority_mod.doctor(home) if sub == "doctor" else authority_mod.discover(home)
+        return EXIT_OK, result
+    if sub == "enroll":
+        if "--json" in args:
+            args = [a for a in args if a != "--json"]
+        kind: str | None = None
+        path: str | None = None
+        index = 1
+        while index < len(args):
+            token = args[index]
+            if token == "--git-repository" and index + 1 < len(args):
+                kind, path = "git_repository", args[index + 1]
+                index += 1
+            elif token == "--release-root" and index + 1 < len(args):
+                kind, path = "release_root", args[index + 1]
+                index += 1
+            elif token == "--snapshot-root" and index + 1 < len(args):
+                kind, path = "snapshot_root", args[index + 1]
+                index += 1
+            else:
+                raise PalError("USAGE", f"unknown authority enroll option {token!r}")
+            index += 1
+        if not kind or not path:
+            raise PalError(
+                "USAGE",
+                "authority enroll needs one of --git-repository/--release-root/--snapshot-root PATH",
+            )
+        result = authority_mod.enroll(home, kind, path)
+        return EXIT_OK, result
+    raise PalError("USAGE", f"unknown authority subcommand {sub!r}; use doctor|discover|enroll")
+
+
+def cmd_sources(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """First-class source operator surface (T-98/T-112).
+
+    doctor/discover are read-only: NO fence, zero writes, available while a
+    writer is active. enroll/enable/disable/remove route through the ONE
+    canonical source-control write gate (`enroll_source` / `set_source_state`
+    / `remove_source`) -- the same functions the `setup` compat shim uses, so
+    no alias can bypass validation or rewrite an existing source's identity.
+
+    CORE-001 ROLE 18 (revised, ROLE 20260910): the mutating functions take
+    the common writer fence INSIDE the canonical transaction (reentrant), not
+    at CLI dispatch -- a direct library caller cannot bypass the boundary.
+    """
+    from saipal_engine.source_health import enroll_source, health_report, remove_source, set_source_state
+    from saipal_engine.sources import discover
+
+    sub = args[0] if args else "doctor"
+    rest = [a for a in args[1:] if a != "--json"]
+
+    if sub == "doctor":
+        report = health_report(home)
+        return EXIT_OK, report
+    if sub == "discover":
+        candidates = discover(home)
+        return EXIT_OK, {
+            "sources_discover": True,
+            "ok": True,
+            "read_only": True,
+            "candidates": candidates,
+        }
+    if sub == "remove":
+        # T-98: remove is configuration-only. Provider evidence (the session
+        # store the path names, staged bundles, indexed records) is NEVER
+        # deleted by configuration; the operator owns the filesystem.
+        source_id = rest[0] if rest else None
+        if not source_id:
+            raise PalError("USAGE", "sources remove needs a source id")
+        return EXIT_OK, remove_source(home, source_id)
+    if sub == "enroll":
+        kind: str | None = None
+        path: str | None = None
+        enabled = True
+        index = 0
+        while index < len(rest):
+            token = rest[index]
+            if token == "--kind" and index + 1 < len(rest):
+                kind, index = rest[index + 1], index + 2
+            elif token == "--path" and index + 1 < len(rest):
+                path, index = rest[index + 1], index + 2
+            elif token == "--disabled":
+                enabled, index = False, index + 1
+            else:
+                raise PalError("USAGE", f"unknown sources enroll option {token!r}")
+        if not kind or not path:
+            raise PalError("USAGE", "sources enroll needs --kind KIND --path PATH")
+        result = enroll_source(home, kind=kind, path=Path(path).expanduser(), enabled=enabled)
+        return EXIT_OK, result
+    if sub in ("enable", "disable"):
+        source_id = rest[0] if rest else None
+        if not source_id:
+            raise PalError("USAGE", f"sources {sub} needs a source id")
+        return EXIT_OK, set_source_state(home, source_id, enabled=(sub == "enable"))
+    raise PalError(
+        "USAGE",
+        f"unknown sources subcommand {sub!r}; use doctor|discover|enroll|enable|disable|remove",
+    )
+
+
+def cmd_coverage(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Read-only binding blocker planner; never migrates, rebinds or probes."""
+    if args:
+        raise PalError("USAGE", "coverage takes no arguments")
+    from saipal_engine.blockers import binding_blockers
+
+    return EXIT_OK, binding_blockers(home, registry=registry)
+
+
+def cmd_watch(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Foreground unattended supervisor loop (T-91)."""
+    from saipal_analyst.supervisor import watch, watch_status
+
+    if args and args[0] == "--status":
+        return EXIT_OK, watch_status(home)
+    max_cycles = 0
+    max_units: int | None = None
+    max_model_attempts: int | None = None
+    canary = False
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--canary":
+            canary = True
+        elif token == "--max-cycles" and index + 1 < len(args):
+            try:
+                max_cycles = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError("USAGE", f"--max-cycles needs an integer, got {args[index + 1]!r}") from exc
+            if max_cycles <= 0:
+                raise PalError("USAGE", "--max-cycles must be positive")
+            index += 1
+        elif token == "--max-units-per-cycle" and index + 1 < len(args):
+            try:
+                max_units = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError("USAGE", f"--max-units-per-cycle needs an integer") from exc
+            if max_units <= 0:
+                raise PalError("USAGE", "--max-units-per-cycle must be positive")
+            index += 1
+        elif token == "--max-model-attempts" and index + 1 < len(args):
+            try:
+                max_model_attempts = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError("USAGE", "--max-model-attempts needs an integer") from exc
+            if max_model_attempts <= 0:
+                raise PalError("USAGE", "--max-model-attempts must be positive")
+            index += 1
+        else:
+            raise PalError("USAGE", f"unknown watch option {token!r}")
+        index += 1
+
+    # T-108 (ROLE 30/31): the canary is a bounded, hard-fenced shadow probe.
+    # Its bounds are not optional -- a canary without an explicit cycle/units
+    # budget is exactly the unbounded implicit drain ROLE 31 forbids.
+    if canary:
+        if max_cycles <= 0:
+            raise PalError(
+                "USAGE", "canary requires --max-cycles (bounded run, no implicit drain)"
+            )
+        if max_units is None or max_units <= 0:
+            raise PalError(
+                "USAGE", "canary requires --max-units-per-cycle (bounded semantic work)"
+            )
+        if max_model_attempts is None or max_model_attempts <= 0:
+            raise PalError(
+                "USAGE", "canary requires --max-model-attempts (bounded model spend)"
+            )
+
+    from saipal_engine.errors import PalError as _Pal
+
+    if canary:
+        from saipal_analyst.supervisor import run_canary
+
+        try:
+            result = run_canary(
+                home,
+                max_cycles=max_cycles,
+                max_units_per_cycle=max_units,
+                max_model_attempts=max_model_attempts,
+            )
+        except _Pal as exc:
+            return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+        return EXIT_OK, result
+
+    try:
+        result = watch(home, max_cycles=max_cycles, max_units_per_cycle=max_units)
+    except _Pal as exc:
+        return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+    return EXIT_OK, result
+
+
+def cmd_investigate(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Autonomous semantic loop: bounded, lock-protected, BIND-gated."""
+
+    max_units: int | None = None
+    drain = False
+    allow_provisional = False
+    calibrate = False
+    seed = "calibration"
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--drain":
+            drain = True
+        elif token == "--max-units" and index + 1 < len(args):
+            try:
+                max_units = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError("USAGE", f"--max-units needs an integer, got {args[index + 1]!r}") from exc
+            if max_units <= 0:
+                raise PalError("USAGE", "--max-units must be positive")
+            index += 1
+        elif token == "--with-provisional":
+            allow_provisional = True
+        elif token == "--calibrate":
+            calibrate = True
+        elif token == "--seed" and index + 1 < len(args):
+            seed = args[index + 1]
+            index += 1
+        else:
+            raise PalError("USAGE", f"unknown investigate option {token!r}")
+        index += 1
+
+    if calibrate:
+        from saipal_analyst.calibration import run_calibration
+
+        try:
+            result = run_calibration(home, sample_units=max_units, seed=seed)
+        except PalError as exc:
+            return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+        if not result.get("ok"):
+            # CONFIGURATION_BLOCKED is a refusal with a machine-readable body.
+            return emit_refusal(
+                PalError(
+                    result.get("code", "CONFIGURATION_BLOCKED"),
+                    result.get("reason", "calibration prerequisites not met"),
+                ),
+                as_json=False,
+                exit_code=EXIT_REFUSED,
+            )  # type: ignore[return-value]
+        return EXIT_OK, result
+
+    from saipal_analyst.worker import investigate
+    from saipal_engine.errors import PalError as _Pal
+
+    try:
+        summary = investigate(
+            home, max_units=max_units, drain=drain, provisional=allow_provisional
+        )
+    except _Pal as exc:
+        return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+    is_busy = summary.get("stop_reason") == "BUSY"
+    is_idle = summary.get("stop_reason") in ("IDLE", "BUDGET_EXHAUSTED", "CONFIG_DISABLED", "BLOCKED")
+    return (EXIT_OK if is_idle or is_busy else EXIT_OK), summary
 
 
 def cmd_submit(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
@@ -1087,7 +1616,80 @@ def cmd_next(home: Path, registry: dict) -> tuple[int, dict]:
 # --------------------------------------------------------------------------- #
 
 
+def _render_watch_status_human(result: dict) -> str:
+    def _safe(v, default="-"):
+        return v if v is not None else default
+
+    def _section(title, mapping):
+        lines = [f"== {title} =="]
+        if isinstance(mapping, dict):
+            if mapping.get("error"):
+                lines.append(f"  error: {mapping['error']}")
+            else:
+                for k, v in mapping.items():
+                    if k == "error":
+                        continue
+                    if isinstance(v, (dict, list)):
+                        lines.append(f"  {k}: {json.dumps(v, ensure_ascii=False)[:400]}")
+                    else:
+                        lines.append(f"  {k}: {_safe(v)}")
+        else:
+            lines.append(f"  {mapping}")
+        return lines
+
+    lines: list[str] = []
+    lines.append(f"watch_status: {result.get('watch_status')} ok={result.get('ok')}")
+    sup = result.get("supervisor") or {}
+    lines.extend(_section("PROCESS", {
+        "cycles": sup.get("cycles"),
+        "successful_cycles": sup.get("successful_cycles"),
+        "failed_cycles": sup.get("failed_cycles"),
+        "last_stop_reason": sup.get("last_stop_reason"),
+        "next_wake_at": sup.get("next_wake_at"),
+        "stall_class": sup.get("stall_class"),
+    }))
+    lines.extend(_section("PROGRESS", result.get("progress") or {}))
+    lines.extend(_section("SOURCES", result.get("sources") or {}))
+    lines.extend(_section("AUTHORITY", result.get("authority") or {}))
+    lines.extend(_section("CORPUS", result.get("corpus") or {}))
+    lines.extend(_section("SEMANTIC", result.get("semantic") or {}))
+    lines.extend(_section("BACKEND", result.get("backend") or {}))
+    lines.extend(_section("BUDGET", result.get("budget_window") or {}))
+    lines.extend(_section("AUDITS", result.get("audits") or {}))
+    lines.extend(_section("SHADOW SAFETY", result.get("shadow_safety") or {}))
+    if result.get("publication_gate"):
+        lines.extend(_section("PUBLICATION GATE", result.get("publication_gate") or {}))
+    if result.get("circuits"):
+        lines.extend(_section("CIRCUITS", result.get("circuits") or {}))
+    return "\n".join(lines)
+
+
 def render_human(result: dict) -> str:
+    if result.get("watch_status"):
+        return _render_watch_status_human(result)
+    if "analyst_setup" in result:
+        return "\n".join(
+            [
+                f"analyst-setup: {result['analyst_setup']}",
+                f"enabled: {result['enabled']}",
+                f"config: {result['path']}",
+                f"note: {result['note']}",
+            ]
+        )
+    if "config_present" in result and result.get("analyst_doctor"):
+        problems = result.get("config_problems") or []
+        lines = [
+            f"analyst enabled: {result.get('enabled')}",
+            f"backend: {result.get('backend_type')} model {result.get('model')!r}",
+            f"endpoint: {result.get('endpoint')} (local={result.get('endpoint_local')})",
+            f"api_key_env: {result.get('api_key_env')} present={result.get('api_key_env_present')}",
+            f"journal: {'present' if result.get('journal_present') else 'absent'}",
+            f"worker lock: {'held' if result.get('worker_active') else 'free'}",
+            f"semantic: {result.get('semantic')}",
+        ]
+        lines += [f"problem: {problem}" for problem in problems]
+        lines.append("ok" if result.get("ok") else "NOT OK")
+        return "\n".join(lines)
     if result.get("command") == "status":
         keys = (
             "phase",
@@ -1250,6 +1852,14 @@ def render_human(result: dict) -> str:
         return "\n".join(lines)
 
     if result.get("command") == "doctor":
+        # T-120: the human doctor surface survives the T-114 truth model, it
+        # does not merely rename one key. Historical generations and the
+        # current (freshest) session population are named separately, and the
+        # current binding distribution is spelled out -- never a single
+        # ambiguous `sessions: N` field again.
+        indexed_total = result.get("indexed_records_total")
+        current_total = result.get("current_sessions_total")
+        current_bindings = result.get("current_binding_counts")
         lines = [
             f"home: {result['home']}",
             f"home_exists: {result['home_exists']}",
@@ -1258,7 +1868,12 @@ def render_human(result: dict) -> str:
             f"publication_mode: {result['publication_mode']}",
             f"sink: {result['sink_status']}",
             f"index: {result['index_status']}",
-            f"sessions: {result['sessions_indexed']}",
+            f"indexed_records: {indexed_total if indexed_total is not None else '-'}",
+            (
+                f"current_sessions: {current_total}"
+                if current_total is not None
+                else "current_sessions: unavailable"
+            ),
             f"staged_audits: {result['staged_audits']}",
             f"adapter: {'available' if result['adapter_available'] else 'missing'}",
             "protocol_authority: "
@@ -1271,6 +1886,24 @@ def render_human(result: dict) -> str:
                 or "none configured"
             ),
         ]
+        if isinstance(current_bindings, dict):
+            lines.append(
+                "current binding: "
+                + " ".join(
+                    f"{key}={current_bindings.get(key)}"
+                    for key in ("BOUND", "PARTIAL", "UNKNOWN")
+                )
+            )
+        blockers = (result.get("binding_blockers") or {}).get("blockers") or []
+        for row in blockers[:5]:
+            lines.append(f"binding_blocker: {row.get('reason')} x{row.get('count')}")
+        triage = result.get("conflict_triage") or {}
+        if isinstance(triage, dict) and "conflicts_current" in triage:
+            lines.append(
+                "conflicts: current={conflicts_current} triaged={conflicts_triaged} "
+                "untriaged={conflicts_untriaged} stale={triage_stale} "
+                "operator_review={operator_review_required}".format(**triage)
+            )
         if result.get("sink_detail"):
             lines.append(f"sink_detail: {result['sink_detail']}")
         if result.get("config_detail"):
@@ -1337,32 +1970,34 @@ def render_human(result: dict) -> str:
             )
         return "\n".join(lines)
 
-    intake = result["intake"]
-    lines = [
-        f"phase: {result['phase']}",
-        f"sources: {len(result['discovered_sources'])}",
-        f"dispatched: {len(result.get('dispatch', {}).get('imported', []))}",
-        f"imported: {intake['new_sessions']}",
-        f"skipped: {len(intake['skipped'])}",
-        f"rejected: {len(intake['rejected'])}",
-        f"conflicts: {len(intake['conflicts'])}",
-        f"sessions_total: {intake['sessions_total']}",
-        f"candidates: {result['candidates']}",
-        f"audits_emitted: {result['audits_emitted']}",
-    ]
-    for source in result["discovered_sources"]:
-        lines.append(f"  source {source['id']} [{source['kind']}] {source['status']}")
-    for entry in intake["imported"]:
-        lines.append(
-            f"  session {entry['session_id']} gen {entry['generation']} "
-            f"[{entry.get('outcome', 'imported')}] {entry.get('events', 0)} events"
-        )
-    for entry in intake["rejected"]:
-        lines.append(f"  rejected {entry['source_ref']} [{entry['code']}]")
-    for entry in intake["conflicts"]:
-        lines.append(f"  conflict {entry['session_id']}: {entry['reason']}")
-    lines.append(f"next_action: {result['next_action']}")
-    return "\n".join(lines)
+    if "intake" in result and result.get("phase") is not None:
+        intake = result["intake"]
+        lines = [
+            f"phase: {result['phase']}",
+            f"sources: {len(result['discovered_sources'])}",
+            f"dispatched: {len(result.get('dispatch', {}).get('imported', []))}",
+            f"imported: {intake['new_sessions']}",
+            f"skipped: {len(intake['skipped'])}",
+            f"rejected: {len(intake['rejected'])}",
+            f"conflicts: {len(intake['conflicts'])}",
+            f"sessions_total: {intake['sessions_total']}",
+            f"candidates: {result['candidates']}",
+            f"audits_emitted: {result['audits_emitted']}",
+        ]
+        for source in result["discovered_sources"]:
+            lines.append(f"  source {source['id']} [{source['kind']}] {source['status']}")
+        for entry in intake["imported"]:
+            lines.append(
+                f"  session {entry['session_id']} gen {entry['generation']} "
+                f"[{entry.get('outcome', 'imported')}] {entry.get('events', 0)} events"
+            )
+        for entry in intake["rejected"]:
+            lines.append(f"  rejected {entry['source_ref']} [{entry['code']}]")
+        for entry in intake["conflicts"]:
+            lines.append(f"  conflict {entry['session_id']}: {entry['reason']}")
+        lines.append(f"next_action: {result['next_action']}")
+        return "\n".join(lines)
+    return json.dumps(result, indent=2, sort_keys=True, ensure_ascii=False)
 
 
 def emit(result: dict, *, as_json: bool) -> int:
@@ -1527,12 +2162,24 @@ def _resolve_home(options: Options, command: str) -> Path:
     home, _reason = resolve_home(explicit=options.home)
     if home is not None:
         return Path(home)
-    if command in READ_ONLY_COMMANDS or command in READ_ONLY_WITH_ARGS:
-        raise PalError(
-            "NO_HOME",
-            f"no {HOME_DIRNAME}/ found; read-only commands never create one",
-            next_action="saipal continue",
-        )
+        if command in READ_ONLY_COMMANDS or command in READ_ONLY_WITH_ARGS:
+            raise PalError(
+                "NO_HOME",
+                f"no {HOME_DIRNAME}/ found; read-only commands never create one",
+                next_action="saipal continue",
+            )
+        return resolve_tool_root() / HOME_DIRNAME
+    if command in ("analyst-status", "analyst-doctor", "investigate", "watch", "authority", "sources"):
+        # Analyst commands resolve the same way as kernel read-only: never
+        # create a home merely by asking about it. `investigate` is a write
+        # command, but it must still prove its home exists first.
+        if home is None:
+            raise PalError(
+                "NO_HOME",
+                f"no {HOME_DIRNAME}/ found; read-only commands never create one",
+                next_action="saipal continue",
+            )
+        return Path(home)
     return resolve_tool_root() / HOME_DIRNAME
 
 
@@ -1594,8 +2241,12 @@ def main(argv: list[str] | None = None) -> int:
         return emit_refusal(exc, as_json=options.as_json, exit_code=EXIT_NO_HOME)
 
     try:
+        # CORE-001: every CLI mutation goes through the one reentrant writer
+        # fence (the raw HomeLock could not nest with the fence that
+        # submit_candidate takes, and mutating surfaces outside it raced the
+        # analyst's commit path).
         if command == "continue":
-            with HomeLock(home):
+            with writer_fence(home):
                 exit_code, result = cmd_continue(home, registry, args)
         elif command == "status":
             exit_code, result = cmd_status(home, registry)
@@ -1604,13 +2255,13 @@ def main(argv: list[str] | None = None) -> int:
         elif command == "report":
             exit_code, result = cmd_report(home, registry)
         elif command == "setup":
-            with HomeLock(home):
+            with writer_fence(home):
                 exit_code, result = cmd_setup(home, registry, args)
         elif command == "submit":
-            with HomeLock(home):
+            with writer_fence(home):
                 exit_code, result = cmd_submit(home, registry, args)
         elif command == "disposition":
-            with HomeLock(home):
+            with writer_fence(home):
                 exit_code, result = cmd_disposition(home, registry, args)
         elif command == "trigger":
             exit_code, result = cmd_trigger(home, registry)
@@ -1618,6 +2269,35 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, result = cmd_sessions(home, registry, args)
         elif command == "evidence":
             exit_code, result = cmd_evidence(home, registry, args)
+        elif command == "analyst-setup":
+            exit_code, result = cmd_analyst_setup(home, registry, args)
+        elif command == "analyst-doctor":
+            exit_code, result = cmd_analyst_doctor(home, registry)
+        elif command == "analyst-status":
+            exit_code, result = cmd_analyst_status(home, registry)
+        elif command == "investigate":
+            exit_code, result = cmd_investigate(home, registry, args)
+        elif command == "rebind":
+            # CORE-001: rebind fences itself inside the canonical rebind()
+            # transaction (ROLE 17); no dispatcher lock here.
+            exit_code, result = cmd_rebind(home, registry, args)
+        elif command == "coverage":
+            exit_code, result = cmd_coverage(home, registry, args)
+        elif command == "authority":
+            # ROLE 18 (revised, ROLE 20260910): enrollment mutates the trusted
+            # control plane (config + pinning), but the fence belongs in the
+            # canonical transaction (authority.enroll), not here: doctor and
+            # discover are read-only and must take no fence and create zero
+            # files -- even a lock node -- while a writer is active.
+            exit_code, result = cmd_authority(home, registry, args)
+        elif command == "sources":
+            # ROLE 18 (revised): source registry mutations fence inside the
+            # canonical write gate (enroll_source/set_source_state/
+            # remove_source). Discovery and health never fence and never
+            # materialize a lock.
+            exit_code, result = cmd_sources(home, registry, args)
+        elif command == "watch":
+            exit_code, result = cmd_watch(home, registry, args)
         else:
             exit_code, result = cmd_next(home, registry)
     except PalError as exc:

@@ -77,7 +77,9 @@ class RegistryFacts(unittest.TestCase):
         commands = set(available_commands(self.registry))
         self.assertEqual(
             {"continue", "status", "next", "report", "evidence", "setup", "doctor",
-             "submit", "disposition", "trigger", "sessions"},
+             "submit", "disposition", "trigger", "sessions",
+             "analyst-setup", "analyst-doctor", "analyst-status", "investigate", "watch",
+             "authority", "sources", "rebind", "coverage"},
             commands,
         )
         for alias, expansion in load_shortcut_table().items():

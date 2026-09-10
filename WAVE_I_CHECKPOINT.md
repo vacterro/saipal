@@ -3,12 +3,35 @@
 All nine waves of the SAIPAL founding roadmap are implemented, green from a
 clean checkout, and the live pipeline emits real immutable audits end-to-end.
 
+## Current verification truth (T-120 contract)
+
+This section is the SINGLE source of verification truth for the repository.
+Every other document (README, handoff, audits) must either reference this
+checkpoint or carry the SAME counts WITH the same checkpoint identity below.
+Hand-maintained independent counters are forbidden: when the suite grows,
+this is the one record to re-derive.
+
+```yaml
+checkpoint_id: T-120-VERIFY-2026-09-09
+commit: ade6f1e (plus the in-flight T-120/T-108 worktree state)
+method: |
+  python -B -m unittest discover -s tools -p "test_*.py"   # from the checkout root
+  python -B tools/validate.py
+unittest_cases: 1400
+validator_checks: 300
+result: ALL PASS
+```
+
+Re-derive after every material change and update ONLY this block plus any
+README line that carries the checkpoint id. A count without the
+`checkpoint_id` it came from is not a fact, it is a decoration.
+
 ## How to verify
 
 ```bash
 python -B tools/test_runner.py                 # full canonical suite (sandboxed)
-python -B tools/test_runner.py --family unit   # 210 unittest cases
-python -B tools/validate.py                    # 146 protocol/registry checks
+python -B -m unittest discover -s tools -p "test_*.py"   # canonical discovery
+python -B tools/validate.py                    # protocol/registry checks
 python -B tools/saipal.py continue             # one bounded cycle; `--json` for machines
 python -B tools/saipal.py status
 python -B tools/saipal.py next
@@ -35,8 +58,9 @@ No pip dependencies. Standard library only. Python 3.8+.
 | H | recurrence / regression intelligence, cross-model/project, telemetry | GREEN |
 | I | hardening, budgets, safety valves, session leases, telemetry persistence | GREEN |
 
-Test counts as of this checkpoint: **225 unittest cases** (discover -s tools -p
-test_*.py), **150 validator checks**, all PASS. Live audit emission verified by
+Test counts as of the founding checkpoint (HISTORICAL — superseded by the
+Current verification truth block above): **225 unittest cases** (discover -s
+tools -p test_*.py), **150 validator checks**, all PASS. Live audit emission verified by
 feeding a session with `PHASE_CHANGE PLAN -> NOPE` into the inbox and running
 `saipal cc`: SAIPAL emits `audit/staging/1.md` with `finding_id=PAL-0001`,
 `drift_class=PHASE_ILLEGALITY`, `severity=P3`, `confidence=HIGH`,
@@ -144,5 +168,6 @@ real `continue` path; the termisai JSONL evidence contract and sanitized fixture
 live in `docs/TERMISAI_EVIDENCE_CONTRACT.md`. External publication stays
 disabled by default and writes through the validated file sink only.
 
-As of this checkpoint: **241 unittest cases** (incl. `test_wave_next1.py`),
+As of that checkpoint (HISTORICAL — superseded by the Current verification
+truth block above): **241 unittest cases** (incl. `test_wave_next1.py`),
 **157 validator checks**, all PASS from a clean sandbox.
