@@ -1,0 +1,143 @@
+{
+  "adapter": "generic",
+  "schema_version": 1,
+  "session_id": "golden-cold-002",
+  "raw_source_ref": "~/.codex/sessions/golden-other.jsonl",
+  "raw_source_sha256": "raw-0002",
+  "temperature": "COLD",
+  "project": {
+    "git_head": "abc1234",
+    "name": "TERMISAI",
+    "root_fingerprint": "fp-termisai"
+  },
+  "protocol": {
+    "binding_status": "BOUND",
+    "confidence": "HIGH",
+    "git_head": "deadbeef",
+    "registry_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "source": "exact-commit",
+    "tree_fingerprint": "tree-001",
+    "version": "7.231.9"
+  },
+  "runtime": {
+    "model": "gpt-x",
+    "provider": "openai",
+    "reasoning_mode": "unknown"
+  },
+  "started_at": "2026-08-30T12:00:00Z",
+  "ended_at": "2026-08-30T12:14:00Z",
+  "events": [
+    {
+      "seq": 1,
+      "ts": "2026-08-30T12:01:00Z",
+      "type": "USER_MESSAGE",
+      "loc": "msg:1",
+      "digest": "e001",
+      "facts": {"chars": 51}
+    },
+    {
+      "seq": 2,
+      "ts": "2026-08-30T12:02:00Z",
+      "type": "COMMAND",
+      "loc": "msg:2",
+      "digest": "e002",
+      "facts": {"canonical": "saipal continue", "raw": "cc"}
+    },
+    {
+      "seq": 3,
+      "ts": "2026-08-30T12:03:00Z",
+      "type": "TOOL_CALL",
+      "loc": "msg:3",
+      "digest": "e003",
+      "facts": {"tool": "read", "target": "STATE.md"}
+    },
+    {
+      "seq": 4,
+      "ts": "2026-08-30T12:04:00Z",
+      "type": "TOOL_RESULT",
+      "loc": "msg:4",
+      "digest": "e004",
+      "facts": {"ok": true, "bytes": 128}
+    },
+    {
+      "seq": 5,
+      "ts": "2026-08-30T12:05:00Z",
+      "type": "PHASE_CHANGE",
+      "loc": "msg:5",
+      "digest": "e005",
+      "facts": {"from_phase": "PLAN", "to_phase": "BUILD"}
+    },
+    {
+      "seq": 6,
+      "ts": "2026-08-30T12:06:00Z",
+      "type": "STATE_SNAPSHOT",
+      "loc": "msg:6",
+      "digest": "e006",
+      "facts": {"active_work": "T-101"}
+    },
+    {
+      "seq": 7,
+      "ts": "2026-08-30T12:07:00Z",
+      "type": "STATE_SNAPSHOT",
+      "loc": "msg:7",
+      "digest": "e007",
+      "facts": {"active_work": "T-102"}
+    },
+    {
+      "seq": 8,
+      "ts": "2026-08-30T12:08:00Z",
+      "type": "SOURCE_EVENT",
+      "loc": "msg:8",
+      "digest": "e008",
+      "facts": {"receipt_id": "SRC-055"}
+    },
+    {
+      "seq": 9,
+      "ts": "2026-08-30T12:09:00Z",
+      "type": "ERROR",
+      "loc": "msg:9",
+      "digest": "e009",
+      "facts": {"kind": "recovery", "message": "resumed journal op-9"}
+    },
+    {
+      "seq": 10,
+      "ts": "2026-08-30T12:10:00Z",
+      "type": "TOOL_CALL",
+      "loc": "msg:10",
+      "digest": "e010",
+      "facts": {"tool": "write", "target": "LOG.md"}
+    },
+    {
+      "seq": 11,
+      "ts": "2026-08-30T12:11:00Z",
+      "type": "TOOL_RESULT",
+      "loc": "msg:11",
+      "digest": "e011",
+      "facts": {"ok": true, "bytes": 256}
+    },
+    {
+      "seq": 12,
+      "ts": "2026-08-30T12:12:00Z",
+      "type": "ASSISTANT_MESSAGE",
+      "loc": "msg:12",
+      "digest": "e012",
+      "facts": {"chars": 88}
+    },
+    {
+      "seq": 13,
+      "ts": "2026-08-30T12:13:00Z",
+      "type": "COMMAND",
+      "loc": "msg:13",
+      "digest": "e013",
+      "facts": {"canonical": "saipal next", "raw": "next"}
+    },
+    {
+      "seq": 14,
+      "ts": "2026-08-30T12:14:00Z",
+      "type": "ASSISTANT_MESSAGE",
+      "loc": "msg:14",
+      "digest": "e014",
+      "facts": {"chars": 44}
+    }
+  ]
+}
