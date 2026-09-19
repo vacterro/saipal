@@ -39,6 +39,9 @@ The executable surface is exactly these commands plus the alias below.
 | `saipal authority doctor\|discover` | — | never | read-only protocol authority health and candidates; discovery never trusts |
 | `saipal authority enroll (--git-repository\|--release-root\|--snapshot-root) PATH` | — | yes | the ONE explicit trust action: persists the root plus pinning metadata (substitution detected, HEAD free to advance) |
 | `saipal rebind [--dry-run]` | — | yes | deterministic historical rebinding: recomputes binding proof from enrolled authority, writes only strengthening transitions, reports newly eligible units; downgrade attempts recorded never applied |
+| `saipal sources doctor\|discover` | — | never | read-only source health report and discovery candidates; discovery never trusts |
+| `saipal sources enroll\|enable\|disable\|remove` | — | yes | the canonical source-control write gate: enrollment and state changes are config-only; provider evidence is never deleted |
+| `saipal coverage` | — | never | read-only binding blocker planner: what still blocks historical rebind eligibility |
 
 Bare `saipal` means `saipal continue`, and `/saipal cc` is the same command where
 slash routing exists. Aliases live in `REGISTRY.json` under `shortcuts`, never in
