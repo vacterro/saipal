@@ -1,13 +1,21 @@
+<div align="center">
+
 # SAIPAL
 
-A forensic protocol observer for SAIPEN-governed agent sessions.
+**Forensic observer for SAIPEN-governed agent sessions.**
 
-SAIPAL reads real session evidence, compares observed behavior against the SAIPEN
-protocol version that actually governed it, isolates root causes, and hands
-qualified findings to the SAIPEN Core maintainer as immutable audits.
+[![Version](https://img.shields.io/badge/version-0.4.1-D4B86A?style=flat-square)](VERSION)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/runtime-stdlib%20only-4A7A20?style=flat-square)
+![Role](https://img.shields.io/badge/role-observer%2C%20not%20maintainer-6B5A2B?style=flat-square)
 
-SAIPAL is **not** a second maintainer. It observes and reports. The maintainer
-decides.
+[Architecture](saipal/ARCHITECTURE.md) · [Commands](saipal/COMMANDS.md) · [Analysis contract](saipal/ANALYSIS.md) · [Run](#run-it)
+
+</div>
+
+SAIPAL reads session evidence, binds it to the protocol version that actually governed the work, and turns qualified root causes into immutable audits for the SAIPEN maintainer.
+
+**It observes and reports. It does not become a second maintainer.**
 
 ## How it is built
 
