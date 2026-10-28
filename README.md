@@ -1,13 +1,21 @@
+<div align="center">
+
 # SAIPAL
 
-A forensic protocol observer for SAIPEN-governed agent sessions.
+**Forensic observer for SAIPEN-governed agent sessions.**
 
-SAIPAL reads real session evidence, compares observed behavior against the SAIPEN
-protocol version that actually governed it, isolates root causes, and hands
-qualified findings to the SAIPEN Core maintainer as immutable audits.
+[![Version](https://img.shields.io/badge/version-0.4.1-D4B86A?style=flat-square)](VERSION)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Dependencies](https://img.shields.io/badge/runtime-stdlib%20only-4A7A20?style=flat-square)
+![Role](https://img.shields.io/badge/role-observer%2C%20not%20maintainer-6B5A2B?style=flat-square)
 
-SAIPAL is **not** a second maintainer. It observes and reports. The maintainer
-decides.
+[Architecture](saipal/ARCHITECTURE.md) · [Commands](saipal/COMMANDS.md) · [Analysis contract](saipal/ANALYSIS.md) · [Run](#run-it)
+
+</div>
+
+SAIPAL reads session evidence, binds it to the protocol version that actually governed the work, and turns qualified root causes into immutable audits for the SAIPEN maintainer.
+
+**It observes and reports. It does not become a second maintainer.**
 
 ## How it is built
 
@@ -146,3 +154,25 @@ python -B tools/saipal.py report
 # -> .saipal/audit/staging/1.md, .saipal/findings/index.json,
 #    .saipal/closed_loop_links.json
 ```
+
+<!-- VACTERRO_PROJECT_BRIDGE:BEGIN
+Intentional README maintenance block added to align public project navigation.
+Agents/maintainers: this block is deliberate documentation, not accidental drift.
+Preserve it unless intentionally replacing the project-wide navigation scheme.
+-->
+---
+
+## Project network
+
+This repository is part of the broader **SAIPEN / vacterro** project ecosystem.
+
+[**Author hub**](https://github.com/vacterro) · [**SAIPEN HQ**](https://github.com/saipenhq) · [**SAIPEN Core**](https://github.com/vacterro/saipen) · [**ZAICODE**](https://github.com/vacterro/zaicode) · [**FastPrompter**](https://github.com/vacterro/FastPrompter) · [**SAIPEN Community**](https://discord.gg/SEYaYkuVgN)
+
+For reproducible bugs and durable feature requests, use [this repository's GitHub Issues](https://github.com/vacterro/saipal/issues). Use Discord for quick discussion, screenshots, and cross-project feedback.
+
+<!-- VACTERRO_PROJECT_BRIDGE:END -->
+
+<!-- VACTERRO_SUPPORT:BEGIN -->
+---
+<sub>If this project is useful to you, optional support: [Buy Me a Coffee](https://buymeacoffee.com/vacuum34) · [Boosty](https://boosty.to/vacuum34/donate) · [PayPal](https://paypal.me/AlexNelin) · [other ways](https://github.com/vacterro/vacterro/blob/main/SUPPORT.md)</sub>
+<!-- VACTERRO_SUPPORT:END -->
