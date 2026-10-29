@@ -10,6 +10,7 @@ turning a source outage into semantic evidence.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,11 +74,20 @@ class Enrollment(unittest.TestCase):
         no-op that preserves id and enabled state; it never mints a second
         source or refuses an operator re-running the same command."""
         first = sh_mod.enroll_source(self.home, kind="claude", path=self.store, source_id="a")
-        variant = Path(str(self.store).upper()) if str(self.store).islower() else self.store
-        again = sh_mod.enroll_source(self.home, kind="claude", path=variant, source_id="b")
-        self.assertTrue(again["ok"])
-        self.assertEqual(again["id"], "a", "re-enrollment must keep the existing id")
-        self.assertTrue(again.get("unchanged"))
+        # Dot segments name the same existing store on either platform.
+        # Case aliases additionally apply on the supported Windows filesystem;
+        # uppercasing /tmp on POSIX names a different, absent directory.
+        variants = [self.store / ".." / self.store.name]
+        if os.name == "nt":
+            variants.append(Path(str(self.store).swapcase()))
+        for variant in variants:
+            with self.subTest(path=variant):
+                self.assertNotEqual(str(variant), str(self.store))
+                self.assertTrue(variant.samefile(self.store))
+                again = sh_mod.enroll_source(self.home, kind="claude", path=variant, source_id="b")
+                self.assertTrue(again["ok"])
+                self.assertEqual(again["id"], "a", "re-enrollment must keep the existing id")
+                self.assertTrue(again.get("unchanged"))
         _status, payload, _d = load_sources(self.home)
         self.assertEqual(len(payload["sources"]), 1)
         self.assertEqual(payload["sources"][0]["id"], "a")
