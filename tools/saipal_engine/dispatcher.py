@@ -7,7 +7,7 @@ from typing import Any
 from . import bundle as bundle_mod
 from .adapters import ADAPTER_REGISTRY, watermark_capability
 from .errors import PalError
-from .paths import atomic_write_bytes, home_paths, sha256_text
+from .paths import atomic_write_bytes, confined_mkdir, home_paths, sha256_text
 from .sessions import STATUS_ABSENT, STATUS_OK, binding_proof_of, find_session, load_index
 
 
@@ -21,6 +21,11 @@ def dispatch_sources(
     authority: dict | None = None,
 ) -> dict[str, Any]:
     paths = home_paths(home)
+    # TARGET B2 (T-125): the staging directory is materialized EXPLICITLY by
+    # its owner (this dispatcher). `atomic_write_bytes` writes only into an
+    # already-authorized existing parent and never recreates missing parents;
+    # an indirection refuses with zero external mutation.
+    confined_mkdir(paths.root, paths.session_inbox.name)
     if index is None:
         # T-103: conflict surfacing (ROLE 12) needs the accepted session
         # state. Callers that already hold the index pass it in; every other

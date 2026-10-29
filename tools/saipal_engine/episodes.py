@@ -8,6 +8,7 @@ never guessed per session.
 
 from __future__ import annotations
 
+import bisect
 from typing import Any
 
 from .registry import load_registry, require_string_list
@@ -125,6 +126,13 @@ def extract_episodes(events: list[dict], *, registry: dict | None = None) -> lis
         return dict(ref) if isinstance(ref, dict) else None
 
     def episode(start_seq: int, end_seq: int, kind: str, trigger_seq: int | None) -> dict:
+        # PERF-003 (SRC-011): count the events in the span with a bisect over
+        # the already-sorted sequence list instead of rescanning every sequence
+        # per episode (the previous `sum(1 for seq in sequences ...)` was
+        # quadratic in events x episodes). Sequence ids need not be contiguous,
+        # so this counts exactly the ids within [start_seq, end_seq].
+        low = bisect.bisect_left(sequences, start_seq)
+        high = bisect.bisect_right(sequences, end_seq)
         return {
             "index": len(episodes),
             "start_seq": start_seq,
@@ -135,9 +143,7 @@ def extract_episodes(events: list[dict], *, registry: dict | None = None) -> lis
             # reader that must know how many carrier slices an episode needs --
             # coverage, the unit digest -- would otherwise have to reload the
             # bundle to count them.
-            "event_count": sum(
-                1 for seq in sequences if start_seq <= seq <= end_seq
-            ),
+            "event_count": high - low,
             "start_evidence_ref": locator_at(start_seq),
             "end_evidence_ref": locator_at(end_seq),
         }

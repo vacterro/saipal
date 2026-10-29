@@ -171,6 +171,8 @@ class Prompts(unittest.TestCase):
         self.assertIn(prompts_mod.DELIMITER_BEGIN, message)
         self.assertIn(prompts_mod.DELIMITER_END, message)
         self.assertIn("UNTRUSTED EVIDENCE", message)
+        self.assertIn("EXACT IDENTITY VALUES", message)
+        self.assertIn('"unit_digest": "' + "d" * 64 + '"', message)
 
     def test_repair_message_preserves_packet_and_demands_identity(self) -> None:
         packet = {"unit_digest": "d" * 64, "session": {"session_id": "s"}}

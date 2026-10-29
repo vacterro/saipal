@@ -25,23 +25,27 @@ from unittest import mock
 import pal_test_support as support
 from saipal_engine import enqueue as enqueue_mod
 from saipal_engine import hardening as hard
+from saipal_engine.errors import PalError
 from saipal_engine.paths import (
     LOCK_CREATE_GRACE_SECONDS,
+    LOCK_MAX_TTL_SECONDS,
+    LOCK_TTL_SECONDS,
     FencedLockFile,
     HomeLock,
 )
 
 
-def live_payload(owner: str) -> str:
+def live_payload(owner: str, ttl=None) -> str:
     """A lock payload that is unambiguously alive on this host."""
-    return json.dumps(
-        {
-            "pid": os.getpid(),
-            "host": socket.gethostname(),
-            "created_at": time.time(),
-            "owner": owner,
-        }
-    )
+    payload = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "created_at": time.time(),
+        "owner": owner,
+    }
+    if ttl is not None:
+        payload["ttl"] = ttl
+    return json.dumps(payload)
 
 
 class LockCase(unittest.TestCase):
@@ -228,6 +232,65 @@ class LeaseOwnership(LockCase):
         finally:
             first.release()
 
+    def test_refresh_retries_past_a_transient_sharing_violation(self) -> None:
+        """Red control: filesystem noise is not ownership loss.
+
+        The heartbeat sidecar rename can hit the same transient Windows
+        sharing window `_unlink_lock` retries past (a contender reading the
+        sidecar). One blip must not fail the renewal -- the lock node still
+        names this owner, so a delayed heartbeat is delayed freshness, never
+        a lost lease. A supervisor that read False here stopped
+        OWNERSHIP_LOST with the lease provably intact (flake class observed
+        in test_wave_analyst_supervisor.ShadowGate / LeaseHeartbeat).
+        """
+        lease = hard.SessionLease(self.home, "sess-flaky-heartbeat")
+        self.assertTrue(lease.acquire())
+        self.addCleanup(lambda: lease.release() if lease.path.exists() else None)
+        real_replace = os.replace
+        failures = {"left": 3}
+
+        # Descriptor-aware double (T-125 Target B5): production calls
+        # os.replace with src_dir_fd/dst_dir_fd on POSIX, so the double must
+        # accept and FORWARD **kwargs rather than force production to drop the
+        # dir_fd confinement.
+        def flaky_replace(src, dst, **kwargs):
+            if failures["left"] > 0:
+                failures["left"] -= 1
+                raise PermissionError(32, "The process cannot access the file")
+            real_replace(src, dst, **kwargs)
+
+        with mock.patch("saipal_engine.paths.os.replace", flaky_replace):
+            self.assertTrue(
+                lease.refresh(ttl=60),
+                "a transient sidecar rename failure must not read as ownership loss",
+            )
+        self.assertEqual(failures["left"], 0, "the retry must actually have retried")
+        # The sidecar landed and names this owner.
+        record = lease._lock._read_lease_freshness()
+        self.assertEqual(record["owner"], lease.token)
+
+    def test_refresh_survives_a_transient_unreadable_node(self) -> None:
+        """An unreadable re-read is retried; the node intact means not lost."""
+        lease = hard.SessionLease(self.home, "sess-unreadable-node")
+        self.assertTrue(lease.acquire())
+        self.addCleanup(lambda: lease.release() if lease.path.exists() else None)
+        real_read = Path.read_bytes
+        calls = {"n": 0}
+
+        def flaky_read(self_path, *args, **kwargs):
+            if self_path == lease.path:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise PermissionError(32, "The process cannot access the file")
+            return real_read(self_path, *args, **kwargs)
+
+        with mock.patch("pathlib.Path.read_bytes", flaky_read):
+            self.assertTrue(
+                lease.refresh(ttl=60),
+                "a transient unreadable node must not read as ownership loss",
+            )
+        self.assertGreaterEqual(calls["n"], 2, "the ambiguous read must be retried")
+
 
 class AuditEnqueueSurvivesFencing(LockCase):
     """The one external write must still work, and still release its lock."""
@@ -285,11 +348,13 @@ class ReleaseSurvivesASharingWindow(LockCase):
         real_unlink = os.unlink
         failures = {"left": 3}
 
-        def flaky_unlink(target):
+        # Descriptor-aware double (T-125 Target B5): os.unlink is called
+        # dir-fd-relative on POSIX; forward **kwargs instead of weakening it.
+        def flaky_unlink(target, **kwargs):
             if failures["left"] > 0:
                 failures["left"] -= 1
                 raise PermissionError(32, "The process cannot access the file")
-            real_unlink(target)
+            real_unlink(target, **kwargs)
 
         with mock.patch("saipal_engine.paths.os.unlink", flaky_unlink):
             lock.release()
@@ -304,7 +369,7 @@ class ReleaseSurvivesASharingWindow(LockCase):
         lock = FencedLockFile(self.home / "locks" / "saipal.lock")
         self.assertTrue(lock.acquire())
 
-        def always_fails(_target):
+        def always_fails(_target, **kwargs):
             raise PermissionError(32, "The process cannot access the file")
 
         with mock.patch("saipal_engine.paths.os.unlink", always_fails):
@@ -406,6 +471,141 @@ class SharedPrimitive(unittest.TestCase):
             self.assertNotIn(
                 "O_EXCL", text, f"{name} must not open lock files itself; use FencedLockFile"
             )
+
+
+class LeaseTtlOwnershipPolicy(LockCase):
+    """CONTROL A-F: lease expiry belongs to the CURRENT OWNER, never the contender.
+
+    A contender's constructor ttl must never shorten, extend, or otherwise
+    influence a live owner's lease. Only the owner's own recorded ttl (sidecar
+    heartbeat, then immutable node payload, then the module default) is an
+    ownership-policy signal.
+    """
+
+    def _lock(self, ttl: float) -> FencedLockFile:
+        return FencedLockFile(self.home / "locks" / "saipal.lock", ttl=ttl)
+
+    def test_control_a_contender_ttl_does_not_steal_a_live_owner(self) -> None:
+        """owner ttl=3600, contender ttl=1, heartbeat age 120 -> must NOT steal."""
+        owner = self._lock(ttl=3600)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(owner.release)
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+
+        owner.refresh(ttl=3600)
+        record = {"owner": owner.token, "ttl": 3600, "renewed_at": time.time() - 120}
+        owner._lease_side_path().write_text(
+            json.dumps(record), encoding="utf-8"
+        )
+
+        contender = self._lock(ttl=1)
+        self.assertFalse(
+            contender._stale_now()[0],
+            "a small contender ttl must not steal a live owner's lease",
+        )
+
+    def test_control_b_owner_ttl_policy_recovers_a_stale_owner(self) -> None:
+        """owner ttl=1, contender ttl=3600, heartbeat older than owner ttl -> may recover."""
+        owner = self._lock(ttl=1)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+        owner.refresh(ttl=1)
+        owner._lease_side_path().write_text(
+            json.dumps({"owner": owner.token, "ttl": 1, "renewed_at": time.time() - 60}),
+            encoding="utf-8",
+        )
+        contender = self._lock(ttl=3600)
+        self.assertTrue(
+            contender._stale_now()[0],
+            "a stale owner must be recoverable by OWNER policy, not contender policy",
+        )
+
+    def test_control_c_refresh_changes_effective_expiry(self) -> None:
+        """refresh(ttl=N) changes the THRESHOLD a contender judges, not a dead field."""
+        owner = self._lock(ttl=3600)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(owner.release)
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+
+        owner.refresh(ttl=5)
+        record = owner._read_lease_freshness()
+        self.assertEqual(record["ttl"], 5, "refresh must persist the new owner ttl")
+
+        owner._lease_side_path().write_text(
+            json.dumps({"owner": owner.token, "ttl": 5, "renewed_at": time.time() - 120}),
+            encoding="utf-8",
+        )
+        contender = self._lock(ttl=3600)
+        self.assertTrue(
+            contender._stale_now()[0],
+            "the refreshed owner ttl (5s) must be the threshold, not the contender's (3600s)",
+        )
+
+    def test_control_d_stale_sidecar_naming_old_owner_does_not_kill_successor(self) -> None:
+        """A sidecar naming an old owner must never affect the current successor."""
+        owner = self._lock(ttl=3600)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(owner.release)
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+        old_token = owner.token
+        owner.refresh(ttl=3600)
+
+        # Replace the lock node with a successor; the stale sidecar still names
+        # the old owner. The successor must NOT be killed by the stale touch
+        # (CONTROL-A also requires the successor survive a small contender ttl).
+        successor_token = "successor-token"
+        owner.path.write_text(
+            live_payload(successor_token, ttl=3600), encoding="utf-8"
+        )
+
+        contender = self._lock(ttl=1)
+        self.assertFalse(
+            contender._stale_now()[0],
+            "a stale sidecar naming an old owner must not kill a live successor",
+        )
+        # And the stale sidecar must not keep the successor alive artificially:
+        # a successor whose OWN lease is genuinely expired is still recoverable.
+        successor_record = {
+            "owner": successor_token,
+            "ttl": 1,
+            "renewed_at": time.time() - 120,
+        }
+        owner._lease_side_path().write_text(
+            json.dumps(successor_record), encoding="utf-8"
+        )
+        self.assertTrue(
+            contender._stale_now()[0],
+            "the successor's own stale lease must be recoverable even with debris around",
+        )
+
+    def test_control_e_malformed_sidecar_ttl_fails_safe(self) -> None:
+        """malformed/non-positive/NaN/infinite sidecar ttl -> owner-policy fallback."""
+        owner = self._lock(ttl=600)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(owner.release)
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+        owner.refresh(ttl=600)
+
+        for bad in (None, 0, -1, float("nan"), float("inf"), "garbage", True, False):
+            owner._lease_side_path().write_text(
+                json.dumps(
+                    {"owner": owner.token, "ttl": bad, "renewed_at": time.time() - 1}
+                ),
+                encoding="utf-8",
+            )
+            ttl = owner._effective_ttl({"owner": owner.token, "ttl": 3600})
+            self.assertGreater(ttl, 0, f"malformed ttl={bad!r} must not yield a non-positive threshold")
+            self.assertLessEqual(ttl, LOCK_MAX_TTL_SECONDS)
+
+    def test_control_f_refresh_after_takeover_is_refused(self) -> None:
+        """An old owner that lost its node must not refresh back into ownership."""
+        owner = self._lock(ttl=600)
+        self.assertTrue(owner.acquire())
+        self.addCleanup(lambda: owner.path.unlink(missing_ok=True))
+        owner.refresh(ttl=600)
+        # Successor takes over the node.
+        owner.path.write_text(live_payload("successor", ttl=600), encoding="utf-8")
+        self.assertFalse(owner.refresh(), "a dethroned owner must not refresh its lease")
 
 
 if __name__ == "__main__":

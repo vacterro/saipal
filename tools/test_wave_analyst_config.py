@@ -32,11 +32,22 @@ class KernelStaysModelFree(unittest.TestCase):
     """Layer A never calls a model: the import graph proves it."""
 
     def test_kernel_never_imports_the_analyst_runtime(self) -> None:
-        offenders = [
-            path.name
-            for path in sorted(KERNEL_DIR.glob("*.py"))
-            if "saipal_analyst" in path.read_text(encoding="utf-8")
-        ]
+        """The import graph is the invariant, not the byte stream: readiness.py's
+        fingerprint allowlist legitimately NAMES the analyst package as a
+        reviewed surface without importing it (T-109)."""
+        offenders = []
+        for path in sorted(KERNEL_DIR.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8-sig"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = {alias.name.split(".")[0] for alias in node.names}
+                elif isinstance(node, ast.ImportFrom):
+                    names = {(node.module or "").split(".")[0]}
+                else:
+                    continue
+                if "saipal_analyst" in names:
+                    offenders.append(path.name)
+                    break
         self.assertEqual(offenders, [])
 
     def test_kernel_has_no_provider_surfaces(self) -> None:
@@ -72,6 +83,34 @@ class ConfigSchema(unittest.TestCase):
         self.assertFalse(config["egress"]["allow_remote_evidence"])
         self.assertTrue(analyst_config.endpoint_is_local(config["backend"]["endpoint"]))
         self.assertEqual(config["backend"]["api_key_env"], "SAIPAL_ANALYST_API_KEY")
+
+    def test_credential_verdict_is_an_egress_verdict(self) -> None:
+        """One rule, three callers: loopback is inert, remote fails closed."""
+        import os
+
+        loopback = base_config()
+        loopback["backend"]["endpoint"] = "http://127.0.0.1:11434/v1/chat/completions"
+        remote = base_config()
+        remote["backend"]["endpoint"] = "http://10.0.0.5:9/v1/chat/completions"
+        keyless = base_config()
+        keyless["backend"]["api_key_env"] = ""
+
+        os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
+        self.assertTrue(
+            analyst_config.credential_verdict(loopback)[0],
+            "a loopback endpoint has no remote party to authenticate to",
+        )
+        refused, detail = analyst_config.credential_verdict(remote)
+        self.assertFalse(refused)
+        self.assertIn("SAIPAL_ANALYST_API_KEY", detail)
+        self.assertIn("no request was sent", detail)
+        self.assertTrue(analyst_config.credential_verdict(keyless)[0])
+
+        os.environ["SAIPAL_ANALYST_API_KEY"] = "present-for-the-test"
+        try:
+            self.assertTrue(analyst_config.credential_verdict(remote)[0])
+        finally:
+            os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
 
     def test_unknown_top_level_field_rejected(self) -> None:
         config = base_config()
@@ -254,18 +293,49 @@ class Doctor(unittest.TestCase):
         self.assertTrue(report["endpoint_local"])
         self.assertFalse(report["api_key_env_present"])
 
-    def test_enabled_without_key_reports_env_not_value(self) -> None:
+    def test_a_loopback_backend_without_a_key_is_healthy(self) -> None:
+        """The credential requirement is an egress requirement.
+
+        The default endpoint is loopback, so an unset key is INERT: doctor must
+        report the fact (presence False) without calling a runnable local analyst
+        broken. When doctor and the transport disagree about this, a keyless local
+        model is reported unusable and never runs.
+        """
         config = base_config()
         config["enabled"] = True
         config["backend"]["model"] = "stub-model"
         analyst_config.save_analyst_config(self.home, config)
         report = self.doctor()
-        self.assertFalse(report["ok"])
-        self.assertIn("SAIPAL_ANALYST_API_KEY", report["config_problems"][0])
-        self.assertIn("is not set", report["config_problems"][0])
+        self.assertTrue(report["ok"], report["config_problems"])
+        self.assertTrue(report["endpoint_local"])
         # The report knows presence, never value.
         self.assertFalse(report["api_key_env_present"])
+        self.assertEqual(report["config_problems"], [])
         self.assertNotIn("sk-", json.dumps(report))
+
+    def test_a_remote_backend_without_its_key_is_a_config_problem(self) -> None:
+        import os
+
+        previous = os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
+
+        def restore() -> None:
+            if previous is not None:
+                os.environ["SAIPAL_ANALYST_API_KEY"] = previous
+
+        self.addCleanup(restore)
+        config = base_config()
+        config["enabled"] = True
+        config["backend"]["model"] = "stub-model"
+        config["backend"]["endpoint"] = "http://10.0.0.5:9/v1/chat/completions"
+        config["egress"]["allow_remote_evidence"] = True
+        analyst_config.save_analyst_config(self.home, config)
+        report = self.doctor()
+        self.assertFalse(report["ok"])
+        self.assertTrue(
+            any("SAIPAL_ANALYST_API_KEY" in problem
+                for problem in report["config_problems"]),
+            report["config_problems"],
+        )
 
     def test_remote_endpoint_fails_doctor_without_flag(self) -> None:
         config = base_config()

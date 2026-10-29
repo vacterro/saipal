@@ -14,7 +14,7 @@ from typing import Any
 
 from .capability import require_action
 from .errors import PalError
-from .paths import home_paths, utc_now_iso
+from .paths import LOG_NAME, confined_append_line, home_paths, utc_now_iso
 
 TAIL_WINDOW = 65536
 
@@ -30,7 +30,15 @@ def append_event(
     require_action("write_own_log", registry=registry)
 
     paths = home_paths(home)
-    paths.root.mkdir(parents=True, exist_ok=True)
+    # T-127 Defect B: append_event is NOT an owner of home bootstrap. The
+    # previous raw `paths.root.mkdir(parents=True, exist_ok=True)` materialized
+    # the home recursively through whatever the operating system's pathname
+    # resolver found -- so a home whose lexical ancestor was a symlink/junction
+    # CREATED external directories and then wrote LOG.jsonl outside the home.
+    # A writer path must arrive with an already-established authorized home
+    # (`ensure_home` owns materialization, through `confined_mkdir`); the
+    # append primitive itself refuses a home reached through an untrusted
+    # lexical ancestor before any byte or directory changes.
 
     record = {
         "seq": last_seq(paths.log) + 1,
@@ -40,19 +48,18 @@ def append_event(
     }
     line = (json.dumps(record, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
 
-    descriptor = os.open(str(paths.log), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    # PAL-WRITE-01 (T-125): the append goes through the shared physical
+    # confinement primitive. The old direct os.open followed a replaced
+    # LOG.jsonl symlink (or a redirected parent) and wrote events outside the
+    # home; confined_append_line refuses a final symlink outright (O_NOFOLLOW
+    # where available) and binds the open to the verified home fd, so a parent
+    # swap after validation cannot redirect the write. Append-only semantics,
+    # the single-line write and fsync are preserved; a refusal leaves every
+    # external byte untouched.
     try:
-        view = memoryview(line)
-        while view:
-            written = os.write(descriptor, view)
-            if written <= 0:
-                raise OSError("short write to home log")
-            view = view[written:]
-        os.fsync(descriptor)
+        confined_append_line(paths.root, LOG_NAME, line)
     except OSError as exc:
         raise PalError("WRITER_BUSY", f"cannot append to home log: {exc}") from exc
-    finally:
-        os.close(descriptor)
     return record
 
 

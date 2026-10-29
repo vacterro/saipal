@@ -34,6 +34,7 @@ from saipal_analyst import output as output_module
 from saipal_analyst import worker as worker_module
 from saipal_analyst.config import default_analyst_config, save_analyst_config
 from saipal_analyst.worker import WorkerClock, investigate
+from saipal_engine.registry import load_registry, require_string_list
 from saipal_engine import submit as submit_module
 
 
@@ -172,6 +173,26 @@ class FakeClock:
 
 
 class RepairBase(unittest.TestCase):
+    def _two_session_home(self) -> tuple[Path, list[str]]:
+        """Two bindable sessions, in the deterministic order the worker serves.
+
+        Both sessions are least-served (0), so the fair rank is session id order.
+        """
+        home = self.fresh_home("conformant-cold.json", "conformant-cold-other.json")
+        from saipal_engine import carrier as carrier_mod
+        from saipal_engine.sessions import load_index
+
+        _status, index, _detail = load_index(home)
+        order = [
+            str(record.get("session_id"))
+            for record in sorted(
+                carrier_mod.freshest_records(index),
+                key=lambda record: str(record.get("session_id")),
+            )
+        ]
+        self.assertEqual(len(order), 2, "the fixture pair must yield two sessions")
+        return home, order
+
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
@@ -701,8 +722,19 @@ class TransportFailures(RepairBase):
         self.assertEqual(job["error_class"], "BACKEND_AUTH")
 
     def test_15_missing_key_makes_zero_requests(self) -> None:
+        """Fail closed where the credential matters: a REMOTE endpoint.
+
+        The credential requirement is an egress requirement. A loopback endpoint
+        has no remote party to authenticate to, so an unset key is inert there and
+        the call proceeds header-less (test_wave_analyst_backend and
+        test_wave_analyst_config carry that control). The refusal this test guards
+        is the egress one: remote party, no credential -- zero requests.
+        """
         home, backend = self._scripted_home()
-        self.enable(home, backend)
+        config = self.enable(home, backend)
+        config["backend"]["endpoint"] = "https://analyst.invalid/v1/chat/completions"
+        config["egress"]["allow_remote_evidence"] = True
+        save_analyst_config(home, config)
         import os
 
         os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
@@ -1013,6 +1045,54 @@ class Scheduling(RepairBase):
 
 
 class RepairBudget(RepairBase):
+    def test_repair_prompt_recovers_candidate_missing_required_reasoning(self) -> None:
+        home = self.fresh_home("conformant-cold.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend)
+        valid = json.loads(self.candidate_json(home))
+        invalid = dict(valid)
+        invalid.pop("reasoning")
+        invalid.pop("slice_index")
+        invalid["unit_digest"] = (
+            ("0" if valid["unit_digest"][0] != "0" else "1")
+            + valid["unit_digest"][1:]
+        )
+        invalid["disposition_class"] = "COMPLIANT"
+        invalid["confidence"] = "HIGH"
+        invalid["severity"] = None
+        invalid["mitigations"] = []
+        invalid["turn_digest"] = "invented"
+        backend.script.append((200, envelope(json.dumps(invalid))))
+        backend.script.append((200, envelope(json.dumps(valid))))
+
+        summary = self.run_worker(home)
+        self.assertEqual(summary["jobs_completed"], 1)
+        self.assertEqual(backend.attempts, 2)
+        repair_prompt = backend.requests[1]["body"]["messages"][1]["content"]
+        required_fields = require_string_list(
+            load_registry(), "candidate_required_fields"
+        )
+
+        self.assertIn(
+            ", ".join(f'"{field}"' for field in required_fields), repair_prompt
+        )
+        self.assertIn("Repair the complete candidate", repair_prompt)
+        self.assertIn("keep reasoning a non-empty string", repair_prompt)
+        self.assertIn("Preserve valid evidence-based content", repair_prompt)
+        self.assertIn("REJECTED MODEL OUTPUT", repair_prompt)
+        self.assertIn("Exact top-level fields:", repair_prompt)
+        self.assertIn(
+            "missing_evidence, protected_invariants, and addressed_defences are arrays of strings",
+            repair_prompt,
+        )
+        self.assertIn("disposition_class must be one of:", repair_prompt)
+        self.assertIn("If the packet contains slice_index", repair_prompt)
+        self.assertIn("EXACT IDENTITY VALUES", repair_prompt)
+        self.assertIn(f'"unit_digest": "{valid["unit_digest"]}"', repair_prompt)
+        self.assertIn("For NO_DRIFT and INSUFFICIENT_EVIDENCE", repair_prompt)
+        self.assertIn("Do not use mitigations or turn_digest", repair_prompt)
+
     def test_25_malformed_repair_429_recovers_after_retry(self) -> None:
         home = self.fresh_home("conformant-cold.json")
         backend = StubBackend()
@@ -1063,6 +1143,424 @@ class RepairBudget(RepairBase):
         job = self.journal_job(home)
         self.assertEqual(job["stage"], jobs_mod.BLOCKED)
         self.assertEqual(job["investigator_repairs"], 1)
+
+
+class BlockedTriage(RepairBase):
+    """`blocked_triage`: which class of session is unanalyzable, and the ACTIONS.
+
+    A blocked population is an operator decision only if the operator can see the
+    classes and what each one costs. Two of the three classes have a canonical
+    command; the third does not, and saying so is the honest answer.
+    """
+
+    def _triage(self, home: Path) -> dict:
+        from saipal_analyst.doctor import blocked_triage
+
+        return blocked_triage(home)
+
+    def _group(self, triage: dict, klass: str) -> dict:
+        rows = [row for row in triage["groups"] if row["class"] == klass]
+        self.assertTrue(rows, f"expected a {klass} group in {triage['groups']}")
+        return rows[0]
+
+    def test_a_binding_wall_names_the_authority_command(self) -> None:
+        home = self.fresh_home("unknown-protocol.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend)
+
+        self.run_worker(home)
+        triage = self._triage(home)
+
+        group = self._group(triage, "BLOCKED_BINDING")
+        self.assertGreaterEqual(group["count"], 1)
+        self.assertIn("coverage", group["command"])
+        self.assertIn("rebind", group["then"])
+        self.assertTrue(group["recoverable"])
+        self.assertEqual(triage["runnable"], 0)
+        self.assertIn("coverage", triage["next_action"])
+        self.assertNotIn("BLOCKED_BINDING", triage["no_canonical_action"])
+
+    def test_an_output_wall_names_the_canonical_requeue(self) -> None:
+        """T-136: the refusal class now HAS a path back, and the triage says so.
+
+        Before the requeue contract existed this class was the honest gap: the
+        triage named it under `no_canonical_action`. It is now actionable, so
+        the same read-only surface must report the command AND whether the
+        command would actually do anything right now.
+        """
+        home, _order = self._two_session_home()
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend, max_units_per_run=3)
+        for _ in range(2):
+            backend.script.append((200, envelope("{not json")))
+            backend.script.append((200, envelope("{repair broken")))
+
+        self.run_worker(home)
+        triage = self._triage(home)
+
+        group = self._group(triage, "BLOCKED_OUTPUT")
+        self.assertEqual(group["count"], 2)
+        self.assertIn("analyst-requeue", group["command"])
+        self.assertTrue(group["recoverable"])
+        self.assertIn("does not repair the model", group["caveat"])
+        self.assertEqual(group["requeue_ready"], 2)
+        self.assertEqual(group["requeue_refused"], 0)
+        self.assertEqual(triage["no_canonical_action"], [])
+        self.assertIn("analyst-requeue", triage["next_action"])
+        self.assertEqual(triage["blocked_total"], 2)
+
+    def test_a_drained_home_reports_nothing_to_unblock(self) -> None:
+        home = self.fresh_home("conformant-cold.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend, max_units_per_run=1)
+        # The candidate must answer the unit actually served, and the session is
+        # drained one episode at a time: build it per request, from the carrier
+        # the worker sent.
+        backend.on_request = lambda request: backend.script.append(
+            (200, envelope(self.candidate_for(home, "NO_DRIFT")))
+        )
+        for _ in range(12):
+            if self.run_worker(home)["stop_reason"] == "IDLE":
+                break
+
+        triage = self._triage(home)
+        self.assertEqual(triage["blocked_total"], 0)
+        self.assertEqual(triage["groups"], [])
+        self.assertEqual(triage["no_canonical_action"], [])
+        self.assertEqual(triage["runnable"], 0)
+        self.assertIn("nothing to unblock", triage["next_action"])
+
+    def test_the_binding_wall_says_which_units_an_enrollment_can_move(self) -> None:
+        """PAL-CPALL-04: name WHICH decision makes a refused unit eligible.
+
+        The wall published one command for the whole BLOCKED_BINDING class, but
+        the command only moves a unit whose session carries an artifact an
+        authority root can actually check -- a full commit id, a registry
+        digest or a tree fingerprint. A version claim with no digest, or no
+        claim at all, has nothing to verify: measured on the real home, 418 of
+        425 blocked units were evidence-absent, so running the recommended
+        command on them was the one action that cannot work.
+        """
+        for fixture, movable in (
+            ("version-only-protocol.json", False),
+            ("unknown-protocol.json", False),
+        ):
+            with self.subTest(fixture=fixture):
+                home = self.fresh_home(fixture)
+                backend = StubBackend()
+                self.addCleanup(backend.stop)
+                self.enable(home, backend)
+                self.run_worker(home)
+
+                group = self._group(self._triage(home), "BLOCKED_BINDING")
+                evidence = group["binding_evidence"]
+                self.assertEqual(
+                    evidence["authority_verifiable"] + evidence["evidence_absent"],
+                    group["count"],
+                    "the split must partition the class, not restate it",
+                )
+                if movable:
+                    self.assertEqual(evidence["authority_verifiable"], group["count"])
+                else:
+                    self.assertEqual(evidence["evidence_absent"], group["count"])
+                self.assertIn("binding_evidence", group["caveat"])
+
+    def test_a_verifiable_claim_counts_as_enrol_movable(self) -> None:
+        """The complement: a full commit id IS something a root can check."""
+        home = self.fresh_home("unverifiable-commit.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend)
+        self.run_worker(home)
+
+        group = self._group(self._triage(home), "BLOCKED_BINDING")
+        evidence = group["binding_evidence"]
+        self.assertEqual(evidence["authority_verifiable"], group["count"])
+        self.assertEqual(evidence["evidence_absent"], 0)
+
+    def test_the_read_only_command_exposes_the_triage(self) -> None:
+        home = self.fresh_home("unknown-protocol.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend)
+
+        code, payload, err = support.run_saipal_json("analyst-doctor", home=home)
+        self.assertEqual(code, 0, err)
+        blocked = payload.get("blocked") or {}
+        self.assertIn("groups", blocked)
+        self.assertIn("next_action", blocked)
+        self.assertEqual(blocked["population"], 1)
+
+    # -- T-158 ---------------------------------------------------------------
+    # The provisional class is decided BEFORE the terminal-job check and before
+    # the binding guard, so `--with-provisional` RECLASSIFIES its members
+    # instead of releasing them. Publishing that flag for the whole class was
+    # the T-145 dead end wearing a different label: the named command runs,
+    # admits nothing, and reads like progress. Measured on the real home,
+    # 246 of 246 reclassified (196 TERMINAL, 50 BLOCKED_BINDING) and the
+    # command served zero.
+
+    def test_the_provisional_split_partitions_the_class(self) -> None:
+        from saipal_analyst.doctor import _provisional_admission
+
+        split = {"TERMINAL": 196, "BLOCKED_BINDING": 50}
+        out = _provisional_admission(split)
+
+        self.assertEqual(out["provisional_admission"], 0)
+        self.assertEqual(out["not_admitted"], split)
+        self.assertEqual(
+            out["provisional_admission"] + sum(split.values()),
+            246,
+            "the split must partition the class, not restate it",
+        )
+
+    def test_an_unadmittable_class_names_no_command(self) -> None:
+        from saipal_analyst.doctor import _provisional_admission
+
+        out = _provisional_admission({"TERMINAL": 3})
+        self.assertIsNone(out["command"])
+        self.assertFalse(out["recoverable"])
+        self.assertIn("3 TERMINAL", out["caveat"])
+
+    def test_an_admittable_class_keeps_its_command_and_counts_the_rest(self) -> None:
+        from saipal_analyst.doctor import _provisional_admission
+
+        out = _provisional_admission({"RUNNABLE_PROVISIONAL": 4, "TERMINAL": 6})
+        self.assertEqual(out["provisional_admission"], 4)
+        self.assertNotIn("command", out, "an admitted half keeps the table's command")
+        self.assertIn("admits 4 of these unit(s)", out["caveat"])
+        self.assertIn("6 TERMINAL", out["caveat"])
+
+    def test_a_refused_provisional_unit_is_not_admitted_by_the_flag(self) -> None:
+        """The human surface must not print a command the flag cannot run.
+
+        Every split the allocator can produce for this class is refused except
+        the one half a `--with-provisional` run actually serves, so the class
+        has no canonical action whenever the split is not that half.
+        """
+        import saipal
+
+        for split in (
+            {"TERMINAL": 1},
+            {"BLOCKED_BINDING": 2},
+            {"TERMINAL": 196, "BLOCKED_BINDING": 50},
+            {"REMOTE_OUTCOME_UNKNOWN": 5},
+        ):
+            with self.subTest(split=split):
+                from saipal_analyst.doctor import _provisional_admission
+
+                group = dict(_provisional_admission(split))
+                group.update({"class": "PROVISIONAL_DISABLED", "count": sum(split.values())})
+                text = saipal.render_human({
+                    "analyst_doctor": True,
+                    "config_present": True,
+                    "enabled": True,
+                    "backend_type": "openai_compatible",
+                    "model": "stub",
+                    "endpoint": "http://127.0.0.1:1/v1",
+                    "endpoint_local": True,
+                    "api_key_env": "K",
+                    "api_key_env_present": False,
+                    "journal_present": True,
+                    "worker_active": False,
+                    "semantic": {},
+                    "config_problems": [],
+                    "blocked": {
+                        "population": sum(split.values()),
+                        "runnable": 0,
+                        "blocked_total": sum(split.values()),
+                        "groups": [group],
+                        "no_canonical_action": ["PROVISIONAL_DISABLED"],
+                        "next_action": "nothing canonical remains to run",
+                    },
+                })
+                self.assertIn("no command moves these units", text)
+                self.assertIn("--with-provisional admits 0:", text)
+                self.assertNotIn("investigate --with-provisional --max-units", text)
+
+    def test_the_split_counts_the_class_members_and_nobody_else(self) -> None:
+        """The split qualifies THIS class, so it may not restate the home.
+
+        Counting every record's post-flag class made the rendered detail sum to
+        the whole home (738) while the group header read 246, which reads as a
+        partition of the class and is not one.
+        """
+        from saipal_analyst import doctor as doctor_mod
+        from saipal_analyst import worker as worker_mod
+
+        home = self.fresh_home("unknown-protocol.json")
+        seen: list[tuple[bool, str]] = []
+
+        real = worker_mod._classify_unit
+
+        def fake(record, event_limit, journal, provisional, now, *a, **kw):
+            # Only the flag-OFF view decides membership; the flag-ON view decides
+            # where a member lands. Every record is a member and every member
+            # reclassifies, so a split that counted the whole home twice would
+            # still look plausible here and sum to twice the class.
+            seen.append((bool(provisional), "TERMINAL"))
+            return "TERMINAL" if provisional else "PROVISIONAL_DISABLED"
+
+        worker_mod._classify_unit = fake
+        self.addCleanup(setattr, worker_mod, "_classify_unit", real)
+
+        triage = doctor_mod.blocked_triage(home)
+        group = self._group(triage, "PROVISIONAL_DISABLED")
+
+        self.assertEqual(group["count"], triage["population"])
+        self.assertEqual(
+            group["provisional_admission"] + sum(group["not_admitted"].values()),
+            group["count"],
+            "the split must partition the class it qualifies",
+        )
+        self.assertEqual(group["not_admitted"], {"TERMINAL": triage["population"]})
+        self.assertEqual(
+            [flag for flag, _ in seen],
+            [False, True] * triage["population"],
+            "the flag-ON pass runs once per member and no more",
+        )
+
+
+class BlockedUnitIsolation(RepairBase):
+    """One inadmissible unit must not consume another session's turn.
+
+    A blocked unit is a property of THAT unit, exactly as a CONFLICT is a
+    property of one session. Ending the slice on the first block made one bad
+    model response cost every other eligible session its place -- the same
+    global freeze PAL-CPALL-03 forbids between families, observed on the real
+    home: 18,364 pending episodes and a 9B model that answers some units with
+    invalid JSON.
+    """
+
+    def test_a_blocked_unit_does_not_end_a_slice_that_has_other_sessions(self) -> None:
+        home, order = self._two_session_home()
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend, max_units_per_run=2)
+
+        # The serve order is the scheduler's decision, not this test's: the reply
+        # is built per REQUEST from the carrier the worker actually sent, so the
+        # first session it serves is the one whose model output is inadmissible
+        # (investigator AND its repair) and every other session gets a valid one.
+        state: dict = {"first": None}
+
+        def answer_from_request(request: dict) -> None:
+            user = str((request.get("body") or {}).get("messages", [{}])[-1].get("content", ""))
+            marker = user.find('"session_id": "')
+            session = ""
+            if marker >= 0:
+                session = user[marker + len('"session_id": "'):].split('"', 1)[0]
+            if state["first"] is None:
+                state["first"] = session
+            if session == state["first"]:
+                backend.script.append((200, envelope("{still not json")))
+            else:
+                backend.script.append(
+                    (200, envelope(self.candidate_for(home, "NO_DRIFT", session)))
+                )
+
+        backend.on_request = answer_from_request
+
+        summary = self.run_worker(home)
+
+        self.assertEqual(summary["jobs_blocked"], 1,
+                         "the inadmissible unit is blocked and counted")
+        self.assertEqual(summary["jobs_completed"], 1,
+                         "the OTHER session was still judged in the same run")
+        self.assertEqual(summary["units"], 2)
+        self.assertEqual(summary["stop_reason"], "BUDGET_EXHAUSTED",
+                         "a run that judged a unit stops on its budget, not as BLOCKED")
+        self.assertIn(state["first"], order)
+        self.assertEqual(
+            [row["session_id"] for row in summary["receipts"]],
+            [session for session in order if session != state["first"]],
+        )
+
+        journal = jobs_mod.load_journal(home)
+        stages = {
+            str(job["session_id"]): job["stage"]
+            for job in (journal.get("jobs") or {}).values()
+        }
+        self.assertEqual(stages[state["first"]], jobs_mod.BLOCKED)
+        self.assertEqual(len(stages), 2, "both sessions were attempted in one run")
+        self.assertEqual(
+            sorted(stages.values()), sorted([jobs_mod.BLOCKED, jobs_mod.DONE])
+        )
+
+    def test_the_slice_still_names_the_wall_when_only_blocks_were_left(self) -> None:
+        home, order = self._two_session_home()
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        # Budget ABOVE the blocked population, so the allocator is consulted once
+        # more and answers for itself that nothing eligible is left.
+        self.enable(home, backend, max_units_per_run=3)
+
+        for _ in range(2):
+            backend.script.append((200, envelope("{not json")))
+            backend.script.append((200, envelope("{repair broken")))
+
+        summary = self.run_worker(home)
+
+        self.assertEqual(summary["jobs_completed"], 0)
+        self.assertEqual(summary["jobs_blocked"], 2)
+        self.assertEqual(summary["stop_reason"], "BLOCKED",
+                         "an unproductive run says BLOCKED, never a healthy stop")
+        self.assertIn("blocked", str(summary["detail"]).lower())
+        self.assertTrue(summary["no_eligible_unit"],
+                        "the allocator exhausted the eligible set and said so in a "
+                        "structured field, not only in prose")
+
+    def test_an_idle_allocator_reports_its_population_classes(self) -> None:
+        """"no analyzable episode is pending" must be countable, not just prose."""
+        home = self.fresh_home("conformant-cold.json")
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend, max_units_per_run=1)
+        backend.script.append((200, envelope(self.candidate_for(home, "NO_DRIFT"))))
+
+        # Every answer carries the population classes ...
+        first = self.run_worker(home)
+        self.assertEqual(first["jobs_completed"], 1)
+        self.assertEqual(first["population_size"], 1)
+        self.assertIn("RUNNABLE_FINAL", first["population_classes"])
+
+        # ... and once the session is judged out, the empty answer is structured
+        # too: nothing is runnable, nothing was blocked, the queue is really empty.
+        idle = None
+        for _ in range(12):
+            result = self.run_worker(home)
+            if result["stop_reason"] == "IDLE":
+                idle = result
+                break
+        self.assertIsNotNone(idle, "the fixture must drain within the run budget")
+        self.assertEqual(idle["jobs_completed"], 0)
+        self.assertTrue(idle["no_analyzable_unit"])
+        self.assertNotIn("no_eligible_unit", idle,
+                         "no unit was blocked here: the queue really is empty")
+        classes = idle["population_classes"]
+        self.assertEqual(sum(int(count) for count in classes.values()), idle["population_size"])
+        self.assertFalse(
+            [name for name in classes if name.startswith("RUNNABLE")],
+            "an idle allocator reports no runnable class",
+        )
+        self.assertIn("TERMINAL", classes)
+
+    def test_a_slice_that_judged_a_unit_is_not_reported_as_exhausted(self) -> None:
+        home, _order = self._two_session_home()
+        backend = StubBackend()
+        self.addCleanup(backend.stop)
+        self.enable(home, backend, max_units_per_run=1)
+        backend.script.append(
+            (200, envelope(self.candidate_for(home, "NO_DRIFT")))
+        )
+
+        summary = self.run_worker(home)
+        self.assertEqual(summary["jobs_completed"], 1)
+        self.assertNotIn("no_eligible_unit", summary,
+                         "work remained after a judged unit: not an exhausted set")
 
 
 class MidDeliberationBudgetBoundaries(RepairBase):

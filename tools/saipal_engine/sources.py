@@ -190,8 +190,20 @@ def _store_candidates(kind: str) -> list[Path]:
     return out
 
 
-def source_status(kind: str, path: Path, *, enabled: bool) -> str:
-    """The observable state of one source: configured or not, usable or not."""
+def source_status(
+    kind: str,
+    path: Path,
+    *,
+    enabled: bool,
+    discovery: list | None = None,
+) -> str:
+    """The observable state of one source: configured or not, usable or not.
+
+    PERF-006 (SRC-011): `discovery` lets a caller that has ALREADY enumerated
+    the provider store derive the classification from that result instead of
+    forcing a second `discover()` call. The semantics are unchanged -- READY vs
+    EMPTY is decided by the discovered session count.
+    """
     if not enabled:
         return SOURCE_DISABLED
     if kind not in ADAPTER_REGISTRY:
@@ -199,7 +211,7 @@ def source_status(kind: str, path: Path, *, enabled: bool) -> str:
     if not path.exists():
         return "UNAVAILABLE"
     try:
-        sessions = len(ADAPTER_REGISTRY[kind].discover(str(path)))
+        sessions = discovery if discovery is not None else ADAPTER_REGISTRY[kind].discover(str(path))
     except Exception:
         return "MISCONFIGURED"
     return "READY" if sessions else "EMPTY"
@@ -278,15 +290,26 @@ def sources_report(home: Path | str) -> dict[str, dict]:
                     "discovery": "unconfigured",
                     "configured": False,
                 }
+        # PERF-006 (SRC-011): discover ONCE. The classification and the session
+        # count are two facts about the SAME snapshot, so a second provider
+        # enumeration per enabled usable source was pure work.
+        discovered: list | None = None
+        discovery_ok = False
+        path_value = Path(row["path"]) if row.get("path") else Path("/nonexistent")
+        if row.get("enabled") and kind in ADAPTER_REGISTRY and path_value.exists():
+            try:
+                discovered = ADAPTER_REGISTRY[kind].discover(str(path_value))
+                discovery_ok = True
+            except Exception:
+                discovered = None
+                discovery_ok = False
         row["status"] = source_status(
             kind,
-            Path(row["path"]) if row.get("path") else Path("/nonexistent"),
+            path_value,
             enabled=bool(row.get("enabled")),
+            discovery=discovered if discovery_ok else None,
         )
         if row["status"] in ("READY", "EMPTY") and row.get("path"):
-            try:
-                row["sessions"] = len(ADAPTER_REGISTRY[kind].discover(str(row["path"])))
-            except Exception:
-                row["sessions"] = 0
+            row["sessions"] = len(discovered or [])
         report[kind] = row
     return report

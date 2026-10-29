@@ -15,6 +15,7 @@
     {"src": "saipal/SKILL.md", "required": true, "owner": "SKILL"},
     {"src": "saipal/INDEX.md", "required": true, "owner": "INDEX"},
     {"src": "saipal/ANALYSIS.md", "required": true, "owner": "ANALYSIS"},
+    {"src": "saipal/CPALL.md", "required": true, "owner": "CPALL"},
     {"src": "saipal/MANIFEST.json", "required": true, "owner": "MANIFEST"},
     {"src": "VERSION", "required": true, "owner": "VERSION"},
     {"src": "README.md", "required": true, "owner": "README"},
@@ -70,6 +71,8 @@
     "saipal_engine/config.py",
     "saipal_engine/dispatcher.py",
     "saipal_engine/publications.py",
-    "saipal_engine/sink.py"
+    "saipal_engine/sink.py",
+    "saipal_engine/cpall.py",
+    "saipal_analyst/operator_queue.py"
   ]
 }

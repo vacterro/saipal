@@ -159,20 +159,37 @@ def inbox_files(home: Path | str) -> list[Path]:
 def import_inbox(
     home: Path | str, *, registry: dict | None = None, now: str | None = None,
     authority: dict | None = None,
+    index: dict | None = None,
 ) -> dict[str, Any]:
-    """Ingest every canonical bundle in the inbox. Returns a full report."""
+    """Ingest every canonical bundle in the inbox. Returns a full report.
+
+    PERF-002 (SRC-004): a caller that already holds a freshly validated index
+    passes it as `index`; the snapshot (and whether it mutated) is returned in
+    the report so the caller can reuse it instead of reparsing the same
+    authoritative bytes a third time in one cycle. A caller that passes nothing
+    gets the historical behavior: one load here.
+    """
     data = registry if registry is not None else load_registry()
     paths = home_paths(home)
     timestamp = now or utc_now_iso()
 
-    status, index, detail = load_index(paths.root, registry=data)
-    if status == STATUS_UNRECOVERABLE:
+    if index is not None and not isinstance(index, dict):
+        # PERF-002: a preloaded snapshot must be the loaded index object, never
+        # a status sentinel; anything else is a caller bug, refused loudly.
         raise PalError(
             "VALIDATION_FAILED",
-            f"session index is unusable: {detail}",
-            next_action="repair or remove .saipal/sessions/index.json by hand",
+            "import_inbox preloaded index must be a loaded index dict or None",
+            next_action="callers pass load_index's index or nothing at all",
         )
-    if status == STATUS_ABSENT or index is None:
+    if index is None:
+        status, index, detail = load_index(paths.root, registry=data)
+        if status == STATUS_UNRECOVERABLE:
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"session index is unusable: {detail}",
+                next_action="repair or remove .saipal/sessions/index.json by hand",
+            )
+    if index is None:
         index = {"schema_version": 1, "sessions": []}
 
     imported: list[dict] = []
@@ -281,6 +298,12 @@ def import_inbox(
         "hot": sum(1 for r in index["sessions"] if r["temperature"] == "HOT"),
         "cold": sum(1 for r in index["sessions"] if r["temperature"] == "COLD"),
         "conflicted": sum(1 for r in index["sessions"] if r["status"] == "CONFLICT"),
+        # PERF-002: the authoritative post-intake snapshot. `index_changed`
+        # says whether the caller's copy must be replaced; when False the
+        # caller's snapshot is still authoritative and a reload is a wasted
+        # full parse of the same bytes.
+        "index": index,
+        "index_changed": index_dirty,
     }
 
 
@@ -355,12 +378,11 @@ def _extend_hot(
     record["prefix_sha256"] = observed_prefix
     record["updated_at"] = timestamp
     record["episodes"] = episodes_mod.extract_episodes(events, registry=registry)
+    # PERF-001 (SRC-004): evidence locators are derived from the canonical
+    # bundle (carrier/evidence commands parse it); the index keeps compact
+    # metadata. The legacy projection is dropped on the next HOT extension.
     record.pop("mechanical_spans", None)
-    record["evidence_refs"] = [
-        {"seq": event["seq"], "evidence_ref": event["evidence_ref"]}
-        for event in events
-        if event.get("evidence_ref") is not None
-    ]
+    record.pop("evidence_refs", None)
     record["imports"].append(
         {
             "source_ref": source_ref,

@@ -26,10 +26,20 @@ import time
 from pathlib import Path
 
 from saipal_engine.errors import PalError
-from saipal_engine.paths import atomic_write_json, home_paths, read_json
+from saipal_engine.paths import atomic_write_json, home_paths, read_json, writer_fence
 
 BUDGET_SCHEMA_VERSION = 1
 BUDGET_NAME = "budget.json"
+
+#: T-138: a competing writer holds the common fence only for the length of one
+#: small local budget transaction, so contention clears in milliseconds. The
+#: mutation is retried a bounded number of times before the busy state is
+#: surfaced, so two concurrent legitimate charges both commit rather than the
+#: loser silently dropping its charge. The bound is finite: a genuinely wedged
+#: or long-held foreign fence still surfaces WRITER_BUSY to the caller (the
+#: analyst worker turns that into a structured stop, never a swallowed charge).
+BUDGET_TXN_RETRIES = 50
+BUDGET_TXN_RETRY_DELAY_SECONDS = 0.01
 
 CIRCUIT_CLOSED = "CLOSED"
 CIRCUIT_OPEN = "OPEN"
@@ -127,7 +137,56 @@ def save_ledger(home: Path | str, ledger: dict) -> Path:
     from time import gmtime, strftime
 
     ledger["updated_at"] = strftime("%Y-%m-%dT%H:%M:%SZ", gmtime())
+    # TARGET B2 (T-125): the analyst workspace directory is materialized
+    # explicitly by its owning writer (see jobs.ensure_journal_dir).
+    from . import jobs as _jobs
+
+    _jobs.ensure_journal_dir(home)
     return atomic_write_json(ledger_path(home), ledger, root=home_paths(home).root)
+
+
+def mutate_ledger(home: Path | str, mutate):
+    """The one authoritative budget.json transaction (T-138).
+
+    `atomic_write_json` makes the final REPLACE atomic; it does NOT isolate a
+    load->mutate->save from a concurrent one doing the same, so two writers both
+    read generation N and independently publish N+1, the later replacement
+    silently discarding the earlier mutation. Every mutator of budget.json --
+    consumption windows, the backend circuit, and the per-source circuits --
+    routes through here, so the whole load/validate/mutate/save runs under the
+    common writer fence and one mutation can never overwrite another's.
+
+    The fence is `paths.writer_fence` (the CORE-001 HomeLock lease), reused
+    rather than reinvented: it is cross-process exclusive, same-thread reentrant
+    (so a caller already holding the fence -- intake, rebind, setup -- drives a
+    budget mutation without deadlocking), and carries the physical-home identity
+    (SRC-010) and PAL-WRITE confinement guarantees. The section is a small local
+    filesystem transaction only: no model/network work runs under it, and a
+    contended writer surfaces WRITER_BUSY to the caller rather than losing state.
+
+    `mutate(ledger)` may return a value to hand back to the caller; when it
+    returns None the mutated ledger itself is returned, matching the historical
+    return shapes of the mutators below.
+    """
+    last_busy: PalError | None = None
+    for attempt in range(BUDGET_TXN_RETRIES):
+        try:
+            with writer_fence(home):
+                ledger = load_ledger(home)
+                result = mutate(ledger)
+                save_ledger(home, ledger)
+            return ledger if result is None else result
+        except PalError as exc:
+            if exc.code != "WRITER_BUSY":
+                raise
+            # A competing writer holds the fence for one short transaction.
+            # Wait and retry rather than drop the charge; a persistently wedged
+            # fence still surfaces WRITER_BUSY to the caller after the bound.
+            last_busy = exc
+            if attempt < BUDGET_TXN_RETRIES - 1:
+                time.sleep(BUDGET_TXN_RETRY_DELAY_SECONDS)
+    assert last_busy is not None
+    raise last_busy
 
 
 def ledger_problems(payload: object) -> list[str]:
@@ -224,25 +283,26 @@ def record_consumption(
     output_tokens: int = 0,
 ) -> dict:
     """Charge the durable window. One transport attempt == one charge."""
-    ledger = load_ledger(home)
     now = time.time() if now is None else float(now)
-    last_seen = ledger.get("last_seen_wall")
-    if isinstance(last_seen, (int, float)) and now < float(last_seen) - CLOCK_SKEW_SECONDS:
-        # Wall time moved backwards: freeze conservatively. Budget is never
-        # granted by suspicious clock movement.
-        ledger["rollback_freeze"] = True
-    elif ledger.get("rollback_freeze") and _rollback_recovered(ledger, now):
-        # W2-003: trusted wall time has caught up with the high-water mark;
-        # reconcile the freeze instead of requiring an operator to edit state.
-        ledger["rollback_freeze"] = False
-    ledger["last_seen_wall"] = max(now, float(last_seen or now))
-    window = _window(ledger, now)
-    window["model_attempts"] += int(model_attempts)
-    window["units"] += int(units)
-    window["input_tokens"] += int(input_tokens)
-    window["output_tokens"] += int(output_tokens)
-    save_ledger(home, ledger)
-    return ledger
+
+    def _apply(ledger: dict) -> None:
+        last_seen = ledger.get("last_seen_wall")
+        if isinstance(last_seen, (int, float)) and now < float(last_seen) - CLOCK_SKEW_SECONDS:
+            # Wall time moved backwards: freeze conservatively. Budget is never
+            # granted by suspicious clock movement.
+            ledger["rollback_freeze"] = True
+        elif ledger.get("rollback_freeze") and _rollback_recovered(ledger, now):
+            # W2-003: trusted wall time has caught up with the high-water mark;
+            # reconcile the freeze instead of requiring an operator to edit state.
+            ledger["rollback_freeze"] = False
+        ledger["last_seen_wall"] = max(now, float(last_seen or now))
+        window = _window(ledger, now)
+        window["model_attempts"] += int(model_attempts)
+        window["units"] += int(units)
+        window["input_tokens"] += int(input_tokens)
+        window["output_tokens"] += int(output_tokens)
+
+    return mutate_ledger(home, _apply)
 
 
 def window_usage(home: Path | str, now: float | None = None) -> dict:
@@ -297,13 +357,30 @@ def budget_allows(
 
 
 def _config_digest(home: Path | str) -> str:
-    from .config import analyst_config_path
+    """What an AUTH latch is pinned to: the config AND the credential verdict.
+
+    "An AUTH open stays until the config materially changes" -- and the bytes are
+    not the whole material. Exporting the variable a config names changes the
+    verdict without touching the file, and a policy that moves the verdict (a
+    loopback endpoint does not need a credential) changes it the other way. Pinning
+    the latch to the verdict is what lets a stale open clear itself instead of
+    outliving the condition it was opened for.
+    """
+    from .config import analyst_config_path, credential_verdict, load_analyst_config
 
     path = analyst_config_path(home)
     try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
+        digest = hashlib.sha256(path.read_bytes())
     except OSError:
         return ""
+    status, config, _detail = load_analyst_config(home)
+    if status == "ok" and isinstance(config, dict):
+        credential_ok, credential_detail = credential_verdict(config)
+        verdict = "allowed" if credential_ok else f"refused:{credential_detail}"
+    else:
+        verdict = f"unusable:{status}"
+    digest.update(b"|" + verdict.encode("utf-8"))
+    return digest.hexdigest()
 
 
 def backend_circuit(home: Path | str) -> dict:
@@ -333,25 +410,26 @@ def circuit_allows(home: Path | str, *, now: float | None = None) -> tuple[bool,
 
 
 def record_backend_success(home: Path | str) -> dict:
-    ledger = load_ledger(home)
-    circuit = ledger.setdefault(
-        "backend_circuit",
-        {
-            "state": CIRCUIT_CLOSED,
-            "consecutive_failures": 0,
-            "opened_at": None,
-            "open_until": None,
-            "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
-            "failure_class": None,
-            "config_digest": None,
-        },
-    )
-    circuit["state"] = CIRCUIT_CLOSED
-    circuit["consecutive_failures"] = 0
-    circuit["open_until"] = None
-    circuit["failure_class"] = None
-    save_ledger(home, ledger)
-    return circuit
+    def _apply(ledger: dict) -> dict:
+        circuit = ledger.setdefault(
+            "backend_circuit",
+            {
+                "state": CIRCUIT_CLOSED,
+                "consecutive_failures": 0,
+                "opened_at": None,
+                "open_until": None,
+                "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
+                "failure_class": None,
+                "config_digest": None,
+            },
+        )
+        circuit["state"] = CIRCUIT_CLOSED
+        circuit["consecutive_failures"] = 0
+        circuit["open_until"] = None
+        circuit["failure_class"] = None
+        return circuit
+
+    return mutate_ledger(home, _apply)
 
 
 #: W2-004: circuit policy is driven by the FAILURE CLASS, not a Boolean.
@@ -372,65 +450,81 @@ def record_backend_failure(
     now: float | None = None,
 ) -> dict:
     """One transport/backend failure. Semantic output failures never land here."""
-    ledger = load_ledger(home)
-    circuit = ledger.setdefault(
-        "backend_circuit",
-        {
-            "state": CIRCUIT_CLOSED,
-            "consecutive_failures": 0,
-            "opened_at": None,
-            "open_until": None,
-            "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
-            "failure_class": None,
-            "config_digest": None,
-        },
-    )
     now = time.time() if now is None else float(now)
-    circuit["consecutive_failures"] = int(circuit.get("consecutive_failures") or 0) + 1
-    circuit["failure_class"] = failure_class
 
-    if circuit["state"] == CIRCUIT_HALF_OPEN and not retryable:
-        # A probe that failed re-trips with a longer open window.
-        pass
-
-    consecutive = int(circuit["consecutive_failures"])
-    opened_now = False
-    if failure_class in CIRCUIT_GLOBAL_CLASSES:
-        # AUTH/config: open until the configuration materially changes.
-        circuit["state"] = CIRCUIT_OPEN
-        circuit["opened_at"] = now
-        circuit["open_until"] = None
-        circuit["config_digest"] = _config_digest(home)
-        opened_now = True
-    elif failure_class in CIRCUIT_TIMED_CLASSES and consecutive >= CIRCUIT_TRIP_THRESHOLD:
-        open_seconds = min(
-            float(circuit.get("open_seconds") or CIRCUIT_BASE_OPEN_SECONDS),
-            CIRCUIT_MAX_OPEN_SECONDS,
+    def _apply(ledger: dict) -> dict:
+        circuit = ledger.setdefault(
+            "backend_circuit",
+            {
+                "state": CIRCUIT_CLOSED,
+                "consecutive_failures": 0,
+                "opened_at": None,
+                "open_until": None,
+                "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
+                "failure_class": None,
+                "config_digest": None,
+            },
         )
-        circuit["state"] = CIRCUIT_OPEN
-        circuit["opened_at"] = now
-        circuit["open_until"] = now + open_seconds
-        circuit["open_seconds"] = min(open_seconds * 2, CIRCUIT_MAX_OPEN_SECONDS)
-        opened_now = True
-    # elif PERMANENT/LIMIT: job-scoped only. `_transport_failure` already
-    # blocks the affected job; the global circuit stays CLOSED so one bad
-    # request or one oversized response can never freeze unrelated work.
-    if not opened_now and circuit["state"] == CIRCUIT_OPEN and failure_class in CIRCUIT_TIMED_CLASSES:
-        circuit["state"] = CIRCUIT_OPEN
-    save_ledger(home, ledger)
-    return circuit
+        circuit["consecutive_failures"] = int(circuit.get("consecutive_failures") or 0) + 1
+        circuit["failure_class"] = failure_class
+
+        if circuit["state"] == CIRCUIT_HALF_OPEN and not retryable:
+            # A probe that failed re-trips with a longer open window.
+            pass
+
+        consecutive = int(circuit["consecutive_failures"])
+        opened_now = False
+        if failure_class in CIRCUIT_GLOBAL_CLASSES:
+            # AUTH/config: open until the configuration materially changes.
+            circuit["state"] = CIRCUIT_OPEN
+            circuit["opened_at"] = now
+            circuit["open_until"] = None
+            circuit["config_digest"] = _config_digest(home)
+            opened_now = True
+        elif failure_class in CIRCUIT_TIMED_CLASSES and consecutive >= CIRCUIT_TRIP_THRESHOLD:
+            open_seconds = min(
+                float(circuit.get("open_seconds") or CIRCUIT_BASE_OPEN_SECONDS),
+                CIRCUIT_MAX_OPEN_SECONDS,
+            )
+            circuit["state"] = CIRCUIT_OPEN
+            circuit["opened_at"] = now
+            circuit["open_until"] = now + open_seconds
+            circuit["open_seconds"] = min(open_seconds * 2, CIRCUIT_MAX_OPEN_SECONDS)
+            opened_now = True
+        # elif PERMANENT/LIMIT: job-scoped only. `_transport_failure` already
+        # blocks the affected job; the global circuit stays CLOSED so one bad
+        # request or one oversized response can never freeze unrelated work.
+        if not opened_now and circuit["state"] == CIRCUIT_OPEN and failure_class in CIRCUIT_TIMED_CLASSES:
+            circuit["state"] = CIRCUIT_OPEN
+        return circuit
+
+    return mutate_ledger(home, _apply)
 
 
 def circuit_probe_allowed(home: Path | str, *, now: float | None = None) -> dict:
     """Demote an expired OPEN to HALF_OPEN for one probe."""
-    ledger = load_ledger(home)
-    circuit = ledger.get("backend_circuit") or {}
     now = time.time() if now is None else float(now)
-    if circuit.get("state") == CIRCUIT_OPEN and circuit.get("open_until") is not None:
-        if float(circuit["open_until"]) <= now:
-            circuit["state"] = CIRCUIT_HALF_OPEN
-            save_ledger(home, ledger)
-    return circuit
+    # Read first: only a real OPEN->HALF_OPEN transition takes the writer fence,
+    # so the common case (nothing due) stays a lock-free read and cannot contend
+    # with a concurrent consumption/circuit mutation.
+    circuit = load_ledger(home).get("backend_circuit") or {}
+    if not (
+        circuit.get("state") == CIRCUIT_OPEN
+        and circuit.get("open_until") is not None
+        and float(circuit["open_until"]) <= now
+    ):
+        return dict(circuit)
+
+    def _apply(ledger: dict) -> dict:
+        live = ledger.get("backend_circuit") or {}
+        # Re-check under the fence: another writer may have moved the circuit
+        # since the unlocked read above.
+        if live.get("state") == CIRCUIT_OPEN and live.get("open_until") is not None:
+            if float(live["open_until"]) <= now:
+                live["state"] = CIRCUIT_HALF_OPEN
+        return live
+
+    return mutate_ledger(home, _apply)
 
 
 # ---------------------------------------------------------------------------
@@ -473,72 +567,75 @@ def record_source_failure(
     now: float | None = None,
 ) -> dict:
     """One source dispatch failure. Configuration changes reset the poison."""
-    ledger = load_ledger(home)
-    circuits = ledger.setdefault("source_circuits", {})
-    circuit = circuits.get(source_id)
-    if circuit is None:
-        circuit = {
-            "state": CIRCUIT_CLOSED,
-            "consecutive_failures": 0,
-            "opened_at": None,
-            "open_until": None,
-            "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
-            "failure_class": failure_class,
-            "config_digest": config_digest,
-        }
-        circuits[source_id] = circuit
-    if config_digest is not None and circuit.get("config_digest") not in (
-        None,
-        config_digest,
-    ):
-        # Material configuration change: the old poison never blocks the new
-        # configuration. The failure count starts over for the new identity.
-        circuit["state"] = CIRCUIT_CLOSED
-        circuit["consecutive_failures"] = 0
-        circuit["open_until"] = None
     now = time.time() if now is None else float(now)
-    circuit["consecutive_failures"] = int(circuit.get("consecutive_failures") or 0) + 1
-    circuit["failure_class"] = failure_class
-    if config_digest is not None:
-        circuit["config_digest"] = config_digest
-    if detail:
-        circuit["detail"] = detail[:200]
-    consecutive = int(circuit["consecutive_failures"])
-    if failure_class == SOURCE_FAILURE_CONFIGURATION:
-        # A known-invalid configuration stays open: it is recovered only by a
-        # material config change (digest above) or an explicit operator
-        # correction on the filesystem -- never by polling the dead path.
-        circuit["state"] = CIRCUIT_OPEN
-        circuit["opened_at"] = now
-        circuit["open_until"] = None
-    elif consecutive >= CIRCUIT_TRIP_THRESHOLD:
-        open_seconds = min(
-            float(circuit.get("open_seconds") or CIRCUIT_BASE_OPEN_SECONDS),
-            CIRCUIT_MAX_OPEN_SECONDS,
-        )
-        circuit["state"] = CIRCUIT_OPEN
-        circuit["opened_at"] = now
-        circuit["open_until"] = now + open_seconds
-        circuit["open_seconds"] = min(open_seconds * 2, CIRCUIT_MAX_OPEN_SECONDS)
-    save_ledger(home, ledger)
-    return circuit
+
+    def _apply(ledger: dict) -> dict:
+        circuits = ledger.setdefault("source_circuits", {})
+        circuit = circuits.get(source_id)
+        if circuit is None:
+            circuit = {
+                "state": CIRCUIT_CLOSED,
+                "consecutive_failures": 0,
+                "opened_at": None,
+                "open_until": None,
+                "open_seconds": CIRCUIT_BASE_OPEN_SECONDS,
+                "failure_class": failure_class,
+                "config_digest": config_digest,
+            }
+            circuits[source_id] = circuit
+        if config_digest is not None and circuit.get("config_digest") not in (
+            None,
+            config_digest,
+        ):
+            # Material configuration change: the old poison never blocks the new
+            # configuration. The failure count starts over for the new identity.
+            circuit["state"] = CIRCUIT_CLOSED
+            circuit["consecutive_failures"] = 0
+            circuit["open_until"] = None
+        circuit["consecutive_failures"] = int(circuit.get("consecutive_failures") or 0) + 1
+        circuit["failure_class"] = failure_class
+        if config_digest is not None:
+            circuit["config_digest"] = config_digest
+        if detail:
+            circuit["detail"] = detail[:200]
+        consecutive = int(circuit["consecutive_failures"])
+        if failure_class == SOURCE_FAILURE_CONFIGURATION:
+            # A known-invalid configuration stays open: it is recovered only by a
+            # material config change (digest above) or an explicit operator
+            # correction on the filesystem -- never by polling the dead path.
+            circuit["state"] = CIRCUIT_OPEN
+            circuit["opened_at"] = now
+            circuit["open_until"] = None
+        elif consecutive >= CIRCUIT_TRIP_THRESHOLD:
+            open_seconds = min(
+                float(circuit.get("open_seconds") or CIRCUIT_BASE_OPEN_SECONDS),
+                CIRCUIT_MAX_OPEN_SECONDS,
+            )
+            circuit["state"] = CIRCUIT_OPEN
+            circuit["opened_at"] = now
+            circuit["open_until"] = now + open_seconds
+            circuit["open_seconds"] = min(open_seconds * 2, CIRCUIT_MAX_OPEN_SECONDS)
+        return circuit
+
+    return mutate_ledger(home, _apply)
 
 
 def record_source_success(
     home: Path | str, source_id: str, *, config_digest: str | None = None
 ) -> dict:
-    ledger = load_ledger(home)
-    circuits = ledger.setdefault("source_circuits", {})
-    circuit = circuits.get(source_id)
-    if circuit is not None:
-        circuit["state"] = CIRCUIT_CLOSED
-        circuit["consecutive_failures"] = 0
-        circuit["open_until"] = None
-        circuit["failure_class"] = None
-        if config_digest is not None:
-            circuit["config_digest"] = config_digest
-    save_ledger(home, ledger)
-    return circuit or {}
+    def _apply(ledger: dict) -> dict:
+        circuits = ledger.setdefault("source_circuits", {})
+        circuit = circuits.get(source_id)
+        if circuit is not None:
+            circuit["state"] = CIRCUIT_CLOSED
+            circuit["consecutive_failures"] = 0
+            circuit["open_until"] = None
+            circuit["failure_class"] = None
+            if config_digest is not None:
+                circuit["config_digest"] = config_digest
+        return circuit or {}
+
+    return mutate_ledger(home, _apply)
 
 
 def source_circuits(home: Path | str) -> dict:
@@ -574,6 +671,7 @@ def source_circuit_allows(
         # new configuration.
         return True, ""
     now = time.time() if now is None else float(now)
+    source_id = str(source.get("id") or "")
     open_until = circuit.get("open_until")
     if open_until is None:
         # CONFIGURATION-class open: recover only through an operator
@@ -590,11 +688,30 @@ def source_circuit_allows(
                 f"source circuit OPEN after {circuit.get('failure_class')}; "
                 "fix the configuration or restore the path to half-open it",
             )
-        circuit["state"] = CIRCUIT_HALF_OPEN
-        save_ledger(home, ledger)
+        _demote_source_half_open(home, source_id, digest)
         return True, ""
     if float(open_until) > now:
         return False, f"source circuit OPEN until {float(open_until):.0f}"
-    circuit["state"] = CIRCUIT_HALF_OPEN
-    save_ledger(home, ledger)
+    _demote_source_half_open(home, source_id, digest)
     return True, ""
+
+
+def _demote_source_half_open(home: Path | str, source_id: str, digest: str) -> None:
+    """OPEN->HALF_OPEN for one source, under the common budget transaction.
+
+    A due/recovered source circuit is demoted so exactly one probe runs. The
+    transition shares budget.json with consumption and the backend circuit, so
+    it must serialize with them (T-138) instead of doing its own unlocked save.
+    The circuit is re-checked under the fence: another writer may have already
+    moved it since the caller's unlocked read.
+    """
+
+    def _apply(ledger: dict) -> None:
+        circuit = (ledger.get("source_circuits") or {}).get(source_id)
+        if not isinstance(circuit, dict) or circuit.get("state") != CIRCUIT_OPEN:
+            return
+        if circuit.get("config_digest") not in (None, digest):
+            return
+        circuit["state"] = CIRCUIT_HALF_OPEN
+
+    mutate_ledger(home, _apply)

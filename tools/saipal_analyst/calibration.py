@@ -27,7 +27,12 @@ from saipal_engine.sessions import STATUS_UNRECOVERABLE, load_index
 
 from . import backend as backend_mod
 from . import jobs as jobs_mod
-from .config import egress_verdict, load_analyst_config, endpoint_is_local
+from .config import (
+    credential_verdict,
+    egress_verdict,
+    endpoint_is_local,
+    load_analyst_config,
+)
 from .worker import WorkerClock, investigate
 
 CALIBRATION_SCHEMA_VERSION = 1
@@ -47,12 +52,12 @@ def configuration_gate(home: Path | str, sample_units: int | None) -> tuple[bool
     backend = config.get("backend") or {}
     if not backend.get("model"):
         return False, "backend.model is not configured"
-    api_key_env = backend.get("api_key_env")
-    if api_key_env and not endpoint_is_local(str(backend.get("endpoint") or "")):
-        import os
-
-        if not os.environ.get(api_key_env):
-            return False, f"API key environment variable {api_key_env!r} is not set"
+    credential_ok, credential_detail = credential_verdict(config)
+    if not credential_ok:
+        # Same rule the transport enforces, from the same function: a preflight
+        # that disagrees with the transport is a backend that either refuses work
+        # it could do, or promises work it will refuse.
+        return False, credential_detail
     allowed, egress_detail = egress_verdict(config)
     if not allowed:
         return False, egress_detail

@@ -19,6 +19,7 @@ analyzed agent's store.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -68,6 +69,9 @@ PROTOCOL_SHORTCUTS = frozenset(
     }
 )
 
+#: SAIPAL exclusive shortcut (T-164). Distinct from SAIPEN protocol shortcuts.
+SAIPAL_SHORTCUTS = frozenset({"pal"})
+
 #: Shortcuts that legally carry an opaque payload after the key (CORE.md 1.10's
 #: control-shortcut payload rule). Whole-token recognition only: `ff topbar` is
 #: focus with a payload, `ffmpeg` is not a shortcut.
@@ -103,6 +107,8 @@ def protocol_command(text: str) -> str | None:
             return None
         return " ".join([first] + head[1:])
     if len(head) == 1 and first in PROTOCOL_SHORTCUTS:
+        return first
+    if len(head) == 1 and first in SAIPAL_SHORTCUTS:
         return first
     if len(head) > 1 and first in PAYLOAD_SHORTCUTS:
         return " ".join([first] + head[1:])
@@ -202,38 +208,48 @@ def _split_ref(file_path: str) -> tuple[Path, str]:
 
 
 def identity(file_path: str) -> str:
+    """A digest of the session's complete ordered part history.
+
+    PERF-004 (SRC-011): the probe used to `fetchall()` the whole result set and
+    then build a second lifetime-sized string with `"".join(...)` before hashing
+    -- peak Python allocation grew linearly with provider history for an
+    operation that only needs one digest. It now iterates the ordered cursor and
+    feeds each canonical JSON fragment straight into an incremental SHA-256,
+    byte-for-byte compatible with the previous concatenation.
+    """
     home, session_id = _split_ref(file_path)
     try:
         con = _open_db(home)
     except sqlite3.Error:
         return sha256_text(file_path)
+    digest = hashlib.sha256()
+    empty = True
     try:
         cur = con.cursor()
-        data = cur.execute(
+        for row in cur.execute(
             "SELECT id, session_id, message_id, time_created, data FROM part "
             "WHERE session_id=? ORDER BY time_created, id",
             (session_id,),
-        ).fetchall()
+        ):
+            empty = False
+            fragment = json.dumps(
+                {
+                    "part_id": row[0],
+                    "session_id": row[1],
+                    "message_id": row[2],
+                    "time_created": row[3],
+                    "data": row[4],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+            digest.update(fragment.encode("utf-8"))
     except sqlite3.Error:
         return sha256_text(file_path)
     finally:
         con.close()
-    blob = "".join(
-        json.dumps(
-            {
-                "part_id": row[0],
-                "session_id": row[1],
-                "message_id": row[2],
-                "time_created": row[3],
-                "data": row[4],
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-        )
-        for row in data
-    )
-    return sha256_text(blob) if blob else sha256_text(file_path)
+    return digest.hexdigest() if not empty else sha256_text(file_path)
 
 
 def stable_watermark(file_path: str) -> int:
@@ -638,6 +654,11 @@ def normalize(file_path: str) -> dict:
             if canonical is not None and role != "assistant":
                 # a user-typed protocol command: the real carrier surface
                 seq += 1
+                cmd_protocol = (
+                    "saipal"
+                    if (canonical in SAIPAL_SHORTCUTS or canonical == "saipal" or canonical.startswith("saipal "))
+                    else "saipen"
+                )
                 events.append(
                     _event(
                         seq,
@@ -647,6 +668,7 @@ def normalize(file_path: str) -> dict:
                             {
                                 "canonical": canonical,
                                 "role": role,
+                                "protocol": cmd_protocol,
                                 "opencode_type": "text",
                             }
                         ),
@@ -677,6 +699,11 @@ def normalize(file_path: str) -> dict:
             if tool in TOOL_COMMANDS and canonical is not None:
                 # a real protocol command, routed through a shell tool
                 seq += 1
+                cmd_protocol = (
+                    "saipal"
+                    if (canonical in SAIPAL_SHORTCUTS or canonical == "saipal" or canonical.startswith("saipal "))
+                    else "saipen"
+                )
                 events.append(
                     _event(
                         seq,
@@ -686,6 +713,7 @@ def normalize(file_path: str) -> dict:
                             {
                                 "canonical": canonical,
                                 "tool": tool,
+                                "protocol": cmd_protocol,
                                 "status": status,
                                 "opencode_type": "tool",
                             }

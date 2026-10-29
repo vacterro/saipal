@@ -2,7 +2,7 @@
 
 from .capability import require_action
 from .errors import PalError
-from .paths import atomic_write_json, home_paths, read_json
+from .paths import FINDINGS_DIR, atomic_write_json, confined_mkdir, home_paths, read_json
 from .registry import load_registry, require_string_list
 from . import causal as causal_mod
 
@@ -213,6 +213,11 @@ def save_index(home, index, *, registry=None):
                        "refusing to write an invalid findings index: " + "; ".join(probs),
                        next_action="the existing index was left untouched")
     p = home_paths(home)
+    # TARGET B2 (T-125): the findings directory is materialized EXPLICITLY by
+    # its owner. `atomic_write_json` writes only into an already-authorized
+    # existing parent and never recreates missing parents; an indirection
+    # refuses with zero external mutation.
+    confined_mkdir(p.root, FINDINGS_DIR)
     atomic_write_json(p.findings_index, index, root=p.root)
     return index
 

@@ -8,6 +8,11 @@ sink, got no error worth noticing, and audits kept piling up in local staging.
 
 Config is now one transaction, shadow review is an explicit flag, and publication
 is proved by a real file arriving in a real maintainer inbox.
+
+T-109: the production gate is proof-based. These end-to-end publish controls mint
+a readiness proof through `mint_readiness_for_tests` — the same durable
+attestation the convergence review writes — so every control here exercises the
+real gate instead of an assertion-era bypass.
 """
 
 from __future__ import annotations
@@ -33,6 +38,19 @@ def _maintainer(root: Path) -> Path:
     return root
 
 
+def _enable_production(home: Path, sink: Path) -> None:
+    """Mint the durable readiness proof, then enable publication once."""
+    from saipal_engine import readiness as readiness_mod
+    from saipal_engine.sink import AuditSink
+
+    readiness_mod.mint_readiness_for_tests(home, sink=AuditSink(home, root=sink))
+    code, payload, err = support.run_saipal_json(
+        "setup", "--sink", str(sink), "--mode", "PUBLISH_ENABLED",
+        "--shadow-reviewed", home=home,
+    )
+    assert code == 0, (code, payload, err)
+
+
 class SetupIsOneTransaction(unittest.TestCase):
     """Mode + sink in one command must succeed; a bad argument must change nothing."""
 
@@ -52,16 +70,28 @@ class SetupIsOneTransaction(unittest.TestCase):
         return config
 
     def test_publish_enabled_is_reachable_in_one_command(self) -> None:
-        """The regression this ticket exists for."""
-        code, payload, err = support.run_saipal_json(
-            "setup", "--sink", str(self.sink), "--mode", "PUBLISH_ENABLED",
-            "--shadow-reviewed", home=self.home,
-        )
-        self.assertEqual(code, 0, err)
+        """The regression this ticket exists for.
+
+        T-109: reachable only WITH the durable readiness proof; without it the
+        same command is refused with zero writes.
+        """
+        _enable_production(self.home, self.sink)
         config = self.config()
         self.assertEqual(config["publication_mode"], "PUBLISH_ENABLED")
         self.assertTrue(config["shadow_reviewed"])
         self.assertEqual(config["sink"]["root"], str(self.sink))
+
+    def test_publish_enabled_without_readiness_is_refused(self) -> None:
+        """T-109 control A/B: shadow_reviewed + valid sink is not authority."""
+        before = self.config()
+        code, payload, _err = support.run_saipal_json(
+            "setup", "--sink", str(self.sink), "--mode", "PUBLISH_ENABLED",
+            "--shadow-reviewed", home=self.home,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["code"], "PUBLICATION_GATE_CLOSED")
+        self.assertIn("readiness", payload["message"])
+        self.assertEqual(self.config(), before, "refusal must be zero-write")
 
     def test_publish_enabled_without_shadow_review_is_refused(self) -> None:
         code, payload, _err = support.run_saipal_json(
@@ -95,10 +125,7 @@ class SetupIsOneTransaction(unittest.TestCase):
         self.assertEqual(self.config(), before)
 
     def test_shadow_review_can_be_withdrawn(self) -> None:
-        support.run_saipal_json(
-            "setup", "--sink", str(self.sink), "--mode", "PUBLISH_ENABLED",
-            "--shadow-reviewed", home=self.home,
-        )
+        _enable_production(self.home, self.sink)
         code, payload, _err = support.run_saipal_json(
             "setup", "--no-shadow-reviewed", home=self.home
         )
@@ -181,7 +208,11 @@ class SinkPreflight(unittest.TestCase):
 
 
 class PublishEndToEnd(unittest.TestCase):
-    """An audit reaches the maintainer inbox; the bookkeeping never does."""
+    """An audit reaches the maintainer inbox; the bookkeeping never does.
+
+    T-109: the production gate is proof-based. End-to-end publication now
+    requires a durable readiness proof minted for the reviewed sink.
+    """
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -189,11 +220,7 @@ class PublishEndToEnd(unittest.TestCase):
         self.home = support.make_home(self.tmp)
         support.run_saipal("continue", home=self.home)
         self.sink = _maintainer(self.tmp / "maintainer")
-        code, _payload, err = support.run_saipal_json(
-            "setup", "--sink", str(self.sink), "--mode", "PUBLISH_ENABLED",
-            "--shadow-reviewed", home=self.home,
-        )
-        self.assertEqual(code, 0, err)
+        _enable_production(self.home, self.sink)
         support.put_inbox(self.home, DRIFT)
 
     def tearDown(self) -> None:

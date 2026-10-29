@@ -108,6 +108,33 @@ class _BudgetStop(Exception):
         super().__init__(detail)
 
 
+def _account(op, what: str) -> None:
+    """Run one authoritative budget-ledger mutation or STOP the loop (T-138).
+
+    Budget accounting is not optional telemetry: a model call that has occurred
+    but whose attempt/unit accounting is silently discarded is a budget bypass.
+    The previous `except PalError: pass` around every ledger mutation turned a
+    lost UPDATE into a lost CHARGE the moment the transaction was serialized --
+    a competing writer's WRITER_BUSY was swallowed and the loop kept spending.
+
+    So a persistence failure here is fatal to the slice, not ignored: it becomes
+    a `_BudgetStop`, which the loop turns into a structured BUDGET_EXHAUSTED stop
+    with the durable job stage already recorded. No further transport is admitted
+    while durable accounting is unavailable. `budgets.mutate_ledger` already
+    retries a transient competing writer, so this fires only when the ledger is
+    genuinely unwritable or the fence is wedged -- exactly when the loop must
+    stop rather than run up an unaccounted bill.
+    """
+    try:
+        op()
+    except PalError as exc:
+        raise _BudgetStop(
+            f"authoritative budget accounting failed ({what}): "
+            f"{exc.message or exc}; no further model transport is admitted "
+            "while the durable ledger is unavailable"
+        ) from exc
+
+
 @dataclass(frozen=True)
 class _Validation:
     """Closed outcome of parsing/validating one role's raw response.
@@ -227,9 +254,31 @@ def investigate(  # noqa: C901
             reconciliation = provenance_mod.reconcile_provenance(root)
             if reconciliation.get("reconciled"):
                 summary["provenance_reconciled"] = reconciliation["reconciled"]
+            # PERF-004 (SRC-004): compact DONE jobs whose receipt AND
+            # provenance are durably settled. Recovery has already run, so no
+            # compactable job is still needed for restart guarantees; ambiguous
+            # pre-DONE jobs are never touched.
+            ledger_snapshot = provenance_mod.load_ledger(root)
+            receipts = {
+                str(record.get("receipt_id"))
+                for record in (ledger_snapshot.get("records") or {}).values()
+                if isinstance(record, dict) and record.get("receipt_id")
+            }
         except PalError as exc:
             summary["errors"].append(
                 {"code": "PROVENANCE_RECONCILE_FAILED", "detail": str(exc.message or exc)}
+            )
+            receipts = set()
+        try:
+            journal_for_compact = jobs_mod.load_journal(root)
+            compacted = jobs_mod.compact_done_jobs(
+                journal_for_compact, root, provenance_receipts=receipts
+            )
+            if compacted:
+                summary["jobs_compacted"] = compacted
+        except PalError as exc:
+            summary["errors"].append(
+                {"code": "JOURNAL_COMPACTION_FAILED", "detail": str(exc.message or exc)}
             )
         result = _loop(
             summary,
@@ -334,6 +383,11 @@ def _classify_unit(
         # Conditional block whose condition resolved: re-eligible now, at a
         # NORMAL current-work queue position (ROLE 7).
         return "RUNNABLE_FINAL" if finality == "FINAL" else "RUNNABLE_PROVISIONAL"
+    if job is not None and job.get("stage") == jobs_mod.REMOTE_OUTCOME_UNKNOWN:
+        # W2-005: this attempt needs explicit resolution. Treating it as fresh
+        # work repeatedly re-enters _drive_unit, which correctly refuses to
+        # replay it but then starves every later runnable claim in the queue.
+        return "REMOTE_OUTCOME_UNKNOWN"
     if job is not None and job.get("stage") in _TERMINAL:
         return "TERMINAL"
     if job is not None and job.get("stage") == jobs_mod.RETRY_WAIT:
@@ -398,6 +452,15 @@ def _allocate(  # noqa: C901
     classifications: dict[str, str] = {}
     for sid, rec in records_by_session.items():
         classifications[sid] = _classify_unit(rec, event_limit, journal, provisional, wall_now)
+    # The allocation answer, made countable. "nothing to do" and "nothing I am
+    # ALLOWED or ABLE to do" are different facts, and only the class counts tell
+    # them apart: 425 unbound sessions and 129 provisional-disabled ones are a
+    # backlog an operator decision moves, not an empty queue.
+    population: dict[str, int] = {}
+    for klass in classifications.values():
+        population[klass] = population.get(klass, 0) + 1
+    summary["population_classes"] = population
+    summary["population_size"] = len(classifications)
 
     eligible_digests: dict[str, str] = {}
     for session_id, record in records_by_session.items():
@@ -472,7 +535,9 @@ def _allocate(  # noqa: C901
             elif cls == "WAITING_RETRY":
                 only_future_retry = True
                 only_provisional = False
-            elif cls in ("TERMINAL", "DONE", "STALE"):
+            elif cls in ("TERMINAL", "DONE", "STALE", "REMOTE_OUTCOME_UNKNOWN"):
+                # Unknown paid outcomes are durable operator work, not a
+                # runnable claim. Retire the fairness ticket without replaying.
                 only_provisional = False
             elif cls == "PROVISIONAL_DISABLED":
                 pass
@@ -706,7 +771,27 @@ def _loop(  # noqa: C901
                 return _stop(summary, "RETRY_WAIT", "eligible work exists only as a future retry; stopping until its time is due")
             blocked_recorded = summary["jobs_blocked_binding"] + summary["jobs_blocked"] > 0
             if blocked_recorded:
-                return _stop(summary, "BLOCKED", "no eligible unit remains; blocked units are recorded in the journal")
+                # STRUCTURED, not prose: the allocator has exhausted the eligible
+                # set and only blocked units are left. A caller (cpall) must be
+                # able to tell that apart from "this unit happened to fail", so it
+                # can reach a truthful terminal state instead of reporting a
+                # runnable backlog that can never converge.
+                summary["no_eligible_unit"] = True
+                # The run's own stop reason stays BLOCKED (the operator-facing
+                # class of the population is named in the detail, where it cannot
+                # silently change what a caller reads as the top-level outcome).
+                return _stop(
+                    summary,
+                    "BLOCKED",
+                    "no eligible unit remains; blocked units are recorded in the "
+                    f"journal ({summary['jobs_blocked']} backend/output, "
+                    f"{summary['jobs_blocked_binding']} binding)",
+                )
+            # The allocator examined the whole indexed population: nothing is
+            # runnable and no blocked unit was recorded in THIS run. Structured,
+            # because a caller must be able to combine it with its own count of
+            # units that still lack a verdict.
+            summary["no_analyzable_unit"] = True
             return _stop(summary, "IDLE", note or "no analyzable episode is pending")
 
         carrier = carrier_mod.build_carrier(
@@ -751,24 +836,63 @@ def _loop(  # noqa: C901
         if outcome == "RETRY_WAIT":
             continue
         summary["units"] += 1
-        try:
-            from . import budgets as budgets_mod
+        # The semantic-unit charge is authoritative durable accounting (T-138):
+        # a silently dropped unit lets an unattended loop under-count its own
+        # spend. A persistence failure STOPS the slice rather than continuing to
+        # spend model calls with the ledger unavailable.
+        from . import budgets as budgets_mod
 
-            budgets_mod.record_consumption(root, units=1)
-        except PalError:
-            pass
-        if outcome in ("BLOCKED", "BLOCKED_BINDING"):
-            reason = "BLOCKED" if outcome == "BLOCKED" else "BLOCKED_BINDING"
-            note = (
-                "backend or output failure blocked the unit; the journal records it"
-                if outcome == "BLOCKED"
-                else "historical binding is insufficient; the unit is recorded and revisited when authority improves"
+        try:
+            _account(
+                lambda: budgets_mod.record_consumption(root, units=1),
+                "semantic unit",
             )
-            return _stop(summary, reason, note)
+        except _BudgetStop as stop:
+            return _stop(summary, "BUDGET_EXHAUSTED", stop.detail)
+        if outcome in ("BLOCKED", "BLOCKED_BINDING"):
+            # A blocked unit is a property of THAT unit, exactly as a CONFLICT is a
+            # property of one session: the job is already durable (stage BLOCKED /
+            # BLOCKED_BINDING), so the next allocation cannot pick it again. Ending
+            # the whole slice here made one inadmissible model response -- or one
+            # unbound session -- cost every other eligible session its turn, which
+            # is the same global freeze PAL-CPALL-03 forbids between families.
+            # The run still stops as BLOCKED once nothing eligible remains; that
+            # decision belongs to the `unit is None` branch below, whose note names
+            # the recorded units.
+            if outcome == "BLOCKED":
+                summary["units_blocked_output"] = summary.get("units_blocked_output", 0) + 1
+            else:
+                summary["units_blocked_binding"] = summary.get("units_blocked_binding", 0) + 1
+            continue
         if outcome == "STALE":
             continue
 
-    return _stop(summary, "BUDGET_EXHAUSTED", f"unit budget {limit} reached")
+    # The unit budget is spent. Name what the run actually achieved: a run that
+    # judged nothing because its units were blocked must not read like an ordinary
+    # budget stop, and a run that DID judge units names the blocks beside them.
+    output_blocks = int(summary.get("units_blocked_output", 0))
+    binding_blocks = int(summary.get("units_blocked_binding", 0))
+    if not summary["jobs_completed"] and (output_blocks or binding_blocks):
+        if output_blocks:
+            return _stop(
+                summary,
+                "BLOCKED",
+                f"unit budget {limit} reached with {output_blocks} blocked unit(s) "
+                "and no judged unit; the journal records them",
+            )
+        return _stop(
+            summary,
+            "BLOCKED_BINDING",
+            f"unit budget {limit} reached with {binding_blocks} binding-blocked "
+            "unit(s) and no judged unit; the journal records them",
+        )
+    detail = f"unit budget {limit} reached"
+    if output_blocks or binding_blocks:
+        detail += (
+            f"; {output_blocks} unit(s) blocked by a backend or output failure and "
+            f"{binding_blocks} by insufficient binding (recorded in the journal)"
+        )
+    return _stop(summary, "BUDGET_EXHAUSTED", detail)
 
 
 def _earliest_retry(journal: dict) -> float | None:
@@ -1135,18 +1259,28 @@ def _drive_unit(  # noqa: C901
             # the kernel committed. A provenance failure never invalidates
             # the receipt -- it surfaces as a discrepancy and the journal
             # still proves the link for `reconcile_provenance`.
+            provenance_ok = False
             try:
                 from . import provenance as provenance_mod
 
                 provenance_mod.record_provenance(
                     root, provenance_mod.provenance_from_job(job)
                 )
+                provenance_ok = True
             except PalError as exc:
                 summary["errors"].append(
                     {"code": "PROVENANCE_WRITE_FAILED", "detail": str(exc.message or exc)}
                 )
             job["stage"] = jobs_mod.DONE
             _persist(root, journal, job)
+            # PERF-004 (SRC-004): the receipt is committed and provenance was
+            # just written -- the raw payloads are dead weight the moment DONE
+            # is durable. Compact THIS job immediately; jobs whose provenance
+            # write crashed stay raw until the next run start repairs and
+            # compacts them.
+            if provenance_ok:
+                jobs_mod.compact_done_job(job)
+                _persist(root, journal, job)
             summary["jobs_completed"] += 1
             summary["receipts"].append(
                 {
@@ -1241,8 +1375,11 @@ def _guarded_call(  # noqa: C901
     # process dies after the provider accepted the request but before the raw
     # response reaches the journal, the restart finds the attempt_id,
     # classifies the outcome REMOTE_OUTCOME_UNKNOWN, and never silently
-    # re-issues the same paid work under a fresh identity.
-    try:
+    # re-issues the same paid work under a fresh identity. This IS durable
+    # attempt accounting, so a persistence failure must PREVENT the transport
+    # (T-138): admitting the call with the identity unrecorded is exactly the
+    # crash-unsafe re-issue this marker exists to prevent. It is not swallowed.
+    def _mark_attempt() -> None:
         from saipal_analyst import jobs as jobs_mod
 
         attempt_id = jobs_mod.next_attempt_id(job, role, _digest(user))
@@ -1254,26 +1391,26 @@ def _guarded_call(  # noqa: C901
         jobs_mod.save_journal(home, fresh)
         job.pop("error_class", None)
         job.pop("error_detail", None)
-    except PalError:
-        pass  # the transport call itself may still fail; accounting is best-effort here
-    try:
-        reply = transport_mod.call(config, system=role_system, user=user, timeout=effective_timeout)
-    finally:
-        pass
+
+    _account(_mark_attempt, "pre-transport attempt identity")
+    reply = transport_mod.call(config, system=role_system, user=user, timeout=effective_timeout)
     if not reply.ok:
-        try:
-            budgets_mod.record_backend_failure(
+        # A failed transport is still one paid attempt. Both the circuit
+        # transition and the durable attempt charge are authoritative: if either
+        # cannot be persisted the loop STOPS (T-138) rather than swallowing the
+        # error and admitting another transport with the charge unaccounted.
+        _account(
+            lambda: budgets_mod.record_backend_failure(
                 home,
                 failure_class=reply.failure_class,
                 retryable=reply.failure_class == backend_mod.RETRYABLE,
-            )
-        except PalError:
-            pass
-        # A failed attempt is still an attempt: charged to the durable window.
-        try:
-            budgets_mod.record_consumption(home, model_attempts=1)
-        except PalError:
-            pass
+            ),
+            "backend failure circuit",
+        )
+        _account(
+            lambda: budgets_mod.record_consumption(home, model_attempts=1),
+            "failed model attempt",
+        )
         if reply.failure_class == backend_mod.RETRYABLE:
             summary["backend_retryable_failures"] += 1
             if reply.http_status == 429:
@@ -1288,10 +1425,10 @@ def _guarded_call(  # noqa: C901
             summary["backend_limits"] += 1
         return BackendFailure(reply)
 
-    try:
-        budgets_mod.record_backend_success(home)
-    except PalError:
-        pass
+    # The backend-success circuit reset is authoritative circuit state that
+    # shares budget.json with the consumption charge below; a lost reset would
+    # leave the circuit reporting stale failures. Persist it or STOP.
+    _account(lambda: budgets_mod.record_backend_success(home), "backend success circuit")
     summary["backend_successes"] += 1
     ledger.calls += 1
     usage_dict = reply.usage if isinstance(reply.usage, dict) else None
@@ -1301,15 +1438,18 @@ def _guarded_call(  # noqa: C901
     delta_in, delta_out = backend_mod.UsageLedger.usage_delta(usage_dict)
     ledger.absorb(usage_dict)
     summary.update(ledger.snapshot())
-    try:
-        budgets_mod.record_consumption(
+    # The paid attempt has occurred. Its durable charge (the attempt plus this
+    # reply's token delta) is authoritative: a lost charge is a budget bypass,
+    # so persistence failure STOPS the slice instead of admitting the next call.
+    _account(
+        lambda: budgets_mod.record_consumption(
             home,
             model_attempts=1,
             input_tokens=delta_in,
             output_tokens=delta_out,
-        )
-    except PalError:
-        pass
+        ),
+        "successful model attempt",
+    )
     return reply.text
 
 

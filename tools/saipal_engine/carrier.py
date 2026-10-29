@@ -12,6 +12,8 @@ performs zero writes -- the whole point is that `next` can be called freely.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 from . import bundle as bundle_mod
@@ -522,7 +524,9 @@ def build_carrier(
     source_ref = str(record.get("source_ref") or "")
     bundle_path = home_paths(root).session_inbox / Path(source_ref).name
     try:
-        bundle = bundle_mod.load_bundle_file(bundle_path, registry=data)
+        bundle = bundle_mod.load_bundle_file(
+            bundle_path, registry=data, expected_sha256=record.get("bundle_sha256")
+        )
     except (OSError, PalError):
         # The index knows the session but its canonical bundle is not readable
         # here. That is a real operator condition, not an exception path: the
@@ -552,10 +556,14 @@ def build_carrier(
         protocol, binding_status=protocol.get("binding_status"),
     )
 
+    # PERF-001 (SRC-004): the carrier already parses the canonical bundle for
+    # THIS slice; derive the bounded evidence locators from those events
+    # instead of reading a duplicated per-event projection from the session
+    # index. The index keeps compact metadata only.
     evidence_refs = [
-        entry
-        for entry in (record.get("evidence_refs") or [])
-        if _in_window(entry, episode, window)
+        {"seq": event["seq"], "evidence_ref": event["evidence_ref"]}
+        for event in events
+        if event.get("evidence_ref") is not None
     ][: limits["max_evidence_refs"]]
 
     return {
@@ -641,3 +649,84 @@ def carrier_problems(carrier: object, *, registry: dict | None = None) -> list[s
         for key in sorted(forbidden & set(event)):
             problems.append(f"events[{position}] carries forbidden raw key {key!r}")
     return problems
+
+
+# --------------------------------------------------------------------------- #
+# conflicts -- one canonical count, two explicitly named questions
+# --------------------------------------------------------------------------- #
+#
+# The 11-vs-12 defect this section exists to end: one reporting surface counted
+# `status == "CONFLICT"` over EVERY indexed record (historical generations
+# included) while another counted only the freshest generation per session.
+# Both were rendered as "conflicts", so the operator saw two numbers for one
+# word and no way to tell which one was a work item.
+#
+# They answer different questions and are now named differently:
+#
+#   current     the operator-facing population: freshest generation per
+#               session, the only generation analysis is offered for, and the
+#               one an operator can actually resolve;
+#   indexed     every conflict occurrence ever recorded, superseded generations
+#               included;
+#   superseded  indexed - current: history, never a second work item.
+#
+# Only `current` is a work item.
+
+#: Conflict material identity. Bumping this changes every conflict digest, which
+#: deliberately invalidates persisted triage dispositions: a digest-scheme change
+#: means the prior disposition answered a different material question.
+CONFLICT_MATERIAL_DIGEST_VERSION = 1
+
+
+def conflict_material_digest(record: dict) -> str:
+    """A deterministic identity over the MATERIAL conflict evidence.
+
+    Mutable human prose (`reason`, `detected_at`) is excluded on purpose: a
+    conflict re-observed with identical material evidence keeps its digest, so a
+    persisted disposition stays valid, while one changed byte in the material
+    evidence yields a distinct digest and invalidates it.
+    """
+    inner = record.get("conflict") or {}
+    material = {
+        "session_id": str(record.get("session_id") or ""),
+        "generation": str(record.get("generation") or ""),
+        "source_ref": str(inner.get("source_ref") or ""),
+        "last_analyzed_seq": str(inner.get("last_analyzed_seq") or ""),
+        "expected_prefix_sha256": str(inner.get("expected_prefix_sha256") or ""),
+        "observed_prefix_sha256": str(inner.get("observed_prefix_sha256") or ""),
+    }
+    raw = json.dumps(material, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def conflict_row(record: dict) -> dict:
+    """One conflict, named for what it is, carrying its material identity."""
+    inner = record.get("conflict") or {}
+    return {
+        "session_id": record.get("session_id"),
+        "generation": record.get("generation"),
+        "detected_at": inner.get("detected_at"),
+        "source_ref": inner.get("source_ref"),
+        "last_analyzed_seq": inner.get("last_analyzed_seq"),
+        "expected_prefix_sha256": inner.get("expected_prefix_sha256"),
+        "observed_prefix_sha256": inner.get("observed_prefix_sha256"),
+        "conflict_material_sha256": conflict_material_digest(record),
+        "material_digest_version": CONFLICT_MATERIAL_DIGEST_VERSION,
+    }
+
+
+def conflict_population(index: dict | None) -> dict:
+    """The single canonical conflict count, beside its explicitly named history."""
+    records = (index or {}).get("sessions") or []
+    indexed = [record for record in records if record.get("status") == "CONFLICT"]
+    current = [
+        record for record in freshest_records(index) if record.get("status") == "CONFLICT"
+    ]
+    rows = [conflict_row(record) for record in current]
+    return {
+        "current": rows,
+        "current_total": len(rows),
+        "indexed_total": len(indexed),
+        "superseded_total": max(0, len(indexed) - len(rows)),
+        "material_digest_version": CONFLICT_MATERIAL_DIGEST_VERSION,
+    }

@@ -61,7 +61,16 @@ def save_links(home: Path | str, links: dict) -> dict:
 
 
 def link_finding_audit(home: Path | str, finding_id: str, audit_result: dict) -> dict:
-    """Durably link a finding to its enqueued audit. Called once at emission."""
+    """Durably link a finding to its enqueued audit. Called once at emission.
+
+    W2-002 (SRC-011): the linkage is an IDEMPOTENT effect keyed by stable audit
+    identity (`audit_number`). Repeating the exact same link (same finding and
+    audit_sha256) returns the stored row and writes nothing, so a crash after
+    the link committed but before the surrounding finding/receipt commit cannot
+    append the same link twice. A DIFFERENT identity for an already-bound audit
+    number is a conflict and fails closed -- one audit, one finding -- rather
+    than overwriting or accumulating a second contradictory row.
+    """
     require_action("write_own_index")
     status, links, detail = load_links(home)
     if status == "unrecoverable":
@@ -72,11 +81,29 @@ def link_finding_audit(home: Path | str, finding_id: str, audit_result: dict) ->
     if links is None:
         links = empty_links()
 
+    audit_number = int(audit_result.get("audit_number", 0))
+    audit_sha256 = str(audit_result.get("audit_sha256", ""))
+    for entry in links["links"]:
+        if int(entry.get("audit_number", 0)) != audit_number:
+            continue
+        if (
+            entry.get("finding_id") == finding_id
+            and str(entry.get("audit_sha256") or "") == audit_sha256
+        ):
+            return entry
+        raise PalError(
+            "VALIDATION_FAILED",
+            f"audit {audit_number} is already linked to finding "
+            f"{entry.get('finding_id')!r}; refusing a conflicting link to "
+            f"{finding_id!r}",
+            next_action="one audit links to one finding; do not re-link it",
+        )
+
     link = {
         "finding_id": finding_id,
-        "audit_number": int(audit_result.get("audit_number", 0)),
+        "audit_number": audit_number,
         "audit_path": audit_result.get("audit_path", ""),
-        "audit_sha256": audit_result.get("audit_sha256", ""),
+        "audit_sha256": audit_sha256,
         "receipt_id": None,
         "work_id": None,
         "disposition": None,
@@ -173,6 +200,16 @@ def import_maintainer_disposition(
 
 
 def import_disposition_file(home: Path | str, path: Path | str) -> list[dict]:
+    """Import a disposition file ALL-OR-NOTHING (audit SRC-004 W2-006).
+
+    The per-row commit made a failed batch destructive: row 1 committed, row 2
+    refused, and the operator could not tell that part of the verdict set had
+    already taken effect. Now the whole file is validated against ONE ledger
+    snapshot first; any invalid row leaves `closed_loop_links.json`
+    byte-identical. Re-importing an already-committed identical verdict stays
+    idempotent, and conflicting duplicate rows for one audit are refused rather
+    than last-write-wins.
+    """
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
@@ -180,19 +217,92 @@ def import_disposition_file(home: Path | str, path: Path | str) -> list[dict]:
     rows = payload if isinstance(payload, list) else payload.get("dispositions") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         raise PalError("VALIDATION_FAILED", "disposition file must contain dispositions array")
-    imported = []
-    seen = set()
+
+    # ONE authoritative snapshot behind both validation and the single save.
+    status, links, detail = load_links(home)
+    if status == "unrecoverable":
+        raise PalError("VALIDATION_FAILED", detail)
+    if links is None:
+        links = empty_links()
+    by_audit = {}
+    for entry in links["links"]:
+        by_audit[int(entry.get("audit_number", 0))] = entry
+
+    # Validate EVERY row against the snapshot before the first mutation.
+    plan: list[dict] = []
+    decisions: dict[int, dict] = {}
     for row in rows:
         if not isinstance(row, dict) or not isinstance(row.get("audit_number"), int) or not isinstance(row.get("disposition"), str):
             raise PalError("VALIDATION_FAILED", "each disposition requires audit_number and disposition")
-        key = (row["audit_number"], row["receipt_id"] if row.get("receipt_id") else None)
-        if key in seen:
+        audit_number = row["audit_number"]
+        proposed = {
+            "disposition": row["disposition"],
+            "fix_version": row.get("fix_version"),
+            "receipt_id": row.get("receipt_id"),
+            "work_id": row.get("work_id"),
+        }
+        if row["disposition"] not in DISPOSITIONS:
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"disposition {row['disposition']!r} is not a closed-loop value",
+                next_action="use one of: " + ", ".join(sorted(DISPOSITIONS)),
+            )
+        previous = decisions.get(audit_number)
+        if previous is not None and any(previous.get(k) != v for k, v in proposed.items() if k != "fix_version" or v is not None):
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"contradictory duplicate rows for audit {audit_number} in one batch",
+                next_action="one audit, one decision per file; split conflicting verdicts into revisions",
+            )
+        if audit_number not in by_audit:
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"no audit with number {audit_number} is linked",
+                next_action="run `saipal continue` to build the link ledger first",
+            )
+        decisions[audit_number] = proposed
+        plan.append({"audit_number": audit_number, "proposed": proposed, "link": by_audit[audit_number]})
+
+    # Apply in memory, then ONE atomic save. Byte-identical ledger on any
+    # earlier refusal is guaranteed because nothing was written before here.
+    imported = []
+    for item in plan:
+        link = item["link"]
+        proposed = item["proposed"]
+        merged = {
+            "disposition": proposed["disposition"],
+            "fix_version": proposed["fix_version"],
+            "receipt_id": proposed["receipt_id"] if proposed["receipt_id"] is not None else link.get("receipt_id"),
+            "work_id": proposed["work_id"] if proposed["work_id"] is not None else link.get("work_id"),
+        }
+        unchanged = link.get("disposition") is not None and all(
+            link.get(field) == value for field, value in merged.items()
+        )
+        if unchanged:
+            imported.append(link)
             continue
-        seen.add(key)
-        imported.append(import_maintainer_disposition(
-            home, audit_number=row["audit_number"], disposition=row["disposition"],
-            receipt_id=row.get("receipt_id"), work_id=row.get("work_id"), fix_version=row.get("fix_version"),
-        ))
+        if link.get("disposition") is not None:
+            history = link.get("history")
+            link["history"] = list(history) if isinstance(history, list) else []
+            link["history"].append(
+                {
+                    "disposition": link.get("disposition"),
+                    "fix_version": link.get("fix_version"),
+                    "receipt_id": link.get("receipt_id"),
+                    "work_id": link.get("work_id"),
+                    "closed_at": link.get("closed_at"),
+                    "superseded_at": utc_now_iso(),
+                }
+            )
+        link["disposition"] = merged["disposition"]
+        link["fix_version"] = merged["fix_version"]
+        link["closed_at"] = utc_now_iso()
+        if merged["receipt_id"] is not None:
+            link["receipt_id"] = merged["receipt_id"]
+        if merged["work_id"] is not None:
+            link["work_id"] = merged["work_id"]
+        imported.append(link)
+    save_links(home, links)
     return imported
 
 

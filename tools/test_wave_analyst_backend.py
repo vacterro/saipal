@@ -167,15 +167,36 @@ class StatusClasses(BackendBase):
             with self.subTest(status=status):
                 self.assertEqual(self.probe(status).failure_class, RETRYABLE)
 
-    def test_missing_key_never_sends_a_request(self) -> None:
+    def test_a_missing_key_is_refused_for_a_remote_endpoint(self) -> None:
+        """Fail closed where the credential actually matters: no request leaves."""
         import os
 
         os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
-        reply = self.call()
+        config = json.loads(json.dumps(self.config))
+        config["backend"]["endpoint"] = "http://10.0.0.5:9/v1/chat/completions"
+        reply = self.call(config)
         self.assertFalse(reply.ok)
         self.assertEqual(reply.failure_class, AUTH)
         self.assertIn("SAIPAL_ANALYST_API_KEY", reply.detail)
+        self.assertIn("no request was sent", reply.detail)
         self.assertEqual(self.server.requests, [])
+
+    def test_a_missing_key_is_inert_on_a_loopback_endpoint(self) -> None:
+        """A loopback endpoint has no remote party to authenticate to.
+
+        The credential requirement is an egress requirement, so an unset key must
+        not stop a local model from answering: refusing here once left a keyless
+        local backend unable to run AND opened a sticky global AUTH latch that no
+        retry could ever clear.
+        """
+        import os
+
+        os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
+        self.server.script = [(200, envelope('{"verdict": "NO_DRIFT"}'), 0.0)]
+        reply = self.call()
+        self.assertTrue(reply.ok, getattr(reply, "detail", ""))
+        self.assertEqual(len(self.server.requests), 1, "the local call must happen")
+        self.assertNotIn("Authorization", self.server.requests[0]["headers"])
 
 
 class EnvelopeFailures(BackendBase):

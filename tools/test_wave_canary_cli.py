@@ -23,6 +23,11 @@ def run_cli(home: Path, *args: str) -> dict:
     return payload or {"exit_code": code}
 
 
+def run_cli_code(home: Path, *args: str) -> tuple[int, dict]:
+    code, payload, _err = support.run_saipal_json("watch", *args, home=home)
+    return code, payload or {}
+
+
 class CanaryParser(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -118,6 +123,42 @@ class CanaryConfigurationBlocked(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "CONFIGURATION_BLOCKED")
         self.assertIn("recurrence", result["detail"])
         self.assertEqual((self.home / "recurrence.json").read_bytes(), b"{broken")
+
+    def test_blocked_canary_returns_nonzero_process_status(self) -> None:
+        """T-109 F: a structured CONFIGURATION_BLOCKED canary is a refusal status,
+        not a process success, while the JSON body and reason are preserved."""
+        code, payload = run_cli_code(
+            self.home, "--canary", "--max-cycles", "1",
+            "--max-units-per-cycle", "1", "--max-model-attempts", "1",
+        )
+        self.assertNotEqual(code, 0, "a failed canary must not be process-success")
+        self.assertTrue(payload["canary"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["stop_reason"], "CONFIGURATION_BLOCKED")
+
+
+class WatchPublicationModeBlockedStatus(unittest.TestCase):
+    """T-109 F: a plain watch that stops on a non-STAGE_ONLY mode is a refusal status."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = support.make_home(Path(self._tmp.name))
+        support.run_saipal("continue", home=self.home)
+
+    def test_publication_mode_blocked_watch_is_nonzero(self) -> None:
+        import json as json_mod
+
+        cfg_path = self.home / "config.json"
+        cfg = json_mod.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["publication_mode"] = "PUBLISH_BLOCKED"
+        cfg_path.write_text(json_mod.dumps(cfg), encoding="utf-8")
+        code, payload, _err = support.run_saipal_json(
+            "watch", "--max-cycles", "1", "--max-units-per-cycle", "1", home=self.home
+        )
+        self.assertNotEqual(code, 0)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["stop_reason"], "PUBLICATION_MODE_BLOCKED")
 
 
 class CanaryPublicationSafetySemantics(unittest.TestCase):
@@ -325,6 +366,38 @@ class CanaryEndToEnd(unittest.TestCase):
         self.assertLessEqual(result["attempts"]["model_calls"], 4)
         self.assertFalse(result["external_publication_possible"])
         self.assertEqual(result["publication_mode"], "STAGE_ONLY")
+
+    def test_successful_bounded_canary_is_zero_exit(self) -> None:
+        """T-109 F: the healthy bounded stop stays EXIT_OK."""
+        import test_wave_analyst_repair as repair
+
+        backend = repair.StubBackend()
+        self.addCleanup(backend.stop)
+        self._configure_backend(backend.endpoint())
+        support.put_inbox(self.home, "conformant-cold.json")
+        support.run_saipal("continue", home=self.home)
+        from saipal_engine import carrier as carrier_mod
+        from saipal_engine.sessions import load_index
+
+        _s, index, _d = load_index(self.home)
+        for record in sorted(
+            carrier_mod.freshest_records(index), key=lambda r: str(r.get("session_id"))
+        ):
+            backend.script.append(
+                (200, repair.envelope(
+                    repair.RepairBase.candidate_for(
+                        repair.RepairBase(), self.home, "NO_DRIFT",
+                        str(record["session_id"]),
+                    )
+                ))
+            )
+        code, payload = run_cli_code(
+            self.home, "--canary", "--max-cycles", "1",
+            "--max-units-per-cycle", "1", "--max-model-attempts", "4",
+        )
+        self.assertEqual(code, 0, payload)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["stop_reason"], "MAX_CYCLES")
 
     def test_restart_canary_commits_no_duplicate_receipt(self) -> None:
         import test_wave_analyst_repair as repair

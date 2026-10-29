@@ -84,6 +84,13 @@ def save_config(home: Path | str, payload: dict) -> dict:
     problems = validate_config(payload)
     if problems:
         raise PalError("VALIDATION_FAILED", "refusing invalid config: " + "; ".join(problems))
+    # T-109: the production gate is proof-based, not assertion-based. A request to
+    # reach PUBLISH_ENABLED must carry a valid, identity-matching readiness proof.
+    # Refusal performs zero writes: the previous config stays byte-equivalent.
+    if (payload.get("publication_mode") or "STAGE_ONLY") == "PUBLISH_ENABLED":
+        from .readiness import require_for_config
+
+        require_for_config(home, payload)
     path = config_path(home)
     atomic_write_json(path, payload, root=home_paths(home).root)
     return payload

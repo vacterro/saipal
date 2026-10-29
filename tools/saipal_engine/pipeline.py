@@ -321,6 +321,71 @@ def _load_signals(signals_path: Path) -> dict:
     return payload
 
 
+class _SignalBatch:
+    """One signal-ledger transaction for a whole bounded analysis pass.
+
+    PERF-002 (SRC-011): `_record_signal` loaded, linearly searched and rewrote
+    the complete lifetime ledger for EVERY accepted signal, so a multi-signal
+    cycle cost O(new_signals x lifetime_signals) CPU plus equivalent whole-file
+    write amplification. This loads the ledger once, keeps an
+    `signal_id -> row` map for O(1) lookup, applies every candidate to the
+    in-memory snapshot, and serializes once.
+
+    Crash alignment (guardrail): the snapshot persists at the SAME boundary as
+    the session index (end of the analysis pass), so a crash discards signal
+    occurrences together with the analysis cursors they describe -- strictly
+    safer than per-signal writes that could survive without the cursor.
+    Returning each row still lets the caller render its bounded summary.
+    """
+
+    def __init__(self, home: Path, *, registry: dict | None):
+        self._home = home
+        self._registry = registry
+        self._path = home_paths(home).root / "signals.json"
+        self._payload: dict | None = None
+        self._by_id: dict[str, dict] = {}
+        self._changed = False
+
+    def __enter__(self) -> "_SignalBatch":
+        self._payload = _load_signals(self._path)
+        self._by_id = {
+            str(row.get("signal_id")): row
+            for row in self._payload["signals"]
+            if isinstance(row, dict)
+        }
+        return self
+
+    def record(self, signal: dict) -> dict:
+        key = str(signal.get("signal_id") or "")
+        existing = self._by_id.get(key)
+        row = dict(signal)
+        row["signal_id"] = key
+        row["occurrences"] = int((existing or {}).get("occurrences") or 0) + 1
+        row["last_seen_at"] = _now_iso()
+        if existing is None:
+            row["first_seen_at"] = row["last_seen_at"]
+            assert self._payload is not None
+            self._payload["signals"].append(row)
+            self._by_id[key] = row
+        else:
+            existing.update(row)
+            row = existing
+        self._changed = True
+        return row
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None and self._changed and self._payload is not None:
+            try:
+                require_action("write_own_index", registry=self._registry)
+                atomic_write_json(self._path, self._payload, root=self._home)
+            except (OSError, PalError):
+                # The signal ledger is an optimization over the session record,
+                # not evidence: a home that cannot hold it still analyzed its
+                # sessions.
+                pass
+        return False
+
+
 def _now_iso() -> str:
     from .paths import utc_now_iso
 
@@ -371,8 +436,27 @@ def analyze_sessions(
         config_mod.protocol_authority(home, config), registry=data
     )
 
+    # PERF-001/PERF-002 (SRC-011): one signal-ledger load and one recurrence
+    # load for the WHOLE bounded pass, committed at the same boundary as the
+    # session index below. Per-session recurrence and per-signal ledger RMW paid
+    # O(clean_sessions x ledger_size) and O(new_signals x lifetime_signals)
+    # respectively; both are collapsed here without changing their semantics.
+    # A ledger that cannot be opened falls back to the per-row path rather than
+    # changing the failure policy (recurrence corruption is already refused by
+    # the cycle preflight before analysis).
+    signal_batch = _SignalBatch(home, registry=data)
+    signal_batch.__enter__()
+    recurrence_batch: recurrence_mod.RecurrenceBatch | None = recurrence_mod.RecurrenceBatch(
+        home, registry=data
+    )
+    try:
+        recurrence_batch.__enter__()
+    except (OSError, ValueError, UnicodeDecodeError, PalError):
+        recurrence_batch = None
+
     for record in index.get("sessions", []):
         if sessions_analyzed >= int(budget.max_sessions):
+            budget_hit = True
             break
         # A tripped budget ends the CYCLE, not just the session: entering a later
         # session would count it, rewrite its analysis block from a budget that
@@ -438,7 +522,7 @@ def analyze_sessions(
                         candidate, record, candidate.get("historical_rule_surface")
                     )
                     signal["signal_id"] = _signal_id(signal)
-                    recorded = _record_signal(home, signal, registry=data)
+                    recorded = signal_batch.record(signal)
                     signals_total += 1
                     session_signals += 1
                     if len(signals) < int(getattr(budget, "max_candidates", 100)):
@@ -482,8 +566,17 @@ def analyze_sessions(
             # the negative-evidence receipt below records only that the
             # mechanical pass found nothing worth signaling.
             _record_recurrence(
-                home, record, exhausted=exhausted and session_signals == 0, registry=data
+                home, record, exhausted=exhausted and session_signals == 0,
+                registry=data, batch=recurrence_batch,
             )
+
+    # PERF-001/PERF-002 (SRC-011): the boundary commit. The signal ledger and
+    # the recurrence ledger flush exactly once, alongside the session index
+    # below, so a crash discards signal/recurrence occurrences together with the
+    # analysis cursors that describe them.
+    signal_batch.__exit__(None, None, None)
+    if recurrence_batch is not None:
+        recurrence_batch.__exit__(None, None, None)
 
     # Nothing analyzed means nothing to persist. Rewriting an 11 MB session
     # index and telemetry after a no-work pass was pure amplification: `status`
@@ -502,7 +595,38 @@ def analyze_sessions(
         "findings_rejected": 0,
         "audits_emitted": audits_emitted,
         "candidates_total": signals_total,
+        "budget_hit": budget_hit,
+        "work_remaining": _work_remaining(home, index),
     }
+
+
+def _work_remaining(home: Path, index: dict) -> bool:
+    """Does any indexed record still owe LOCALLY PROCESSABLE episodes?
+
+    Derived from the persisted analysis cursors after the bounded pass, not
+    from what this cycle happened to reach: `budget_hit` says the pass stopped
+    early, this says there is still something it stopped SHORT of.
+
+    W2-001 (SRC-011) guardrail -- "locally actionable, not merely non-exhausted":
+    a record whose bundle is absent from the inbox is NOT processable, so it must
+    not keep `--drain` looping. Counting it would spin the drain to its safety
+    valve on evidence no cycle can ever advance, exactly the "externally blocked
+    work must not create an infinite drain" contract. A record with no episodes,
+    one already exhausted, or one without its staged bundle owes nothing here.
+    """
+    paths = home_paths(home)
+    for record in index.get("sessions", []):
+        if not record.get("episodes"):
+            continue
+        if record.get("analysis", {}).get("episodes_exhausted"):
+            continue
+        source_ref = str(record.get("source_ref") or "")
+        if not Path(source_ref).name:
+            continue
+        if not (paths.session_inbox / Path(source_ref).name).exists():
+            continue
+        return True
+    return False
 
 
 def _signal_id(signal: dict) -> str:
@@ -531,6 +655,7 @@ def _record_recurrence(
     *,
     exhausted: bool = True,
     registry: dict | None,
+    batch: "recurrence_mod.RecurrenceBatch | None" = None,
 ) -> None:
     """Record mechanical-triage completion for the recurrence ledger.
 
@@ -541,9 +666,16 @@ def _record_recurrence(
     not negative evidence: "no signal yet" and "no signal in this session" are
     different claims, and recording the first as the second would let a bounded
     cycle vote clean on evidence it never read.
+
+    PERF-001 (SRC-011): when a `batch` is supplied the occurrence is applied to
+    its shared in-memory ledger and flushed at the caller's boundary, so a clean
+    session no longer pays three full ledger reads plus a whole-ledger write.
     """
     try:
         if not exhausted:
+            return
+        if batch is not None:
+            batch.record_negative(record)
             return
         recurrence_mod.record_negative(home, record, registry=registry)
     except (OSError, ValueError, UnicodeDecodeError, PalError) as exc:
@@ -669,6 +801,13 @@ def emit_audit(
             sink_status, sink, sink_detail = configured_sink(home)
             if sink_status != "ok" or sink is None:
                 raise PalError("SINK_UNAVAILABLE", sink_detail, next_action="keep audit staged and retry")
+            # T-109: the external-effect boundary revalidates the production
+            # gate against LIVE state -- the readiness proof, the sink
+            # identity/manifest and the reviewed software fingerprint are
+            # re-derived here, never trusted from what setup saw earlier.
+            from . import readiness as readiness_mod
+
+            readiness_mod.check_publish_gate(home, sink)
             result = sink.publish(finding, body)
             if not sink.verify(result):
                 raise PalError("SINK_UNAVAILABLE", "sink write did not verify")
@@ -690,7 +829,13 @@ def emit_audit(
                 registry=registry,
             )
             from . import log as log_mod
-            log_mod.append_event(home, "sink_publish_failure", data={"finding_id": finding.get("finding_id", ""), "reason": str(exc)}, registry=registry)
+            gate_code = getattr(exc, "code", "") == "PUBLICATION_GATE_CLOSED"
+            log_mod.append_event(
+                home,
+                "publication_gate_refusal" if gate_code else "sink_publish_failure",
+                data={"finding_id": finding.get("finding_id", ""), "reason": str(exc)},
+                registry=registry,
+            )
     else:
         result = enqueue_mod.enqueue_audit(home, finding, body, registry=registry, maintainer_root=None)
     finding["audit"] = {
@@ -703,6 +848,12 @@ def emit_audit(
         # EMITTED means locally staged. Whether the maintainer sink has the file
         # is a separate fact, and a reader must be able to tell them apart.
         finding["audit"]["delivery"] = delivery
+    else:
+        # W2-007 (SRC-004): the delivery truth is the publication ledger. A
+        # finding staged without a ledger entry (pure STAGE_ONLY path) carries
+        # no delivery claim at all; keep the field absent rather than minting a
+        # second source of truth.
+        finding["audit"].pop("delivery", None)
     findings_mod.advance_lifecycle(finding, "EMITTED", registry=registry)
     audits_emitted.append(result)
 

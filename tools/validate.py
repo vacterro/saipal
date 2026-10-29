@@ -62,6 +62,10 @@ EXPECTED_RULE_FAMILIES = (
     "PAL-SKILL",
     "PAL-INDEX",
     "PAL-ANALYSIS",
+    # T-135: the durable autonomous convergence objective owns its own rules and
+    # its own document, rather than adding prose to COMMANDS.md that nothing
+    # can enforce.
+    "PAL-CPALL",
 )
 
 # Modules owned by waves that have not landed yet. A guard that never
@@ -563,6 +567,35 @@ def check_verification_truth(report: Report) -> None:
     if match:
         checkpoint_id = match.group(1)
 
+    import unittest
+
+    discovered_cases = (
+        unittest.TestLoader()
+        .discover(str(_ROOT / "tools"), pattern="test_*.py")
+        .countTestCases()
+    )
+    cases_match = re.search(r"unittest_cases:\s*(\d+)", checkpoint_text)
+    recorded_cases = int(cases_match.group(1)) if cases_match else None
+    report.check(
+        recorded_cases == discovered_cases,
+        f"WAVE_I_CHECKPOINT.md unittest_cases matches discovery ({discovered_cases})",
+        f"checkpoint claims {recorded_cases}, discovery found {discovered_cases}",
+    )
+
+    has_win_decl = bool(re.search(r"Windows.*:\s*(?:EXECUTED|VERIFIED)", checkpoint_text, re.I))
+    has_posix_decl = bool(re.search(r"POSIX:\s*(?:NOT EXECUTED|UNVERIFIED|EXECUTED|VERIFIED)", checkpoint_text, re.I))
+    report.check(
+        has_win_decl and has_posix_decl,
+        "WAVE_I_CHECKPOINT.md declares explicit platform executions for Windows and POSIX",
+        "missing explicit platform_executions declaration for Windows or POSIX",
+    )
+    if "POSIX: NOT EXECUTED" in checkpoint_text or "POSIX: UNVERIFIED" in checkpoint_text:
+        report.check(
+            "POSIX fully race-closed" not in checkpoint_text,
+            "WAVE_I_CHECKPOINT.md does not claim 'POSIX fully race-closed' when unexecuted",
+            "falsely claims 'POSIX fully race-closed' when POSIX was not executed",
+        )
+
     # Any other repo document that quotes suite counts must name the same
     # checkpoint identity. Audits under docs/audits/ are exempt: they are
     # dated external artifacts, archaeology by definition.
@@ -596,6 +629,366 @@ def check_verification_truth(report: Report) -> None:
                 f"{path.name} carries no unsourced verification counts",
                 f"counts without the {checkpoint_id!r} identity: {', '.join(stale)}",
             )
+
+
+# --------------------------------------------------------------------------- #
+# closure chain (SRC-006 / the T-125 gap)
+# --------------------------------------------------------------------------- #
+#
+# The defect class this section ends, measured on this project's own memory:
+# T-125 reached `## DONE` with `closure_mode`, `owner`, `claim_time` and
+# mechanized events -- everything the field-based lifecycle repair looks at --
+# while its LOG carried NO canonical finish record at all. The phase chain
+# stopped at VERIFY; REVIEW and SHIP were never entered. Nothing caught it:
+#
+#   * `[saio]` flags structural-marker TEXT without an `[op: ...]` slot, and the
+#     hand-written records that closed it carried a plain `DEC:`/`RUN:` text;
+#   * the SAIOPS `[gate-closure]` check inspects EXISTING finish events, so a
+#     closure with no finish event has nothing to inspect;
+#   * the lifecycle repair planner reads BOARD FIELDS, which were present.
+#
+# So the missing control is about the CHAIN, not the fields: a `## DONE` record
+# of the generation the closure contract governs must carry its own canonical
+# closure chain -- a `ticket finished via SAIOPS -- completion (from SHIP)`
+# record -- or an explicit, append-only attestation saying it did not.
+#
+# SCOPE is the protocol's own frontier, never a new invention: the lowest
+# ticket number on BOARD that carries `closure_mode` is the point from which
+# the closure contract was observable, and anything below it is LEGACY and
+# exempt (its grammar did not exist yet). When no record carries
+# `closure_mode` at all, the fallback is the operation layer's own marker: a
+# ticket that never appears on an `[op: ...]` event predates it.
+#
+# REPAIR (decided here, and the reason this check has a second legal shape): a
+# closure gap is repaired by an APPEND-ONLY ATTESTATION, never by synthesizing
+# the missing gate. It must name the ticket, state the chain that was actually
+# reached, and declare the record historical evidence rather than gate proof.
+# A current-generation gap whose consequences are material additionally owes a
+# corrective successor (T-125's is T-127, bound to source receipt SRC-006).
+# SAIOPS' own `recover --attest-legacy-done` route covers LEGACY-generation
+# records only, so this attestation is written under the documented OPS
+# fallback and records why. No phase event, no `closure_mode` and no historical
+# LOG line is ever created or rewritten to close a gap: an attestation that
+# manufactured gate proof would be the very laundering it exists to prevent.
+#
+# WHY THE TWO EXISTING MECHANISMS CANNOT SEE IT, stated as the code states it:
+#
+#   * the skill's `[gate-closure]` check (T-602) regexes FINISH EVENTS that
+#     exist and fails a non-SHIP one after its self-establishing boundary. A
+#     record with NO finish event hands it an empty set to inspect, so absence
+#     is invisible to it -- the complement of this check, not a duplicate;
+#   * the skill's lifecycle repair planner (reconcile.py) judges FIELDS: it
+#     reopens a `## DONE` row only when it carries no `closure_mode`, no
+#     `owner`, no `claim_time` and no verification evidence. T-125 carries all
+#     four, so it is skipped before its history is ever read. Fields present is
+#     not a chain, and that difference is this section's whole subject.
+#
+# The repair record's CONTRACT, enforced below rather than trusted: anchored
+# `DEC` text beginning `closure-chain-gap attested for`, naming the gap it
+# answers, carrying the disclaimer `not gate proof`, and naming only Work that
+# exists on BOARD (so a gap is docked to a real corrective successor instead of
+# to prose). It is written in the engine's own attested-DEC shape, which is why
+# `saipen validate` and the `[saio]` provenance rule both keep passing over it.
+
+#: The canonical finish record the operation layer writes. Because
+#: `finish_ticket` REFUSES every non-SHIP closure, the phase this names IS the
+#: gate proof, and its absence is the gap.
+CLOSURE_FINISH_MARKER = "ticket finished via SAIOPS"
+CLOSURE_SHIP_EDGE = "(from SHIP)"
+
+#: The machine prefix of the append-only repair record.
+CLOSURE_ATTESTATION_PREFIX = "closure-chain-gap attested for"
+
+#: A repair record must DISCLAIM gate authority IN ITS OWN TEXT. An attestation
+#: that reads like a completion is the laundering this route exists to prevent,
+#: so the disclaimer is part of the record's contract rather than its prose, and
+#: the audit fails a record that omits it.
+CLOSURE_ATTESTATION_DISCLAIMER = "not gate proof"
+
+_LOG_EVENT_RE = re.compile(r"^\s*-\s+\S+\s+\S+\s+\[E-(\d+)\](?P<rest>.*)$")
+_LOG_TICKET_RE = re.compile(r"\[(T-\d+)\]")
+_LOG_OP_RE = re.compile(r"\[op:\s*([^\]]+)\]")
+_LOG_LEAD_SLOT_RE = re.compile(r"\s*\[[^\]]*\]")
+_LOG_TAXONOMY_RE = re.compile(r"\s*([A-Z]{3,8}):\s?(?P<text>.*)$", re.S)
+_BOARD_DONE_ROW_RE = re.compile(r"^-\s*\[([ x/])\]\s+(T-\d+)(?P<fields>.*)$")
+_CLOSURE_MODE_RE = re.compile(r"\bclosure_mode\s*:\s*\S+")
+_LOG_TRANSITION_RE = re.compile(r"\btransition to ([A-Z][A-Z0-9_]*)")
+_LOG_PHASE_EDGE_RE = re.compile(r"\(from ([A-Z][A-Z0-9_]*)\)")
+_LOG_ANY_TICKET_RE = re.compile(r"\bT-\d+\b")
+
+
+def _log_records(log_text: str) -> list[dict]:
+    """Parse the append-only LOG into `{event, ticket, op_id, taxonomy, text}`.
+
+    Deliberately structural-only: an unparseable line is skipped rather than
+    guessed at, because this audit must never manufacture a chain out of prose.
+    """
+    records: list[dict] = []
+    for raw in log_text.splitlines():
+        line = raw.rstrip()
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = _LOG_EVENT_RE.match(line)
+        if not match:
+            continue
+        rest = match.group("rest")
+        ticket = _LOG_TICKET_RE.search(rest)
+        op = _LOG_OP_RE.search(rest)
+        body = rest
+        while True:
+            slot = _LOG_LEAD_SLOT_RE.match(body)
+            if not slot:
+                break
+            body = body[slot.end() :]
+        taxonomy = _LOG_TAXONOMY_RE.match(body)
+        records.append(
+            {
+                "event": int(match.group(1)),
+                "ticket": ticket.group(1) if ticket else None,
+                "op_id": op.group(1) if op else None,
+                "taxonomy": taxonomy.group(1) if taxonomy else None,
+                "text": (taxonomy.group("text") if taxonomy else body).strip(),
+            }
+        )
+    return records
+
+
+def _board_rows(board_text: str, section_name: str | None = None) -> list[tuple[str, str]]:
+    """`(ticket, row_fields)` for every BOARD row under one section.
+
+    `section_name=None` means every section: a repair record may name Work that
+    is not itself closed, and a reference is checked against the whole BOARD.
+    """
+    rows: list[tuple[str, str]] = []
+    section = None
+    for line in board_text.splitlines():
+        if line.startswith("## "):
+            section = line.strip()
+            continue
+        match = _BOARD_DONE_ROW_RE.match(line)
+        if match and (section_name is None or section == section_name):
+            rows.append((match.group(2), match.group(3)))
+    return rows
+
+
+def closure_chain_report(board_text: str, log_text: str) -> dict:
+    """Audit every `## DONE` record of the governed generation for its chain.
+
+    Returns `{frontier, judged, closed, unattested, attested, stale, legacy,
+    rows, events}`:
+
+    * `judged` -- DONE records at/above the closure-contract frontier;
+    * `closed` -- judged records with a canonical `(from SHIP)` finish record;
+    * `unattested` -- judged records with NO closure chain and no attestation
+      (the defect class, and the only state this audit must fail);
+    * `attested` -- `{ticket: {event, declares_historical_evidence, names}}`
+      for gaps whose append-only repair record exists;
+    * `stale` -- repair records answering no gap: a record that is not governed
+      here, or one that has since closed properly (drift);
+    * `undeclared` -- repair records that do not disclaim gate authority;
+    * `phantom_refs` -- tickets a repair record names that are on no BOARD row;
+    * `chains` -- `{ticket: [PHASE, ...]}`, the phase chain the LOG proves;
+    * `legacy` -- records below the frontier, exempt and counted, never ignored.
+    """
+    records = _log_records(log_text)
+    rows = _board_rows(board_text, "## DONE")
+    board_ids = {ticket for ticket, _fields in _board_rows(board_text)}
+
+    modes = [ticket for ticket, fields in rows if _CLOSURE_MODE_RE.search(fields)]
+    frontier = min((int(ticket[2:]) for ticket in modes), default=None)
+    mechanized = {
+        record["ticket"]
+        for record in records
+        if record["ticket"] and record["op_id"]
+    }
+
+    def governed(ticket: str) -> bool:
+        if not (ticket.startswith("T-") and ticket[2:].isdigit()):
+            return False
+        if frontier is not None:
+            return int(ticket[2:]) >= frontier
+        # No record carries closure_mode: the operation layer's own marker is
+        # the boundary, and anything it never touched is LEGACY.
+        return ticket in mechanized
+
+    def note_phase(ticket: str, phase: str) -> None:
+        phases = chains.setdefault(ticket, [])
+        if phase not in phases:
+            phases.append(phase)
+
+    #: The phase chain the LOG actually proves, per ticket: a recorded
+    #: transition, or the phase a canonical finish record closed FROM. This is
+    #: what makes the failure detail say where the chain STOPPED rather than
+    #: only that it did.
+    chains: dict[str, list[str]] = {}
+
+    #: ticket -> (has_a_finish_record, has_a_SHIP_finish_record). A finish
+    #: record from any OTHER phase is not a chain either: it is the recorded
+    #: skipped-gate closure this audit exists to surface. Anchored on the `DEC`
+    #: taxonomy because authority belongs to the record type that carries it --
+    #: a `RUN` reporting a completion is not one.
+    finished: dict[str, list[bool]] = {}
+    for record in records:
+        ticket = record["ticket"]
+        if not ticket:
+            continue
+        transition = _LOG_TRANSITION_RE.search(record["text"])
+        if transition:
+            note_phase(ticket, transition.group(1))
+        if record["taxonomy"] != "DEC":
+            continue
+        text = record["text"]
+        if not text.startswith(CLOSURE_FINISH_MARKER):
+            continue
+        entry = finished.setdefault(ticket, [True, False])
+        entry[0] = True
+        edge = _LOG_PHASE_EDGE_RE.search(text)
+        if edge:
+            note_phase(ticket, edge.group(1))
+        if CLOSURE_SHIP_EDGE in text:
+            entry[1] = True
+
+    attestations: dict[str, dict] = {}
+    for record in records:
+        text = record["text"]
+        if record["taxonomy"] != "DEC":
+            continue
+        if not text.startswith(CLOSURE_ATTESTATION_PREFIX):
+            continue
+        named = set(_LOG_ANY_TICKET_RE.findall(text))
+        subject = record["ticket"]
+        if subject is None and named:
+            subject = sorted(named, key=lambda ticket: int(ticket[2:]))[0]
+        if subject is None:
+            continue
+        named.discard(subject)
+        attestations[subject] = {
+            "event": record["event"],
+            "declares_historical_evidence": CLOSURE_ATTESTATION_DISCLAIMER in text,
+            "names": sorted(named, key=lambda ticket: int(ticket[2:])),
+        }
+
+    judged, closed, unattested, attest, legacy = [], [], [], {}, []
+    for ticket, _fields in rows:
+        if not governed(ticket):
+            legacy.append(ticket)
+            continue
+        judged.append(ticket)
+        _has_finish, has_ship = finished.get(ticket, [False, False])
+        if has_ship:
+            closed.append(ticket)
+            continue
+        if ticket in attestations:
+            attest[ticket] = attestations[ticket]
+        else:
+            unattested.append(ticket)
+
+    #: A repair record that answers NO gap is drift, in either direction: it
+    #: names a record this audit does not govern, or a record that has since
+    #: closed properly. Both are stale, and neither may be silently ignored.
+    stale = sorted(
+        t
+        for t in attestations
+        if t not in judged or finished.get(t, [False, False])[1]
+    )
+    undeclared = sorted(
+        t for t, record in attestations.items() if not record["declares_historical_evidence"]
+    )
+    phantom_refs = sorted(
+        {
+            named
+            for record in attestations.values()
+            for named in record["names"]
+            if named not in board_ids
+        },
+        key=lambda ticket: int(ticket[2:]),
+    )
+    return {
+        "frontier": frontier,
+        "judged": judged,
+        "closed": closed,
+        "unattested": unattested,
+        "attested": attest,
+        "stale": stale,
+        "undeclared": undeclared,
+        "phantom_refs": phantom_refs,
+        "chains": chains,
+        "legacy": legacy,
+        "rows": [ticket for ticket, _fields in rows],
+        "events": len(records),
+    }
+
+
+def check_closure_chain(report: Report) -> None:
+    """A `## DONE` record owes its own closure chain -- or an honest attestation.
+
+    Applied to THIS checkout's project memory when it is present (`.saipen/` is
+    local state and is not part of a clean clone, so there is nothing to audit
+    there and the section says so instead of passing silently).
+    """
+    print("[closure chain]")
+    board_path = _ROOT / ".saipen" / "BOARD.md"
+    log_path = _ROOT / ".saipen" / "LOG.md"
+    if not (board_path.is_file() and log_path.is_file()):
+        report.check(
+            True,
+            "no .saipen project memory in this checkout (closure-chain audit not applicable)",
+            "",
+        )
+        return
+    audit = closure_chain_report(
+        board_path.read_text(encoding="utf-8"),
+        log_path.read_text(encoding="utf-8"),
+    )
+    report.check(
+        not audit["unattested"],
+        "every current-generation ## DONE record carries its own closure chain",
+        "closed with no SHIP finish record and no attestation: "
+        + ", ".join(
+            f"{ticket} (phase chain: "
+            + (" > ".join(audit["chains"].get(ticket) or ()) or "no transition recorded")
+            + ")"
+            for ticket in audit["unattested"]
+        )
+        + " (repair with an append-only `"
+        + CLOSURE_ATTESTATION_PREFIX
+        + f"` record that says it is {CLOSURE_ATTESTATION_DISCLAIMER}, or reopen "
+        "it -- never by synthesizing the missing gate)",
+    )
+    accounted = len(audit["judged"]) + len(audit["legacy"])
+    report.check(
+        accounted == len(audit["rows"]),
+        "the closure-chain audit accounts for every ## DONE record",
+        f"{accounted} of {len(audit['rows'])} rows classified",
+    )
+    report.check(
+        not audit["stale"],
+        "every closure-chain attestation answers a real gap",
+        "attestation names a record with no closure gap (drift to clean): "
+        + ", ".join(audit["stale"]),
+    )
+    report.check(
+        not audit["undeclared"],
+        "every closure-chain attestation disclaims gate authority",
+        f"repair record does not say it is {CLOSURE_ATTESTATION_DISCLAIMER}: "
+        + ", ".join(audit["undeclared"]),
+    )
+    report.check(
+        not audit["phantom_refs"],
+        "every ticket a closure-chain attestation names exists on BOARD",
+        "repair record names Work that is on no BOARD row: "
+        + ", ".join(audit["phantom_refs"]),
+    )
+    if audit["attested"]:
+        print(
+            "  note attested closure-chain gaps (historical evidence, never "
+            "gate proof): "
+            + ", ".join(
+                f"{ticket} (E-{record['event']})"
+                + (f" -> corrective successor {', '.join(record['names'])}" if record["names"] else "")
+                for ticket, record in sorted(audit["attested"].items())
+            )
+        )
 
 
 def check_law_coverage(report: Report, registry: dict) -> None:
@@ -658,6 +1051,8 @@ def main(argv: list[str] | None = None) -> int:
         check_verification_truth(report)
     else:
         report.check(False, "registry-driven checks ran", "registry did not load")
+
+    check_closure_chain(report)
 
     if quiet:
         return 0 if report.ok else 1

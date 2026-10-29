@@ -562,6 +562,72 @@ def record_batch(
     return save_recurrence(home, data, registry=registry)
 
 
+class RecurrenceBatch:
+    """One recurrence ledger transaction for a batch of mechanical occurrences.
+
+    PERF-001 (SRC-011): `record_negative`/`record_occurrence` each pay an
+    `_ensure_migrated` (status + load) plus another `load_recurrence`, i.e. three
+    full reads per call on an already-current v2 ledger, and one full
+    serialization per changed row. A bounded analysis pass calls the mechanical
+    negative path once per clean session, so that cost repeats per session even
+    though all sessions belong to one analysis transaction. This context loads
+    and migrates ONCE, applies every occurrence to the in-memory snapshot, and
+    persists ONCE at a deterministic boundary.
+
+    Durability: the caller commits this at the same boundary as the session
+    index, so a restart cannot claim analysis progress whose recurrence write was
+    discarded. A corrupt ledger still fails closed at `__enter__` (the
+    `_ensure_migrated` gate). Public `record_negative`/`record_batch` are
+    unchanged for independent callers.
+    """
+
+    def __init__(self, home: Path | str, *, registry: dict | None = None):
+        self._home = home
+        self._registry = registry
+        self._data: dict | None = None
+        self._changed = False
+
+    def __enter__(self) -> "RecurrenceBatch":
+        _ensure_migrated(self._home, registry=self._registry)
+        self._data = load_recurrence(self._home)
+        return self
+
+    def record_occurrence(
+        self, finding, session, *, occurrence_id: str = ""
+    ) -> dict:
+        if not isinstance(finding, dict) or not isinstance(session, dict):
+            raise PalError("VALIDATION_FAILED", "finding and session must be objects")
+        assert self._data is not None
+        if _bump_occurrence(
+            self._data,
+            finding,
+            session,
+            conformant=bool(session.get("conformant", True)),
+            occurrence_id=occurrence_id,
+        ):
+            self._changed = True
+        return self._data
+
+    def record_negative(self, session, *, occurrence_id: str = "") -> dict:
+        if not isinstance(session, dict):
+            raise PalError("VALIDATION_FAILED", "session must be an object")
+        assert self._data is not None
+        if _bump_occurrence(
+            self._data,
+            {"drift_class": "CONFORMANT", "severity": "P3", "confidence": "HIGH"},
+            session,
+            conformant=True,
+            occurrence_id=occurrence_id,
+        ):
+            self._changed = True
+        return self._data
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if exc_type is None and self._changed and self._data is not None:
+            save_recurrence(self._home, self._data, registry=self._registry)
+        return False
+
+
 def _breakdown(data: dict, drift_class: str, dimension: str, label: str) -> list[dict]:
     counts: dict[str, dict] = {}
     for finding in data.get("by_finding", {}).values():

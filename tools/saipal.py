@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """saipal -- the forensic protocol observer CLI.
 
-Operator surface: `continue` (alias `cc`), read-only inspection, setup,
+Operator surface: `continue` (alias `pal`), read-only inspection, setup,
 disposition intake and triggering.
 
 Exit codes: 0 success, 1 refused, 2 usage, 3 no SAIPAL home.
@@ -40,12 +40,19 @@ from saipal_engine.sink import configured_sink  # noqa: E402
 from saipal_engine.closedloop import import_disposition_file  # noqa: E402
 from saipal_engine.log import append_event, log_stats  # noqa: E402
 from saipal_engine.sessions import (  # noqa: E402
+    STATUS_ABSENT as INDEX_ABSENT,
     STATUS_UNRECOVERABLE as INDEX_UNRECOVERABLE,
 )
 from saipal_engine.sessions import load_index  # noqa: E402
 from saipal_engine.paths import (  # noqa: E402
     HOME_DIRNAME,
+    HOME_ENV_VAR,
+    TRIGGER_CLAIM_NAME,
+    TRIGGER_NAME,
     HomeLock,
+    confined_replace,
+    confined_unlink,
+    establish_lock_surface,
     home_paths,
     resolve_home,
     resolve_tool_root,
@@ -54,6 +61,7 @@ from saipal_engine.paths import (  # noqa: E402
     writer_fence,
 )
 from saipal_engine.registry import load_registry, require_string_list  # noqa: E402
+from saipal_engine import cpall as cpall_mod  # noqa: E402
 from saipal_engine.sources import (  # noqa: E402
     SOURCES_UNRECOVERABLE,
     discover,
@@ -73,7 +81,11 @@ EXIT_USAGE = 2
 EXIT_NO_HOME = 3
 
 READ_ONLY_COMMANDS = ("status", "next", "doctor", "report", "analyst-doctor")
-READ_ONLY_WITH_ARGS = ("sessions", "evidence")
+READ_ONLY_WITH_ARGS = ("sessions", "evidence", "operator-queue")
+
+#: Commands that may bootstrap an absent home (recovering their own state is
+#: their first legal act). Everything read-only refuses with NO_HOME instead.
+BOOTSTRAP_COMMANDS = ("continue", "cpall", "goal", "setup")
 
 
 def version_text() -> str:
@@ -97,6 +109,19 @@ def _claim_trigger(home: Path) -> bool:
     pending for the next cycle. A claim left by a crashed cycle is adopted here
     rather than deleted unexamined -- the request was acknowledged, so it is owed
     a run (audit CORE-010).
+
+    T-127 Defect C: the rename goes through the shared physical confinement
+    primitive instead of a raw `os.replace`. The writer fence serializes
+    cycles but it does NOT freeze the lexical home pathname on POSIX -- a
+    directory can be renamed while it is open -- so the old raw rename could
+    be pointed at a home-root replacement (rename the physical home away,
+    drop a symlink/junction in its place) and would then move an EXTERNAL
+    trigger.json into an external trigger.claimed. `confined_replace` binds
+    both ends to verified parent directory fds, so a swapped root refuses with
+    PATH_ESCAPE and every external byte stays untouched. One-cycle ownership
+    and coalescing semantics are unchanged: one pending trigger, one claimed
+    trigger, crash-left claims adopted, a request arriving mid-cycle left for
+    the next cycle.
     """
     paths = home_paths(home)
     if paths.trigger_claim.exists():
@@ -104,7 +129,13 @@ def _claim_trigger(home: Path) -> bool:
     if not paths.trigger.exists():
         return False
     try:
-        os.replace(str(paths.trigger), str(paths.trigger_claim))
+        confined_replace(paths.root, TRIGGER_NAME, TRIGGER_CLAIM_NAME)
+    except PalError:
+        # Both ends are bound to verified physical parents: a refusal means the
+        # home itself is no longer the verified node (PATH_ESCAPE). It is
+        # reported, never quietly turned into "no trigger" -- a refused cycle
+        # is a result, and hiding a root replacement would hide the attack.
+        raise
     except OSError:
         # Another cycle claimed it first, or the token vanished. Either way this
         # cycle owns nothing and must not delete anything.
@@ -113,13 +144,23 @@ def _claim_trigger(home: Path) -> bool:
 
 
 def _release_trigger(home: Path) -> None:
-    """Consume only the claim this cycle owns."""
-    claim = home_paths(home).trigger_claim
-    if claim.exists():
-        try:
-            os.unlink(str(claim))
-        except OSError:
-            pass
+    """Consume only the claim this cycle owns.
+
+    T-127 Defect C: the unlink goes through `confined_unlink` for the same
+    reason the claim does -- a raw `os.unlink` of the lexical claim path can
+    delete an EXTERNAL trigger.claimed after a home-root replacement. A
+    transient sharing failure is still swallowed (the claim simply expires),
+    but a confinement refusal is reported.
+    """
+    paths = home_paths(home)
+    if not paths.trigger_claim.exists():
+        return
+    try:
+        confined_unlink(paths.root, TRIGGER_CLAIM_NAME)
+    except PalError:
+        raise
+    except OSError:
+        pass
 
 
 def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
@@ -136,6 +177,28 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
         )
 
     created = ensure_home(home, registry=registry)
+
+    # Load protocol authority for binding verification during intake.
+    # W2-004 (SRC-011): config is a control-plane input, so an unreadable/invalid
+    # DURABLE config must fail closed HERE, before the cycle's first mutation
+    # (trigger claim, dispatch, inbox/cache writes, migrations, publication
+    # retry, analysis). Previously an unrecoverable config was silently converted
+    # to `authority = {}`, intake persisted a weaker PARTIAL binding that the
+    # digest/cache fast path made durable, and the cycle only refused later
+    # inside analysis -- after the damage. An ABSENT config may still fall back
+    # to defaults (bootstrap); `ensure_home` above materializes one when absent.
+    authority: dict = {}
+    config_status, config, config_detail = load_config(home)
+    if config_status == "unrecoverable":
+        raise PalError(
+            "VALIDATION_FAILED",
+            config_detail or ".saipal/config.json is unreadable",
+            next_action="repair or remove .saipal/config.json by hand, then "
+            "rerun; nothing of this cycle was written",
+        )
+    if config:
+        from saipal_engine.config import protocol_authority
+        authority = {k: str(v) if v is not None else None for k, v in protocol_authority(home, config).items()}
 
     # Claim the trigger present RIGHT NOW, before any work. A request arriving
     # later in this cycle must survive it: deleting whatever trigger.json exists
@@ -172,25 +235,22 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
             "overwrite it",
         )
 
-    # Load protocol authority for binding verification during intake.
-    authority: dict = {}
-    config_status, config, config_detail = load_config(home)
-    if config_status != "unrecoverable" and config:
-        from saipal_engine.config import protocol_authority
-        authority = {k: str(v) if v is not None else None for k, v in protocol_authority(home, config).items()}
 
     dispatch = dispatch_sources(home, configured, registry=registry, index=session_index, authority=authority)
     sources = discover(home, auto=home == resolve_tool_root() / HOME_DIRNAME)
     enabled = [source for source in sources if source["enabled"]]
-    intake = import_inbox(home, registry=registry, authority=authority)
-
-    index_status, session_index, index_detail = load_index(home, registry=registry)
-    if index_status == INDEX_UNRECOVERABLE:
-        raise PalError(
-            "VALIDATION_FAILED",
-            f"session index is unusable: {index_detail}",
-            next_action="repair or remove .saipal/sessions/index.json by hand",
-        )
+    # PERF-002 (SRC-004): the index loaded above is authoritative for intake;
+    # import_inbox reuses it and returns the post-intake snapshot, so the
+    # historical second full parse here and third below collapse to one. An
+    # ABSENT index hands intake an empty snapshot so the absent home pays the
+    # same single parse.
+    if index_status == INDEX_ABSENT or session_index is None:
+        preloaded_index = {"schema_version": 1, "sessions": []}
+    else:
+        preloaded_index = session_index
+    intake = import_inbox(home, registry=registry, authority=authority, index=preloaded_index)
+    if intake.get("index") is not None:
+        session_index = intake["index"]
 
     from saipal_engine.pipeline import analyze_sessions
     from saipal_engine.publications import (
@@ -204,6 +264,19 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
     # acted on, published, or grandfathered while still claiming an old state.
     # Deterministic and idempotent; it never depends on session analysis.
     migration = migrate_index(home, registry=registry)
+
+    # PERF-001 (SRC-004): compact the session index's derived per-event
+    # projections once, here, rather than waiting for each session to be
+    # re-imported. A valid loaded index is compacted idempotently; a corrupt
+    # one already refused at load above.
+    index_compaction = {"records_compacted": 0}
+    if session_index is not None:
+        from saipal_engine.sessions import compact_index as _compact_index
+
+        session_index, records_compacted = _compact_index(
+            home, session_index, registry=registry
+        )
+        index_compaction = {"records_compacted": records_compacted}
 
     # Quarantine BEFORE retry: a pending ledger entry is transport history,
     # not authority to publish. An audit whose finding lacks a semantic DRIFT
@@ -241,6 +314,7 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
             for row in outstanding[:5]
         ],
         "legacy_migration": migration,
+        "index_compaction": index_compaction,
     }
 
     candidates = int(analysis["findings_created"])
@@ -283,11 +357,22 @@ def _continue_cycle(home: Path, registry: dict) -> tuple[int, dict]:
     )
     save_state(home, state, registry=registry)
 
+    intake_report = {k: v for k, v in intake.items() if k != "index"}
+    # Two different questions, never one boolean (audit W2-001): `intake_idle`
+    # is "no new evidence arrived", `work_remaining` is "analysis still owes
+    # episodes it did not reach". `idle` is the complete-cycle answer built
+    # from both, for callers that only need the terminal one.
+    intake_idle = not intake["imported"] and not intake["conflicts"]
+    work_remaining = bool(analysis.get("work_remaining"))
+    budget_hit = bool(analysis.get("budget_hit"))
     return EXIT_OK, {
         "ok": True, "command": "continue", "home": str(home),
         "phase": state["phase"],
-        "idle": not intake["imported"] and not intake["conflicts"],
-        "created": created, "discovered_sources": sources, "intake": intake,
+        "intake_idle": intake_idle,
+        "work_remaining": work_remaining,
+        "budget_hit": budget_hit,
+        "idle": intake_idle and not work_remaining and not budget_hit,
+        "created": created, "discovered_sources": sources, "intake": intake_report,
         "dispatch": dispatch, "sessions_indexed": intake["new_sessions"],
         "sessions_analyzed": analysis["sessions_analyzed"],
         "events_analyzed": analysis["events_analyzed"],
@@ -354,20 +439,27 @@ def cmd_continue(home: Path, registry: dict, args: list[str] | None = None) -> t
             total["drain_reason"] = valve_reason
             break
 
-        idle = result.get("idle", False)
+        intake_idle = bool(result.get("intake_idle", False))
         has_conflicts = len(result.get("intake", {}).get("conflicts", [])) > 0
+        # Locally actionable work is durable analysis the cycle did not finish:
+        # it hit a mechanical budget, or records still owe unanalyzed episodes.
+        # Externally blocked work (publication/sink backlog) is NOT this: it is
+        # retried next cycle and must never keep the drain spinning (W2-001).
+        actionable = bool(result.get("work_remaining")) or bool(result.get("budget_hit"))
         productive = any(
             result.get(k, 0) > 0
             for k in ("sessions_indexed", "sessions_analyzed", "candidates", "audits_emitted")
         )
-        if idle or has_conflicts:
-            total["drain_outcome"] = "idle" if idle else "blocked"
-            total["drain_reason"] = (
-                "backlog drained" if idle else "conflict requires operator resolution"
-            )
-            blocked = has_conflicts
+        if has_conflicts:
+            total["drain_outcome"] = "blocked"
+            total["drain_reason"] = "conflict requires operator resolution"
+            blocked = True
             break
-        if not productive:
+        if intake_idle and not actionable:
+            total["drain_outcome"] = "idle"
+            total["drain_reason"] = "backlog drained"
+            break
+        if not productive and not actionable:
             total["drain_outcome"] = "idle"
             total["drain_reason"] = "no remaining work"
             break
@@ -824,6 +916,90 @@ def cmd_analyst_doctor(home: Path, registry: dict) -> tuple[int, dict]:
     return (EXIT_OK if report.get("ok") else EXIT_REFUSED), report
 
 
+def cmd_analyst_requeue(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Canonical reactivation of semantically refused units (T-136).
+
+    The journal-side twin of `rebind`: rebind wakes a unit whose authority
+    became sufficient, this wakes a unit whose ANSWER was refused. Both are
+    bounded, recorded and idempotent; neither is journal surgery by hand.
+    """
+    from saipal_analyst.requeue import requeue as requeue_units
+
+    dry_run = False
+    force = False
+    limit: int | None = None
+    reason: str | None = None
+    job_classes: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--dry-run":
+            dry_run = True
+        elif token == "--force":
+            force = True
+        elif token == "--class" and index + 1 < len(args):
+            job_classes.append(args[index + 1])
+            index += 1
+        elif token == "--limit" and index + 1 < len(args):
+            try:
+                limit = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError(
+                    "USAGE", f"--limit needs an integer, got {args[index + 1]!r}"
+                ) from exc
+            if limit <= 0:
+                raise PalError("USAGE", "--limit must be positive")
+            index += 1
+        elif token == "--reason" and index + 1 < len(args):
+            reason = args[index + 1]
+            index += 1
+        else:
+            raise PalError("USAGE", f"unknown analyst-requeue option {token!r}")
+        index += 1
+
+    result = requeue_units(
+        home,
+        registry=registry,
+        job_classes=tuple(job_classes) or None,
+        limit=limit,
+        reason=reason,
+        force=force,
+        dry_run=dry_run,
+    )
+    return (EXIT_OK if result.get("ok") else EXIT_REFUSED), result
+
+
+def _render_analyst_requeue_human(result: dict) -> str:
+    counts = result.get("counts") or {}
+    material = result.get("material") or {}
+    lines = [
+        f"analyst-requeue{' (dry run)' if result.get('dry_run') else ''}: "
+        f"{counts.get('requeued', 0)} requeued, {counts.get('refused', 0)} refused, "
+        f"{counts.get('remaining', 0)} left by --limit",
+        f"material: {material.get('model')!r} digest {str(material.get('config_digest'))[:12]}",
+        f"allowance: {result.get('max_requeues_per_unit')} fresh attempt(s) per unit",
+        f"wrote: {bool(result.get('wrote'))}",
+    ]
+    for row in result.get("requeued") or []:
+        lines.append(
+            f"  requeued {row['job_id'][:12]} {row['error_class']} "
+            f"({row.get('requeues_spent')} spent)"
+        )
+    by_class = result.get("by_class") or {}
+    if by_class:
+        lines.append(
+            "refused population: "
+            + ", ".join(f"{name} {count}" for name, count in sorted(by_class.items()))
+        )
+    for row in (result.get("refused") or [])[:5]:
+        lines.append(f"  refused {row['job_id'][:12]} {row['stage']}: {row['reason']}")
+        if row.get("next_action"):
+            lines.append(f"    next: {row['next_action']}")
+    if not result.get("ok"):
+        lines.append("a refusal is a decision, not an error: nothing was lost")
+    return "\n".join(lines)
+
+
 def cmd_analyst_status(home: Path, registry: dict) -> tuple[int, dict]:
     """Read-only worker state: journal, budgets, last run, telemetry."""
     from saipal_analyst import jobs as analyst_jobs
@@ -1049,6 +1225,180 @@ def cmd_coverage(home: Path, registry: dict, args: list[str]) -> tuple[int, dict
     return EXIT_OK, binding_blockers(home, registry=registry)
 
 
+def _operator_queue_module():
+    """The PAL-CPALL-05 packet builder, injected so the kernel stays model-free.
+
+    `saipal_engine` may never import `saipal_analyst`, and the queue needs the
+    analyst allocator's classifier to know what is runnable. The CLI is above
+    both layers, so it hands the module down instead.
+    """
+    from saipal_analyst import operator_queue
+
+    return operator_queue
+
+
+def cmd_operator_queue(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """The canonical operator queue: one owner decision per blocked session.
+
+    Read-only by default. `--write` persists the packet beside the objective so
+    a cpall run, SAIMAIL or a later session can read the same deterministic
+    queue without re-deriving it. Writing the queue is not taking a decision:
+    the packet names what an operator owes, and enrolling, resolving or
+    replaying anything here stays a separate, explicit, operator act.
+    """
+    from saipal_analyst.operator_queue import build, render_text, write_packet
+
+    write = False
+    for token in args:
+        if token == "--write":
+            write = True
+        else:
+            raise PalError("USAGE", f"unknown operator-queue option {token!r}; use --write")
+    packet = build(home, registry=registry)
+    if write:
+        if not packet.get("ok"):
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"refusing to persist an incomplete operator queue: {packet.get('reason')}",
+            )
+        packet["packet_path"] = str(write_packet(home, packet))
+    packet["rendered"] = render_text(packet)
+    return EXIT_OK, packet
+
+
+def cmd_readiness(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """Publication-gate readiness surface (T-109).
+
+    `status` is read-only. `mint` is the ONE supported production path: it runs
+    a real bounded STAGE_ONLY convergence review through the same supervisor
+    canary the operator already has, and mints the durable readiness proof from
+    that ACTUAL report through the hardened `readiness.mint` boundary. A canary
+    run by itself never enables publication -- the transition to PUBLISH_ENABLED
+    stays an explicit operator act through `setup --mode PUBLISH_ENABLED`, which
+    the gate revalidates from live state at every external-effect boundary.
+    """
+    from saipal_engine import readiness as readiness_mod
+    from saipal_engine.sink import AuditSink
+
+    sub = args[0] if args else "status"
+    rest = [a for a in args[1:] if a != "--json"]
+
+    if sub == "status":
+        status, attest, detail = readiness_mod.load(home)
+        return EXIT_OK, {
+            "command": "readiness",
+            "status": status,
+            "detail": detail,
+            "attestation": attest,
+        }
+
+    if sub == "mint":
+        from saipal_analyst.supervisor import run_canary
+        from saipal_engine.config import load_config as _mint_load_config
+
+        sink_root: Path | None = None
+        max_cycles = 0
+        max_units = 0
+        max_attempts = 0
+        replace = False
+        index = 0
+        while index < len(rest):
+            token = rest[index]
+            if token == "--sink" and index + 1 < len(rest):
+                sink_root = Path(rest[index + 1]).expanduser()
+                index += 1
+            elif token == "--replace":
+                replace = True
+            elif token == "--max-cycles" and index + 1 < len(rest):
+                try:
+                    max_cycles = int(rest[index + 1])
+                except ValueError as exc:
+                    raise PalError("USAGE", f"--max-cycles needs an integer") from exc
+                index += 1
+            elif token == "--max-units-per-cycle" and index + 1 < len(rest):
+                try:
+                    max_units = int(rest[index + 1])
+                except ValueError as exc:
+                    raise PalError("USAGE", "--max-units-per-cycle needs an integer") from exc
+                index += 1
+            elif token == "--max-model-attempts" and index + 1 < len(rest):
+                try:
+                    max_attempts = int(rest[index + 1])
+                except ValueError as exc:
+                    raise PalError("USAGE", "--max-model-attempts needs an integer") from exc
+                index += 1
+            else:
+                raise PalError("USAGE", f"unknown readiness mint option {token!r}")
+            index += 1
+        if sink_root is None:
+            raise PalError("USAGE", "readiness mint requires --sink PATH")
+        if not sink_root.is_dir():
+            raise PalError("USAGE", f"sink root {str(sink_root)!r} is not an existing directory")
+        if max_cycles <= 0 or max_units <= 0 or max_attempts <= 0:
+            raise PalError(
+                "USAGE",
+                "readiness mint requires a bounded review: "
+                "--max-cycles, --max-units-per-cycle and --max-model-attempts must all be positive",
+            )
+        prior_status, _prior_attest, prior_detail = readiness_mod.load(home)
+        if not replace and prior_status in ("ok", "unrecoverable"):
+            return EXIT_REFUSED, {
+                "command": "readiness",
+                "ok": False,
+                "reason": (
+                    f"refusing to overwrite {prior_status} readiness proof "
+                    f"at .saipal/readiness.json"
+                    + (f": {prior_detail}" if prior_detail else "")
+                    + "; retry with mint --replace after a successful review"
+                ),
+            }
+        status, config, detail = _mint_load_config(home)
+        if status != "ok" or not isinstance(config, dict) or config.get("publication_mode") != "STAGE_ONLY":
+            return EXIT_REFUSED, {
+                "command": "readiness",
+                "ok": False,
+                "reason": (
+                    "readiness may only be minted on a STAGE_ONLY home; "
+                    f"current mode is {(config or {}).get('publication_mode')!r}"
+                    if status == "ok" and isinstance(config, dict)
+                    else f"config is unusable: {detail}"
+                ),
+            }
+        result = run_canary(
+            home,
+            max_cycles=max_cycles,
+            max_units_per_cycle=max_units,
+            max_model_attempts=max_attempts,
+        )
+        if not result.get("ok"):
+            return EXIT_REFUSED, {
+                "command": "readiness",
+                "ok": False,
+                "reason": "the convergence review did not succeed; no readiness proof was minted",
+                "review": result,
+            }
+        try:
+            attest = readiness_mod.mint(
+                home, report=result, sink=AuditSink(home, root=sink_root), replace=replace
+            )
+        except ValueError as exc:
+            return EXIT_REFUSED, {
+                "command": "readiness",
+                "ok": False,
+                "reason": str(exc),
+                "review": result,
+            }
+        return EXIT_OK, {
+            "command": "readiness",
+            "ok": True,
+            "replaced": replace and prior_status == "ok",
+            "attestation": attest,
+            "next_action": "saipal setup --mode PUBLISH_ENABLED --shadow-reviewed --sink PATH",
+        }
+
+    raise PalError("USAGE", f"unknown readiness subcommand {sub!r}; use status|mint")
+
+
 def cmd_watch(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
     """Foreground unattended supervisor loop (T-91)."""
     from saipal_analyst.supervisor import watch, watch_status
@@ -1123,12 +1473,19 @@ def cmd_watch(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
             )
         except _Pal as exc:
             return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+        # T-109: a structured canary result with ok == false is a REFUSAL with a
+        # process status, never a cheerful exit 0 -- the report body and reason
+        # are preserved either way. Healthy bounded stops stay EXIT_OK.
+        if not result.get("ok"):
+            return EXIT_REFUSED, result
         return EXIT_OK, result
 
     try:
         result = watch(home, max_cycles=max_cycles, max_units_per_cycle=max_units)
     except _Pal as exc:
         return emit_refusal(exc, as_json=False, exit_code=EXIT_REFUSED)  # type: ignore[return-value]
+    if not result.get("ok"):
+        return EXIT_REFUSED, result
     return EXIT_OK, result
 
 
@@ -1195,6 +1552,241 @@ def cmd_investigate(home: Path, registry: dict, args: list[str]) -> tuple[int, d
     is_busy = summary.get("stop_reason") == "BUSY"
     is_idle = summary.get("stop_reason") in ("IDLE", "BUDGET_EXHAUSTED", "CONFIG_DISABLED", "BLOCKED")
     return (EXIT_OK if is_idle or is_busy else EXIT_OK), summary
+
+
+# --------------------------------------------------------------------------- #
+# cpall -- the durable autonomous convergence objective
+# --------------------------------------------------------------------------- #
+
+
+def _analyst_backend_identity(home: Path) -> dict:
+    """Backend/model identity for reports, plus the egress class of the route.
+
+    A loopback endpoint is never classified as external egress; a non-loopback
+    one carries the operator's explicit verdict, so a report can never claim a
+    local run while the evidence left the machine.
+    """
+    try:
+        from saipal_analyst.config import endpoint_is_local, load_analyst_config
+
+        status, config, detail = load_analyst_config(home)
+        if status != "ok" or not config:
+            return {"ok": False, "reason": detail or status}
+        backend = config.get("backend") or {}
+        endpoint = str(backend.get("endpoint") or "")
+        return {
+            "ok": True,
+            "enabled": bool(config.get("enabled")),
+            "route": "local" if endpoint_is_local(endpoint) else "remote",
+            "model": backend.get("model"),
+            "backend_type": backend.get("type"),
+            "loopback": bool(endpoint_is_local(endpoint)),
+        }
+    except Exception as exc:  # noqa: BLE001 - identity is cosmetic, never fatal
+        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _cpall_mechanical_slice(home: Path, registry: dict):
+    """One bounded mechanical cycle, fenced per slice rather than per run.
+
+    The writer fence is taken for the duration of the cycle and released before
+    the semantic slice runs: holding it for a whole multi-hour objective would
+    starve the analyst's own commit path, which is exactly the race the shared
+    fence exists to prevent.
+    """
+
+    def _slice(target: Path) -> dict:
+        with writer_fence(target):
+            _exit, result = _continue_cycle(target, registry)
+        return result if isinstance(result, dict) else {}
+
+    return _slice
+
+
+def _cpall_semantic_slice(home: Path, *, units: int):
+    """One bounded semantic batch through the EXISTING analyst worker.
+
+    No second semantic engine: this is `investigate` with an explicit positive
+    unit budget, exactly as `watch` drives it. The summary is normalised onto
+    cpall's slice contract (`units`, `backend`) and nothing else is added.
+    """
+
+    def _slice(target: Path) -> dict:
+        from saipal_analyst.worker import investigate
+
+        summary = investigate(target, max_units=int(units))
+        report = dict(summary) if isinstance(summary, dict) else {}
+        report["units"] = int(report.get("jobs_completed") or 0)
+        report["backend"] = _analyst_backend_identity(target)
+        return report
+
+    return _slice
+
+
+def cmd_cpall(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """`/goal cpall` -- durable autonomous convergence over eligible work.
+
+    Not a drain: a drain is one bounded process and stops at the first batch
+    boundary. This chains bounded, checkpointed slices into ONE persisted
+    objective that survives restarts, backend outages and conflict isolation.
+    """
+    show_status = False
+    stop_requested = False
+    reason = "operator cancelled the objective"
+    max_slices: int | None = None
+    units: int | None = None
+    cadence: float | None = None
+
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token == "--status":
+            show_status = True
+        elif token in ("--stop", "--cancel"):
+            stop_requested = True
+        elif token == "--reason" and index + 1 < len(args):
+            reason = args[index + 1]
+            index += 1
+        elif token in ("--slices", "--max-slices") and index + 1 < len(args):
+            try:
+                max_slices = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError(
+                    "USAGE", f"{token} needs an integer, got {args[index + 1]!r}"
+                ) from exc
+            if max_slices < 0:
+                raise PalError("USAGE", f"{token} must not be negative")
+            index += 1
+        elif token == "--units" and index + 1 < len(args):
+            try:
+                units = int(args[index + 1])
+            except ValueError as exc:
+                raise PalError(
+                    "USAGE", f"--units needs an integer, got {args[index + 1]!r}"
+                ) from exc
+            if units <= 0:
+                raise PalError("USAGE", "--units must be positive")
+            index += 1
+        elif token == "--report-cadence" and index + 1 < len(args):
+            try:
+                cadence = float(args[index + 1])
+            except ValueError as exc:
+                raise PalError(
+                    "USAGE", f"--report-cadence needs seconds, got {args[index + 1]!r}"
+                ) from exc
+            index += 1
+        else:
+            raise PalError("USAGE", f"unknown cpall option {token!r}")
+        index += 1
+
+    if show_status:
+        if any((stop_requested, max_slices is not None, units is not None, cadence is not None)):
+            raise PalError("USAGE", "cpall --status takes no other option")
+        return cmd_cpall_status(home, registry)
+
+    if stop_requested:
+        result = cpall_mod.cancel(home, reason=reason, registry=registry)
+        return EXIT_OK, {"ok": True, "command": "cpall", "action": "cancel", **{
+            key: value for key, value in result.items() if key != "objective"
+        }, "objective": _cpall_public_objective(result.get("objective") or {}),
+            "next_action": (
+                "the objective is CANCELLED; every completed unit, receipt and "
+                "conflict record is retained. `/goal cpall` starts a fresh objective."
+            )}
+
+    settings = cpall_mod.settings_from_registry(registry)
+    if cadence is not None:
+        settings["report_cadence_seconds"] = max(0.0, float(cadence))
+    units_per_slice = int(units or settings["max_units_per_slice"])
+    settings["max_units_per_slice"] = units_per_slice
+
+    summary = cpall_mod.run(
+        home,
+        mechanical_slice=_cpall_mechanical_slice(home, registry),
+        semantic_slice=_cpall_semantic_slice(home, units=units_per_slice),
+        registry=registry,
+        settings=settings,
+        max_slices=int(max_slices or 0),
+        operator_queue=_operator_queue_module(),
+    )
+    objective = summary.get("objective") or {}
+    payload = {
+        "ok": bool(summary.get("ok", True)),
+        "command": "cpall",
+        "home": str(home),
+        "objective_id": summary.get("objective_id"),
+        "state": summary.get("state"),
+        "stop_reason": summary.get("stop_reason"),
+        "terminal": summary.get("state") in cpall_mod.TERMINAL_STATES,
+        "slices": summary.get("slices"),
+        "runtime_seconds": summary.get("runtime_seconds"),
+        "coverage": summary.get("coverage"),
+        "conflicts": summary.get("conflicts"),
+        "families": objective.get("families"),
+        "retry": objective.get("retry"),
+        "backend": objective.get("backend"),
+        "next_action": objective.get("next_action"),
+        "unresolved": objective.get("unresolved") or [],
+        "reports": cpall_mod.summary_for_report(home, limit=3),
+        "detail": summary.get("detail"),
+    }
+    if summary.get("state") == cpall_mod.STATE_SAFETY_STOP:
+        payload["safety_stop"] = summary.get("safety_stop")
+    if summary.get("stop_reason") == "ATTACHED_TO_LIVE_OWNER":
+        payload["attached"] = True
+        payload["owner"] = summary.get("owner")
+    # OPERATOR_BLOCKED is a truthful refusal-shaped result, not a crash.
+    return EXIT_OK, payload
+
+
+def _cpall_public_objective(objective: dict) -> dict:
+    """The small operator-facing projection of a persisted objective."""
+    return {
+        key: objective.get(key)
+        for key in (
+            "objective_id", "state", "state_reason", "started_at", "last_progress_at",
+            "last_checkpoint_at", "slices", "units_discovered", "units_completed",
+            "units_remaining", "units_eligible_remaining", "units_conflict",
+            "sessions_total", "sessions_completed", "cancelled_at", "cancelled_reason",
+        )
+    }
+
+
+def cmd_cpall_status(home: Path, registry: dict) -> tuple[int, dict]:
+    """Read-only CPALL truth, joined with the live eligible-work view."""
+    report = cpall_mod.status(home, registry=registry)
+    try:
+        view = cpall_mod.backlog(home, registry=registry)
+    except PalError as exc:
+        view = {"ok": False, "code": exc.code, "message": exc.message}
+    recent = cpall_mod.summary_for_report(home, limit=3)
+    return EXIT_OK, {
+        "ok": True,
+        "command": "cpall-status",
+        "home": str(home),
+        "cpall": report,
+        "backlog": view,
+        "recent_reports": recent["recent"],
+        "reports_total": recent["reports_total"],
+        "idle": False if report.get("exists") else None,
+        "next_action": report.get("next_action"),
+    }
+
+
+def cmd_goal(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
+    """The `/goal` operator form: `/goal cpall`, `/goal status`, `/goal stop`."""
+    if not args:
+        raise PalError("USAGE", "goal needs a subcommand: cpall | status | stop")
+    sub, rest = args[0], args[1:]
+    if sub in ("cpall", "converge", "continue-all", "all"):
+        return cmd_cpall(home, registry, rest)
+    if sub == "status":
+        return cmd_cpall_status(home, registry)
+    if sub in ("stop", "cancel"):
+        return cmd_cpall(home, registry, ["--stop", *rest])
+    raise PalError(
+        "USAGE", f"unknown goal {sub!r}; expected cpall | status | stop"
+    )
 
 
 def cmd_submit(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
@@ -1313,6 +1905,17 @@ def _load_read_only(home: Path, registry: dict) -> dict:
     log_events, malformed = log_stats(home)
     paths = home_paths(home)
     assert state is not None
+    # CONFLICT COUNT (T-135): one canonical definition, two explicit names.
+    # `sessions_conflict` is the OPERATOR-FACING population: the freshest
+    # generation of each session, which is the only generation analysis is
+    # offered for and the only one an operator can resolve. Counting every
+    # indexed record made `status`/`report`/`next` report 12 while `doctor`
+    # reported 11 on the same live home; the historical occurrence count is now
+    # named `sessions_conflict_indexed` and the difference is named too, so a
+    # superseded generation can never pass for a second work item.
+    from saipal_engine import carrier as _carrier_mod
+
+    conflict_population = _carrier_mod.conflict_population(index or {})
     return {
         "ok": True,
         "_session_index": index,
@@ -1329,7 +1932,10 @@ def _load_read_only(home: Path, registry: dict) -> dict:
         "sessions": len(records),
         "sessions_hot": sum(1 for r in records if r["temperature"] == "HOT"),
         "sessions_cold": sum(1 for r in records if r["temperature"] == "COLD"),
-        "sessions_conflict": sum(1 for r in records if r["status"] == "CONFLICT"),
+        "sessions_conflict": conflict_population["current_total"],
+        "sessions_conflict_current": conflict_population["current_total"],
+        "sessions_conflict_indexed": conflict_population["indexed_total"],
+        "sessions_conflict_superseded": conflict_population["superseded_total"],
         "events_indexed": sum(int(r["event_count"]) for r in records),
         "episodes": sum(len(r["episodes"]) for r in records),
         "log_events": log_events,
@@ -1529,6 +2135,9 @@ def cmd_report(home: Path, registry: dict) -> tuple[int, dict]:
         "verdict": verdict,
         "sessions": base["sessions"],
         "sessions_conflict": base["sessions_conflict"],
+        "sessions_conflict_current": base.get("sessions_conflict_current"),
+        "sessions_conflict_indexed": base.get("sessions_conflict_indexed"),
+        "sessions_conflict_superseded": base.get("sessions_conflict_superseded"),
         "coverage": coverage,
         "counts": counts,
         "findings": reported,
@@ -1583,6 +2192,9 @@ def cmd_next(home: Path, registry: dict) -> tuple[int, dict]:
         "sources": result["sources"],
         "sessions": result["sessions"],
         "sessions_conflict": result["sessions_conflict"],
+        "sessions_conflict_current": result.get("sessions_conflict_current"),
+        "sessions_conflict_indexed": result.get("sessions_conflict_indexed"),
+        "sessions_conflict_superseded": result.get("sessions_conflict_superseded"),
         "next_action": "saipal continue",
     }
     notes = {
@@ -1664,9 +2276,127 @@ def _render_watch_status_human(result: dict) -> str:
     return "\n".join(lines)
 
 
+def _render_cpall_human(result: dict) -> str:
+    """The CPALL control panel: objective truth, never IDLE while it lives."""
+    lines = [f"cpall: {result.get('state')} [{result.get('objective_id')}]"]
+    coverage = result.get("coverage") or {}
+    if coverage:
+        lines.append(
+            f"units: {coverage.get('units_completed', 0)}/{coverage.get('units_discovered', 0)} "
+            f"completed, {coverage.get('units_eligible_remaining', 0)} eligible remaining"
+        )
+        lines.append(
+            f"sessions: {coverage.get('sessions_completed', 0)}/"
+            f"{coverage.get('sessions_total', 0)} exhausted"
+        )
+    conflicts = result.get("conflicts") or {}
+    if conflicts:
+        lines.append(
+            f"conflicts: current={conflicts.get('current')} "
+            f"indexed={conflicts.get('indexed')} "
+            f"superseded={conflicts.get('superseded')}"
+        )
+    lines.append(f"slices: {result.get('slices')}")
+    lines.append(f"stop_reason: {result.get('stop_reason')}")
+    if result.get("detail"):
+        lines.append(f"detail: {result['detail']}")
+    retry = result.get("retry") or {}
+    if retry.get("next_attempt_at"):
+        lines.append(
+            f"retry: attempts={retry.get('attempts')} "
+            f"next={retry.get('next_attempt_at')} "
+            f"class={retry.get('last_error_class')}"
+        )
+    backend = result.get("backend") or {}
+    if backend.get("model"):
+        lines.append(
+            f"backend: {backend.get('route')}/{backend.get('model')} "
+            f"(loopback={backend.get('loopback')})"
+        )
+    for name, family in sorted((result.get("families") or {}).items()):
+        lines.append(
+            f"  family {name}: {family.get('state')} - {family.get('reason')}"
+        )
+    for row in result.get("unresolved") or []:
+        lines.append(f"  unresolved: {row}")
+    lines.append(f"next_action: {result.get('next_action')}")
+    return "\n".join(lines)
+
+
+def _render_cpall_status_human(result: dict) -> str:
+    report = result.get("cpall") or {}
+    view = result.get("backlog") or {}
+    if not report.get("exists"):
+        return (
+            "cpall: none\nnext_action: `/goal cpall` starts a durable convergence "
+            "objective"
+        )
+    coverage = report.get("coverage") or {}
+    lines = [
+        f"cpall: {report.get('state')} [{report.get('objective_id')}]"
+        if report.get("objective_id")
+        else f"cpall: {report.get('state')}",
+        f"started: {report.get('started_at')}  last_progress: {report.get('last_progress_at')}",
+        f"checkpoint: {report.get('last_checkpoint_at')}",
+        f"units: {coverage.get('units_completed')}/{coverage.get('units_discovered')} "
+        f"completed, {coverage.get('units_eligible_remaining')} eligible remaining, "
+        f"{coverage.get('units_blocked')} blocked",
+        f"sessions: {coverage.get('sessions_completed')}/{coverage.get('sessions_total')} "
+        "exhausted",
+        f"coverage: {coverage.get('percent')}%",
+    ]
+    conflicts = report.get("conflicts") or {}
+    lines.append(
+        f"conflicts: current={conflicts.get('current')} "
+        f"isolated={conflicts.get('isolated')} "
+        f"indexed={conflicts.get('indexed')} superseded={conflicts.get('superseded')}"
+    )
+    retry = report.get("retry") or {}
+    lines.append(
+        f"retry: attempts={retry.get('attempts')} "
+        f"next_in={retry.get('seconds_until_retry')} "
+        f"class={retry.get('last_error_class')}"
+    )
+    owner = report.get("owner") or {}
+    if owner.get("owner_id"):
+        lines.append(
+            f"owner: {owner.get('owner_id')} pid={owner.get('pid')} "
+            f"live={owner.get('live')} heartbeat={owner.get('heartbeat_at')}"
+        )
+    backend = report.get("backend") or {}
+    lines.append(
+        f"backend: {backend.get('route')}/{backend.get('model')} "
+        f"ready={backend.get('ok')}"
+    )
+    for name, family in sorted((report.get("families") or {}).items()):
+        lines.append(f"  family {name}: {family.get('state')} - {family.get('reason')}")
+    if view.get("ok"):
+        lines.append(
+            f"live backlog: {view.get('units_eligible_remaining')} eligible of "
+            f"{view.get('units_discovered')}, {view.get('conflicts_current')} current "
+            f"conflicts ({view.get('conflicts_indexed')} indexed occurrences, "
+            f"{view.get('conflicts_superseded')} superseded)"
+        )
+        lines.append(
+            f"mechanical pending: {view.get('mechanical_pending')} "
+            f"(staged audits {view.get('staged_audits')}, inbox files "
+            f"{view.get('inbox_files')})"
+        )
+    lines.append(f"next_action: {report.get('next_action')}")
+    return "\n".join(lines)
+
+
 def render_human(result: dict) -> str:
+    if result.get("operator_queue"):
+        return str(result.get("rendered") or "operator-queue: no packet")
+    if result.get("command") == "cpall-status":
+        return _render_cpall_status_human(result)
+    if result.get("command") == "cpall":
+        return _render_cpall_human(result)
     if result.get("watch_status"):
         return _render_watch_status_human(result)
+    if result.get("requeue"):
+        return _render_analyst_requeue_human(result)
     if "analyst_setup" in result:
         return "\n".join(
             [
@@ -1687,6 +2417,39 @@ def render_human(result: dict) -> str:
             f"worker lock: {'held' if result.get('worker_active') else 'free'}",
             f"semantic: {result.get('semantic')}",
         ]
+        blocked = result.get("blocked") or {}
+        if blocked and not blocked.get("index"):
+            lines.append(
+                f"blocked: {blocked.get('blocked_total', 0)} unit(s) cannot be "
+                f"analyzed, {blocked.get('runnable', 0)} runnable "
+                f"(of {blocked.get('population', 0)} sessions)"
+            )
+            for group in blocked.get("groups") or []:
+                action = group.get("command") or group.get("action") or "no action"
+                lines.append(f"  {group['class']} {group['count']}: {action}")
+                # PAL-CPALL-04: name WHICH decision works. Enrolling an authority
+                # root moves a unit only when the session carries an artifact the
+                # root can check, so the dead half is stated beside the command
+                # instead of being left for the operator to discover.
+                evidence = group.get("binding_evidence") or {}
+                if evidence:
+                    lines.append(
+                        f"    binding evidence: "
+                        f"{evidence['authority_verifiable']} enrol-movable, "
+                        f"{evidence['evidence_absent']} evidence-absent "
+                        f"(no authority root can change those)"
+                    )
+                if group.get("provisional_admission") is not None:
+                    elsewhere = group.get("not_admitted") or {}
+                    detail = ", ".join(
+                        f"{count} {klass}" for klass, count in elsewhere.items()
+                    )
+                    lines.append(
+                        f"    --with-provisional admits "
+                        f"{group['provisional_admission']}: {detail or 'none'}"
+                    )
+            if blocked.get("next_action"):
+                lines.append(f"next blocked action: {blocked['next_action']}")
         lines += [f"problem: {problem}" for problem in problems]
         lines.append("ok" if result.get("ok") else "NOT OK")
         return "\n".join(lines)
@@ -1979,7 +2742,10 @@ def render_human(result: dict) -> str:
             f"imported: {intake['new_sessions']}",
             f"skipped: {len(intake['skipped'])}",
             f"rejected: {len(intake['rejected'])}",
-            f"conflicts: {len(intake['conflicts'])}",
+            # "new this cycle" is the only thing a `continue` cycle can know;
+            # the canonical total is reported by `status`/`report`/`cpall`, so
+            # the two questions no longer share one ambiguous word (T-135).
+            f"conflicts_new: {len(intake['conflicts'])}",
             f"sessions_total: {intake['sessions_total']}",
             f"candidates: {result['candidates']}",
             f"audits_emitted: {result['audits_emitted']}",
@@ -2068,6 +2834,56 @@ def cmd_sessions(home: Path, registry: dict, args: list[str]) -> tuple[int, dict
     }
 
 
+def _resolve_evidence_locator(
+    home: Path, registry: dict, record: dict, event_seq: int
+) -> dict:
+    """The canonical locator for one indexed event, or an explicit refusal.
+
+    SRC-004 PERF-001 integrity repair: the locator must come from the canonical
+    bundle bytes that match the indexed generation's `bundle_sha256` -- never
+    from a duplicated per-event index projection, and never from an unvalidated
+    `json.load` of whatever currently sits in the inbox. The canonical bundle
+    is resolved through the validated loader bound to the record's trusted
+    bundle identity (root-confined path, expected digest, current canonical
+    registry), so a materially changed bundle, a digest mismatch or a malformed
+    bundle refuses with the canonical integrity error instead of answering from
+    mismatched bytes. The legacy index projection answers only for the exact
+    compatibility condition where the canonical bundle is genuinely absent
+    (pre-bundle-era records).
+    """
+    source_ref = str(record.get("source_ref") or "")
+    bundle_path = home_paths(home).session_inbox / Path(source_ref).name if source_ref else None
+    if bundle_path is not None and bundle_path.is_file():
+        from saipal_engine import bundle as bundle_mod
+
+        payload = bundle_mod.load_bundle_verified(
+            bundle_path,
+            registry=registry,
+            expected_sha256=record.get("bundle_sha256"),
+        )
+        for event in bundle_mod.events_of(payload):
+            if isinstance(event, dict) and event.get("seq") == event_seq:
+                locator = event.get("evidence_ref")
+                if locator is not None:
+                    return {"seq": event_seq, "evidence_ref": locator}
+                break
+        raise PalError(
+            "EVIDENCE_NOT_FOUND",
+            f"event {event_seq} has no evidence locator in the canonical bundle",
+        )
+    # Legacy index-projection compatibility: the canonical bundle is genuinely
+    # absent and the projection is all this home still carries. This fallback
+    # never hides a digest mismatch or a malformed canonical bundle -- those
+    # refuse above.
+    entry = next(
+        (item for item in record.get("evidence_refs", []) if item.get("seq") == event_seq),
+        None,
+    )
+    if entry is None:
+        raise PalError("EVIDENCE_NOT_FOUND", f"event {event_seq} has no evidence locator")
+    return entry
+
+
 def cmd_evidence(home: Path, registry: dict, args: list[str]) -> tuple[int, dict]:
     """Resolve an indexed event locator into one bounded provider window."""
     if len(args) < 2:
@@ -2107,12 +2923,7 @@ def cmd_evidence(home: Path, registry: dict, args: list[str]) -> tuple[int, dict
     record = find_session(session_index or {"sessions": []}, session_id)
     if record is None:
         raise PalError("EVIDENCE_NOT_FOUND", f"session {session_id!r} is not indexed")
-    entry = next(
-        (item for item in record.get("evidence_refs", []) if item.get("seq") == event_seq),
-        None,
-    )
-    if entry is None:
-        raise PalError("EVIDENCE_NOT_FOUND", f"event {event_seq} has no evidence locator")
+    entry = _resolve_evidence_locator(home, registry, record, event_seq)
     source_ref = record.get("provider_source_ref")
     if not isinstance(source_ref, str) or not source_ref:
         raise PalError("EVIDENCE_UNSUPPORTED", "session has no provider source authority")
@@ -2159,28 +2970,52 @@ def cmd_evidence(home: Path, registry: dict, args: list[str]) -> tuple[int, dict
 
 
 def _resolve_home(options: Options, command: str) -> Path:
-    home, _reason = resolve_home(explicit=options.home)
-    if home is not None:
-        return Path(home)
-        if command in READ_ONLY_COMMANDS or command in READ_ONLY_WITH_ARGS:
-            raise PalError(
-                "NO_HOME",
-                f"no {HOME_DIRNAME}/ found; read-only commands never create one",
-                next_action="saipal continue",
-            )
-        return resolve_tool_root() / HOME_DIRNAME
-    if command in ("analyst-status", "analyst-doctor", "investigate", "watch", "authority", "sources"):
-        # Analyst commands resolve the same way as kernel read-only: never
-        # create a home merely by asking about it. `investigate` is a write
-        # command, but it must still prove its home exists first.
-        if home is None:
-            raise PalError(
-                "NO_HOME",
-                f"no {HOME_DIRNAME}/ found; read-only commands never create one",
-                next_action="saipal continue",
-            )
-        return Path(home)
-    return resolve_tool_root() / HOME_DIRNAME
+    # TARGET 1 (T-125): define bootstrap control flow cleanly:
+    # 1. Explicitly declared home (--home or SAIPAL_HOME)
+    explicit_val = options.home
+    explicit_source = "explicit --home"
+    if explicit_val is None:
+        env_val = os.environ.get(HOME_ENV_VAR, "").strip()
+        if env_val:
+            explicit_val = env_val
+            explicit_source = f"{HOME_ENV_VAR} environment variable"
+
+    if explicit_val is not None:
+        target = Path(explicit_val).expanduser()
+        if target.is_dir():
+            # Existing home: use it, no bootstrap mutation beyond required lock state
+            return target
+        # Explicit missing home
+        if command in BOOTSTRAP_COMMANDS:
+            establish_lock_surface(target)
+            return target
+        raise PalError(
+            "NO_HOME",
+            f"no {HOME_DIRNAME}/ found at {str(target)!r} ({explicit_source}); "
+            "read-only commands never create one",
+            next_action="saipal continue",
+        )
+
+    # 2. Implicit ancestor walk
+    here = Path.cwd().resolve()
+    for candidate in (here, *here.parents):
+        nested = candidate / HOME_DIRNAME
+        if nested.is_dir():
+            return nested
+
+    # 3. Implicit missing home
+    if command in BOOTSTRAP_COMMANDS:
+        canonical = resolve_tool_root() / HOME_DIRNAME
+        establish_lock_surface(canonical)
+        return canonical
+
+    # 4. Read-only command + missing home
+    raise PalError(
+        "NO_HOME",
+        f"no {HOME_DIRNAME}/ found in {here} or any ancestor; "
+        "read-only commands never create one",
+        next_action="saipal continue",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2212,11 +3047,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if command not in available_commands(registry):
+        hint = "; SAIPAL continuation shortcut is 'pal'" if command == "cc" else ""
         return emit_refusal(
             PalError(
                 "UNKNOWN_COMMAND",
-                f"unknown command {command!r}",
-                next_action="saipal --help",
+                f"unknown command {command!r}{hint}",
+                next_action="saipal pal" if command == "cc" else "saipal --help",
             ),
             as_json=options.as_json,
             exit_code=EXIT_USAGE,
@@ -2275,6 +3111,11 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, result = cmd_analyst_doctor(home, registry)
         elif command == "analyst-status":
             exit_code, result = cmd_analyst_status(home, registry)
+        elif command == "analyst-requeue":
+            # Bounded journal mutation: the canonical transaction inside
+            # requeue() takes the analyst worker lock (the same one `investigate`
+            # takes), so a live run can never race it; no dispatcher lock here.
+            exit_code, result = cmd_analyst_requeue(home, registry, args)
         elif command == "investigate":
             exit_code, result = cmd_investigate(home, registry, args)
         elif command == "rebind":
@@ -2283,6 +3124,14 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, result = cmd_rebind(home, registry, args)
         elif command == "coverage":
             exit_code, result = cmd_coverage(home, registry, args)
+        elif command == "operator-queue":
+            # Read-only: it classifies the corpus and never decides anything.
+            # --write persists the packet atomically; no fence is taken, because
+            # the file it writes is a derived report, not home state.
+            exit_code, result = cmd_operator_queue(home, registry, args)
+        elif command == "readiness":
+            with writer_fence(home):
+                exit_code, result = cmd_readiness(home, registry, args)
         elif command == "authority":
             # ROLE 18 (revised, ROLE 20260910): enrollment mutates the trusted
             # control plane (config + pinning), but the fence belongs in the
@@ -2298,6 +3147,10 @@ def main(argv: list[str] | None = None) -> int:
             exit_code, result = cmd_sources(home, registry, args)
         elif command == "watch":
             exit_code, result = cmd_watch(home, registry, args)
+        elif command == "cpall":
+            exit_code, result = cmd_cpall(home, registry, args)
+        elif command == "goal":
+            exit_code, result = cmd_goal(home, registry, args)
         else:
             exit_code, result = cmd_next(home, registry)
     except PalError as exc:
@@ -2312,7 +3165,12 @@ def main(argv: list[str] | None = None) -> int:
             code = EXIT_REFUSED
         return emit_refusal(exc, as_json=options.as_json, exit_code=code)
 
-    return emit(result, as_json=options.as_json) if exit_code == EXIT_OK else exit_code
+    # T-109: a refused structured result still carries its JSON body and
+    # reason. Only a None result (nothing to report) exits silently.
+    if result is None:
+        return exit_code
+    emit(result, as_json=options.as_json)
+    return exit_code
 
 
 def _smoke() -> None:

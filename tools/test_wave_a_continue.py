@@ -211,11 +211,17 @@ class ContinueCycle(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["code"], "UNKNOWN_COMMAND")
 
-    def test_cc_alias_runs_continue(self) -> None:
-        code, payload, err = support.run_saipal_json("cc", home=self.home)
+    def test_pal_alias_runs_continue(self) -> None:
+        code, payload, err = support.run_saipal_json("pal", home=self.home)
         self.assertEqual(code, 0, err)
         assert payload is not None
         self.assertEqual(payload["command"], "continue")
+
+    def test_retired_cc_alias_refuses_unknown_command(self) -> None:
+        code, payload, _err = support.run_saipal_json("cc", home=self.home)
+        self.assertEqual(code, 2)
+        assert payload is not None
+        self.assertEqual(payload["code"], "UNKNOWN_COMMAND")
 
     def test_bare_invocation_runs_continue(self) -> None:
         if str(TOOLS_DIR) not in sys.path:
@@ -347,6 +353,93 @@ class DrainLoop(unittest.TestCase):
         self.assertEqual(code, 0, err)
         assert payload is not None
         self.assertNotIn("drain", payload)
+
+
+class DrainTerminalState(unittest.TestCase):
+    """W2-001: drain must exhaust the ANALYSIS budget, not just intake.
+
+    `idle` used to mean "no new bundle arrived", so a home whose analysis budget
+    (50 sessions) stopped the cycle still reported `backlog drained` with
+    processing records left. One `--drain` invocation must finish them.
+    """
+
+    BUDGET = 50
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.home = support.make_home(self.tmp)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _cold_bundle(self, session_id: str) -> dict:
+        return {
+            "schema_version": 1,
+            "session_id": session_id,
+            "adapter": "generic",
+            "project": {"name": "DrainProject"},
+            "runtime": {"provider": "p", "model": "m"},
+            "temperature": "COLD",
+            "protocol": {"version": "7.231.9", "registry_sha256": "a" * 64},
+            "events": [
+                {"seq": 1, "type": "USER_MESSAGE", "facts": {"task": "step"}},
+                {"seq": 2, "type": "ASSISTANT_MESSAGE", "facts": {"reply": "done"}},
+            ],
+        }
+
+    def _stage(self, count: int) -> None:
+        for index in range(count):
+            support.write_inbox(
+                self.home, f"drain-{index:03d}.json", self._cold_bundle(f"drain-{index:03d}")
+            )
+
+    def _drain(self) -> dict:
+        code, payload, err = support.run_saipal_json("continue", "--drain", home=self.home)
+        self.assertEqual(code, 0, err)
+        assert payload is not None
+        return payload
+
+    def _assert_all_exhausted(self) -> None:
+        records = support.sessions_of(self.home)
+        self.assertTrue(records, "precondition: sessions were indexed")
+        pending = [
+            record["session_id"]
+            for record in records
+            if record.get("episodes")
+            and not record.get("analysis", {}).get("episodes_exhausted")
+        ]
+        self.assertEqual(pending, [], f"mechanically unanalysed records remain: {pending[:5]}")
+
+    def test_drain_finishes_a_backlog_beyond_one_budget(self) -> None:
+        """120 sessions, 50-session budget: one drain leaves nothing pending."""
+        self._stage(120)
+        payload = self._drain()
+        self.assertEqual(payload["drain_outcome"], "idle")
+        self.assertEqual(payload["drain_reason"], "backlog drained")
+        self.assertGreaterEqual(
+            payload["drain_cycles"], 3, "drain stopped before the second budget chunk"
+        )
+        self.assertEqual(payload["sessions_analyzed"], 120)
+        self.assertNotEqual(
+            payload["cycle_results"][0]["sessions_analyzed"], 120
+        )
+        self._assert_all_exhausted()
+
+    def test_exactly_one_budget_is_a_single_chunk(self) -> None:
+        self._stage(self.BUDGET)
+        payload = self._drain()
+        self.assertEqual(payload["drain_outcome"], "idle")
+        self.assertEqual(payload["sessions_analyzed"], self.BUDGET)
+        self._assert_all_exhausted()
+
+    def test_one_past_the_budget_does_not_declare_drained_early(self) -> None:
+        self._stage(self.BUDGET + 1)
+        payload = self._drain()
+        self.assertEqual(payload["drain_outcome"], "idle")
+        self.assertEqual(payload["sessions_analyzed"], self.BUDGET + 1)
+        self.assertTrue(payload["cycle_results"][0]["work_remaining"])
+        self._assert_all_exhausted()
 
 
 if __name__ == "__main__":

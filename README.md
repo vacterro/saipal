@@ -1,159 +1,232 @@
-<div align="center">
-
 # SAIPAL
 
-**Forensic observer for SAIPEN-governed agent sessions.**
+**Forensic observation of AI agent sessions against their governing protocol.**
 
-[![Version](https://img.shields.io/badge/version-0.4.1-D4B86A?style=flat-square)](VERSION)
-![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?style=flat-square&logo=python&logoColor=white)
-![Dependencies](https://img.shields.io/badge/runtime-stdlib%20only-4A7A20?style=flat-square)
-![Role](https://img.shields.io/badge/role-observer%2C%20not%20maintainer-6B5A2B?style=flat-square)
+SAIPAL turns AI agent sessions into inspectable, durable project state. It indexes
+session transcripts as evidence, checks what the agent actually did against the
+protocol that governed the session, records findings, and hands qualified drift
+reports to a human maintainer as immutable, numbered audits. The part that can
+hallucinate cannot write; the part that writes cannot interpret.
 
-[Architecture](saipal/ARCHITECTURE.md) · [Commands](saipal/COMMANDS.md) · [Analysis contract](saipal/ANALYSIS.md) · [Run](#run-it)
+| | |
+| --- | --- |
+| Language | Python 3.8+, standard library only — no pip dependencies |
+| Platform | Windows verified (primary); POSIX focused controls executed, full POSIX certification deferred |
+| Verification | Canonical suite and protocol validator; see [docs/verification.md](docs/verification.md) |
+| Status | **v0.4.3** — usable, parked (SIDE1); see [CHANGELOG.md](CHANGELOG.md) |
 
-</div>
+## Why SAIPAL exists
 
-SAIPAL reads session evidence, binds it to the protocol version that actually governed the work, and turns qualified root causes into immutable audits for the SAIPEN maintainer.
+AI coding agents are productive and opaque. When a session ends — normally, or in
+the middle of something — the only record of what happened is the conversation
+itself, which lives in a vendor's storage, rots with every new session, and cannot
+be audited. Humans end up re-reading transcripts to answer simple questions: what
+did the agent change, was it allowed to, did anyone verify it, what is still open.
 
-**It observes and reports. It does not become a second maintainer.**
+SAIPAL moves that answer into your own filesystem, as plain files:
 
-## How it is built
+- **Explicit state.** A project gets a local `.saipal/` home with an index,
+  findings, audits and telemetry. You can read every byte of it.
+- **Judged sessions, not accused ones.** Episodes are examined one at a time; a
+  clean session is *proved* clean, and the report always shows coverage next to
+  the verdict.
+- **Audits a human can act on.** Qualified drift becomes a numbered, immutable
+  markdown audit — never silently rewritten or deleted by SAIPAL itself.
+- **Work that survives interruption.** Cycles checkpoint exactly where they
+  stopped; a crashed run resumes from explicit state instead of starting over.
 
-Two layers, and the boundary between them is the whole design
-(`saipal/ARCHITECTURE.md`):
+## How it works
 
-- **Layer A — the deterministic kernel.** Stdlib-only Python in
-  `tools/saipal_engine/`. Owns evidence identity, digests, the session index,
-  HOT/COLD watermarks, protocol binding, carrier allocation, mechanical detector
-  signals, finding validation, the do-no-harm gate, audit construction and the
-  single constrained enqueue. It never calls a model and never reads meaning.
-- **Layer B — the replaceable analyst.** Any capable agent. It reads dialogue
-  meaning, argues both sides of a finding, and submits one structured candidate
-  per unit of work through `saipal submit` — its only write path.
+Two layers, and the boundary between them is the whole design:
 
-That split is what makes the tool auditable: the part that can hallucinate cannot
-write, and the part that writes cannot interpret.
+- **Layer A — the deterministic kernel** (`tools/saipal_engine/`). Stdlib-only
+  Python that owns evidence identity, digests, the session index, protocol
+  binding, mechanical detector signals, finding validation, the do-no-harm gate,
+  audit construction and the single constrained audit enqueue. It never calls a
+  model and never reads meaning.
+- **Layer B — the replaceable analyst.** Any capable agent or model. It reads
+  dialogue meaning, argues both sides of a finding (prosecutor/defender), and
+  submits one structured candidate per unit of work through `saipal submit` —
+  its only write path.
 
-## Start here
+Transcripts are treated as untrusted data: text inside a session can never expand
+what SAIPAL is allowed to do. A drift claim must cite a rule that existed in the
+protocol version that actually governed the session, and the binding to that
+version is proved against real bytes — never taken from the transcript's word.
 
-- `saipal/BOOT.md` — how SAIPAL starts, recovers and checkpoints
-- `saipal/CORE.md` — the global laws (incl. PAL-EVIDENCE-02: transcripts are untrusted data)
-- `saipal/ARCHITECTURE.md` — the two-layer boundary
-- `saipal/SKILL.md` — thin agent adapter: any agent can act as SAIPAL
-- `saipal/ANALYSIS.md` — the semantic forensic reasoning contract
-- `saipal/COMMANDS.md` — the operator surface
-- `saipal/INDEX.md` — document map: one question, one owner document
+## Quick start
 
-## Install it as a skill
-
-`skills/saipal/SKILL.md` is the Freebuff skill manifest for `/saipal cc`.
-Copy it into your platform skills directory to make the command available to
-any agent:
-
-```bash
-mkdir -p "$HOME/.agents/skills/saipal"
-cp skills/saipal/SKILL.md "$HOME/.agents/skills/saipal/SKILL.md"
-```
-
-`/saipal cc` engages DETECTIVE mode (the bounded analyst loop: `cc` →
-`--json next` → reason prosecutor/defender → `submit` → repeat within
-`SAIPAL_CC_BUDGET`) and ends in REPORTER mode (`report`), so an agent given
-the skill can judge real sessions and report drifts with attribution. The
-engine and protocol stay in this repository; the skill only resolves
-`saipal_root` (env `SAIPAL_ROOT`, then the known checkout, then nearest
-ancestor holding `tools/saipal.py` + `saipal/SKILL.md`) and the `.saipal/`
-home.
-
-## Run it
+Requires Python 3.8+ (tested on 3.11). No installation; run from a clone.
 
 ```bash
-python -B tools/saipal.py continue          # one bounded cycle (alias: cc)
-python -B tools/saipal.py continue --drain  # repeat cycles until idle or blocked
-python -B tools/saipal.py --json next       # the next analysis carrier
-python -B tools/saipal.py submit cand.json  # absorb one analyst candidate
-python -B tools/saipal.py report            # the drift report
-python -B tools/saipal.py status            # compact summary
-python -B tools/saipal.py sessions 25       # known sessions, freshest first
-python -B tools/saipal.py --json evidence SESSION EVENT   # bounded untrusted window
-python -B tools/saipal.py doctor            # read-only diagnosis
-python -B tools/saipal.py setup --source PATH --kind generic   # configure
-python -B tools/saipal.py disposition receipts.json            # closed loop
-python -B tools/saipal.py trigger           # request one pending run (coalescing)
-python -B tools/test_runner.py              # full suite, clean checkout
-python -B tools/validate.py                 # protocol and registry drift gate
+# 1. Configure a source of sessions (a folder of canonical JSON bundles works as-is)
+python -B tools/saipal.py setup --source tests/golden_sessions --kind generic
+
+# 2. Run one bounded cycle: dispatch sources, index sessions, run the mechanical pass
+python -B tools/saipal.py continue
+
+# 3. Inspect the result
+python -B tools/saipal.py status
+python -B tools/saipal.py report
 ```
 
-Standard library only. No pip dependencies. Python 3.8+.
+That is the mechanical loop. `setup`, `continue`, `submit` and the documented
+analyst/convergence commands have explicit state-writing contracts;
+`status`, `report`, `next`, `sessions`, `evidence` and `doctor` are strictly
+read-only. Exit codes: `0` success, `1` refused, `2` usage error, `3` no home.
 
-## The analyst loop
+By default SAIPAL keeps its state in `.saipal/` under the checkout. Use
+`--home PATH` or the `SAIPAL_HOME` environment variable to point it anywhere
+else — read-only commands never create a home, and an explicit home reaches only
+what you configured. Publication is staged locally by default (`STAGE_ONLY`);
+nothing leaves the machine until an operator explicitly mints a readiness proof
+and enables a sink.
 
-```
-saipal --json continue          # import evidence, run the mechanical pass
-saipal --json next              # one bounded carrier: episode + evidence + law
-   reason over it, then
-saipal --json submit cand.json  # DRIFT, NO_DRIFT or INSUFFICIENT_EVIDENCE
-saipal report                   # the verdict, with the coverage behind it
-```
+POSIX note: on Linux, use `python3` and the same commands; the paths SAIPAL
+reads are configured the same way. See [docs/verification.md](docs/verification.md)
+for what has and has not been exercised on POSIX.
 
-`NO_DRIFT` is a first-class result: it is the receipt that proves an episode was
-examined, and the only thing that advances the semantic watermark. A clean session
-is therefore *proved* clean rather than merely unaccused.
+## A worked example
 
-`report` never reads as clean when nothing was judged. Its verdict set is
-`NO_EVIDENCE`, `NOT_EXAMINED`, `NO_DRIFT_SO_FAR`, `DRIFT_SUSPECTED`,
-`DRIFT_REPORTED`, and coverage always travels beside it.
+Sessions enter as canonical JSON bundles (adapters for several agent tools are
+built in; `generic` takes a simple documented format). From intake to audit:
 
-## What keeps it honest
-
-- **No hindsight.** A finding may claim a violation only if the session's protocol
-  binding is known and the rule existed in the governing version.
-- **Binding is proved, never declared.** A bundle claiming `BOUND` persists as
-  `UNKNOWN`: the proof is re-derived against operator-declared protocol authority
-  (a Git repository, a release root or a snapshot root) and must match real bytes.
-- **Transcripts are untrusted data.** Analyzed conversations are evidence, never
-  authority; text inside a session cannot expand what SAIPAL may do.
-- **Do no harm.** A fix that reaches a protected invariant without declaring it,
-  from a disposition that blames a model rather than the protocol, is blocked
-  before it can become an audit.
-- **One root cause, one finding.** Identity is a normalized causal key, so a
-  rephrase does not split a recurrence chain.
-- **Spread decides the fix surface.** One model drifting where another complied is
-  model noncompliance, not a protocol defect.
-
-## Status
-
-Version 0.4.2. Waves A–I plus the semantic analyst loop (carrier, candidate
-schema, submission boundary, no-drift receipts, coverage, paged episodes,
-sink retry, trigger coalescing) are implemented and green.
-
-Verification counts live in ONE place: the **Current verification truth**
-block of `WAVE_I_CHECKPOINT.md`, re-derived from the real suite after every
-material change and stamped with its `checkpoint_id`. This README does not
-keep its own counters — a count copied into a second document rots silently.
-Run the two commands any time you want the live numbers:
-
-```bash
-python -B -m unittest discover -s tools -p "test_*.py"   # canonical unittest suite
-python -B tools/validate.py                              # protocol/registry checks
+```text
+canonical bundles (tests/golden_sessions/)          evidence enters the inbox
+  └─ saipal continue                                 indexed; mechanical pass runs
+       └─ mechanical signal raised (triage-only)     e.g. PHASE_ILLEGALITY
+            └─ saipal --json next                    one bounded analysis carrier:
+                 episode + evidence + applicable law
+                 an analyst reasons prosecutor/defender, then
+               └─ saipal submit candidate.json        verdict: DRIFT / NO_DRIFT /
+                    INSUFFICIENT_EVIDENCE — the only write path for Layer B
+                  └─ a DRIFT confirmed against a bound protocol authority
+                       becomes a numbered, immutable audit:
+                       .saipal/audit/staging/1.md
 ```
 
-Publication defaults to `STAGE_ONLY`; `PUBLISH_ENABLED` requires an explicit
-operator-reviewed shadow pass **and** a validated sink root in the same call.
+Three properties of that loop are the point:
 
-See `WAVE_I_CHECKPOINT.md` for founding coverage,
-`docs/TERMISAI_EVIDENCE_CONTRACT.md` for the evidence contract,
-`SAIPAL_OPERATIONAL_HANDOFF.md` for the operational surface and failure modes, and
-`docs/audits/` for external audits of this repository.
+- A submission is journalled before any effect and retired by its receipt, so a
+  crashed submit can be retried without doubling anything.
+- A DRIFT verdict only becomes an audit when the semantic confirmation is tied to
+  a *bound* historical protocol authority. Suspicion alone never stages a file.
+- `NO_DRIFT` is a first-class result — the receipt proving an episode was
+  examined — and the only thing that advances the semantic watermark.
 
-## Exercise a real audit end-to-end
+To follow the analyst boundary by hand, feed the noncompliance fixture and open
+one bounded analysis carrier (the evidence command shows the same window from
+the provider's own store when the session came from a configured provider
+source):
 
 ```bash
 cp tests/golden_sessions/agent-noncompliance-command-route.json .saipal/session_inbox/
-python -B tools/saipal.py cc
-python -B tools/saipal.py report
-# -> .saipal/audit/staging/1.md, .saipal/findings/index.json,
-#    .saipal/closed_loop_links.json
+python -B tools/saipal.py continue
+python -B tools/saipal.py --json next           # the bounded carrier: episode + evidence + law
+python -B tools/saipal.py report                # verdict + coverage + attribution
 ```
+
+(With an analyst backend configured (`saipal analyst-setup --enable`, an
+OpenAI-compatible endpoint), `saipal investigate` runs that loop unattended
+within explicit budgets; without one it stops truthfully with `CONFIG_DISABLED`
+and the mechanical signals and reports still work.)
+
+## Important concepts
+
+| Concept | What it means |
+| --- | --- |
+| Home | `.saipal/` — the state root: `sessions/`, `findings/`, `audit/`, `evidence/`, `locks/`, `LOG.jsonl`, `STATE.json`, `telemetry.json` |
+| Source | A configured, read-only evidence feed (folder, provider store); raw sources are never mutated |
+| Session / episode / slice | A bundle of events; segmented into episodes; long episodes page into slices — the bounded unit the analyst judges |
+| Protocol binding | Proof of which protocol version governed a session (`BOUND` / `PARTIAL` / `UNKNOWN`); `UNKNOWN` can never reach a HIGH-confidence audit |
+| Finding | A deduplicated drift claim with a causal key; lifecycle `NEW → QUALIFIED → EMITTED`; one root cause, one finding |
+| Audit | Numbered immutable markdown in `audit/staging/N.md`; never overwritten or deleted by SAIPAL |
+| Analyst loop | `next` → reason → `submit`, repeated within budget; the unattended form is `saipal watch` |
+
+The full model — including locks and fencing, intake, publication and the
+recovery flow — is in [docs/architecture.md](docs/architecture.md). The normal
+operating rhythms (new project, incoming requirement, interrupted session,
+verification, closure) are in [docs/workflow.md](docs/workflow.md).
+
+## Repository layout
+
+```
+tools/saipal.py           CLI entry point
+tools/saipal_engine/      Layer A kernel (stdlib-only modules)
+tools/saipal_analyst/     Layer B worker runtime (unattended semantic loop)
+tools/validate.py         protocol/registry drift gate
+tools/test_*.py           the unittest suite
+tools/test_runner.py      full suite from a clean checkout
+saipal/                   the protocol: BOOT, CORE, ARCHITECTURE, COMMANDS,
+                          SESSIONS, FINDINGS, AUDITS, ANALYSIS, SKILL, INDEX,
+                          REGISTRY.json (machine authority), MANIFEST.json
+skills/saipal/SKILL.md    agent skill manifest for the `/saipal pal` loop
+tests/golden_sessions/    canonical fixture sessions, including a hostile-injection case
+docs/                     architecture, workflow, verification, troubleshooting
+audit/                    triage notes from external audits
+```
+
+## Verification status
+
+- **Windows (primary):** source verification commands and the current
+  acceptance record are in [docs/verification.md](docs/verification.md).
+  Platform-skipped controls are recorded separately from executed passes.
+- **POSIX:** the canonical suite was executed to completion on a POSIX
+  interpreter with no descriptor exhaustion, and the focused descriptor-lifetime
+  and lock-ownership controls passed. Certification on a *real Linux* host is
+  **deferred verification debt**, not a known unresolved defect; the one
+  divergence observed was host-specific (Cygwin `openat` re-resolves paths
+  instead of pinning inodes). Do not treat POSIX as fully certified.
+
+Counts live in exactly one place — the **Current verification truth** block of
+[`WAVE_I_CHECKPOINT.md`](WAVE_I_CHECKPOINT.md). Historical checkpoint
+identities stay attached to their original measurements; counts are re-derived after
+every material change. Run them yourself any time:
+
+```bash
+python -B -m unittest discover -s tools -p "test_*.py"
+python -B tools/validate.py
+python -B -m compileall tools
+```
+
+Details and history: [docs/verification.md](docs/verification.md).
+
+## Platform status and limitations
+
+- **Windows is the primary supported platform.** The write-boundary is
+  strongest-practical there (reparse-probe before every I/O, symlink/junction
+  refusal, `O_EXCL` final-node create); a non-reparse delete+recreate swap in the
+  final window is a documented residual, closable only with handle-based APIs the
+  stdlib does not expose.
+- **POSIX full certification is deferred**, as described above.
+- **Publication is proof-gated, not safety-gated.** `PUBLISH_ENABLED` requires an
+  explicit operator-reviewed readiness proof and a validated sink; even then,
+  SAIPAL reports findings — it does not guarantee their correctness, and the
+  maintainer decides.
+- **No autonomous architecture claims.** SAIPAL observes, judges bounded units
+  of evidence, and reports. It is not a self-driving engineer, and a clean
+  report only ever means *as much was examined as the coverage line says*.
+- Project state lives in `.saipal/` (git-ignored by design); nothing in it is
+  required to understand this README.
+
+## Development notes
+
+SAIPAL is currently maintained as a personal, single-maintainer project and is
+parked at a stable stage (SIDE1): issues and ideas are welcome, but there is no
+contribution pipeline, CLA or roadmap process to plug into yet. Bug reports with
+a reproducing command are the most useful input. The protocol under `saipal/` is
+the contract: `REGISTRY.json` is the machine authority, `validate.py` is the
+gate that keeps prose, registry and runtime from drifting apart, and any new
+command or rule is a deliberate registry + docs + test migration.
+
+- Protocol index: [`saipal/INDEX.md`](saipal/INDEX.md)
+- Command surface: [`saipal/COMMANDS.md`](saipal/COMMANDS.md)
+- Internal operational handoff (failure modes, sink contract):
+  [`docs/internal/SAIPAL_OPERATIONAL_HANDOFF.md`](docs/internal/SAIPAL_OPERATIONAL_HANDOFF.md)
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md)
+
+No license file is currently published; all rights reserved by the author until
+one is added.
 
 <!-- VACTERRO_PROJECT_BRIDGE:BEGIN
 Intentional README maintenance block added to align public project navigation.

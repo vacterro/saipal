@@ -146,6 +146,74 @@ class WorkerBase(unittest.TestCase):
 
 
 class BudgetsAndExhaustion(WorkerBase):
+    def test_unknown_remote_outcome_does_not_starve_other_runnable_work(self) -> None:
+        from saipal_analyst.worker import investigate
+        from saipal_engine.sessions import load_index
+
+        backend = StubBackend([])
+        self.addCleanup(backend.stop)
+        self.config_with_backend(backend)
+        status, index, detail = load_index(self.home)
+        self.assertEqual(status, "ok", detail)
+        records = carrier_mod.freshest_records(index)
+        self.assertGreaterEqual(len(records), 2)
+
+        packets = [
+            carrier_mod.build_carrier(
+                self.home,
+                index=index,
+                session_id=str(record["session_id"]),
+                episode_index=int(record["episodes"][0]["index"]),
+                slice_index=0,
+            )
+            for record in records[:2]
+        ]
+        unknown_packet, runnable_packet = packets
+        self.assertNotEqual(
+            unknown_packet["session"]["session_id"],
+            runnable_packet["session"]["session_id"],
+        )
+        unknown_job = jobs_mod.new_job(
+            session_id=unknown_packet["session"]["session_id"],
+            episode_index=int(unknown_packet["episode"]["index"]),
+            slice_index=int(unknown_packet["slice"]["index"]),
+            unit_digest=unknown_packet["unit_digest"],
+            finality=str(unknown_packet["episode"]["finality"]),
+            backend_type="openai_compatible",
+            model="stub-model",
+            run_id="remote-unknown-test",
+        )
+        unknown_attempt = jobs_mod.next_attempt_id(
+            unknown_job, "investigator", "unknown-payload-digest"
+        )
+        jobs_mod.mark_ambiguous_attempt(
+            unknown_job, "investigator", unknown_attempt
+        )
+        unknown_job["stage"] = jobs_mod.REMOTE_OUTCOME_UNKNOWN
+        unknown_job["error_class"] = jobs_mod.REMOTE_OUTCOME_UNKNOWN
+        unknown_job["error_detail"] = "operator resolution required"
+        journal = jobs_mod.load_journal(self.home)
+        jobs_mod.upsert(journal, unknown_job)
+        jobs_mod.save_journal(self.home, journal)
+
+        backend.script.append(
+            (200, envelope(self.candidate_json(runnable_packet)))
+        )
+        summary = investigate(self.home, max_units=1)
+
+        self.assertEqual(summary["jobs_completed"], 1)
+        self.assertEqual(summary["model_calls"], 1)
+        self.assertEqual(summary["jobs_blocked"], 0)
+        self.assertEqual(
+            summary["population_classes"]["REMOTE_OUTCOME_UNKNOWN"], 1
+        )
+        self.assertEqual(len(backend.requests), 1)
+        journal = jobs_mod.load_journal(self.home)
+        retained = journal["jobs"][unknown_job["job_id"]]
+        self.assertEqual(retained["stage"], jobs_mod.REMOTE_OUTCOME_UNKNOWN)
+        self.assertEqual(retained["attempt_ids"]["investigator"], unknown_attempt)
+        self.assertEqual(retained["transport_attempts"], 0)
+
     def test_max_units_consumes_exactly_max_and_leaves_backlog(self) -> None:
         from saipal_analyst.worker import investigate
 

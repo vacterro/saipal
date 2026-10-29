@@ -40,7 +40,7 @@ No arbitrary detector-selected paths.
 
 ## Commands
 
-- `continue` / `cc` — one bounded cycle. `continue --drain` repeats bounded
+- `continue` / `pal` — one bounded cycle. `continue --drain` repeats bounded
   cycles until idle, blocked by a `CONFLICT`, or the safety valve trips.
 - `next` — the next analysis carrier (one bounded semantic unit).
 - `submit FILE|-` — absorb one analyst candidate; Layer B's only write path.

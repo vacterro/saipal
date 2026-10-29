@@ -10,8 +10,10 @@ cold-session "emit nothing" bar through the real CLI.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import pal_test_support as support
@@ -19,6 +21,14 @@ from saipal_engine import audits as audits_mod
 from saipal_engine import bundle as bundle_mod
 from saipal_engine import enqueue as enqueue_mod
 from saipal_engine import redact as redact_mod
+
+
+def _normpath(text: str) -> str:
+    import ntpath
+    import posixpath
+
+    return (ntpath if "\\" in text else posixpath).normpath(text)
+
 
 COLD = "conformant-cold.json"
 
@@ -342,6 +352,539 @@ class ConcurrentPublisherRedControl(unittest.TestCase):
         t.join(timeout=10)
         self.assertTrue(blocked.is_set())
         self.assertIsInstance(result_holder[0], dict)
+
+class PendingRecoveryImmutability(unittest.TestCase):
+    """W2-002 (SRC-005): a recovered pending entry must never overwrite the
+    physical audit slot. The decision table is: file absent -> write; file
+    present with the intended digest -> finalize only (zero writes to the
+    file); file present with different bytes -> refuse and preserve. The same
+    table applies to local staging and a maintainer sink with private
+    bookkeeping; the digest check runs before any write in both shapes."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = support.make_home(Path(self.tmp.name))
+        (self.home / "audit" / "staging").mkdir(parents=True, exist_ok=True)
+
+    def _finding(self, finding_id: str = "F-W2-002") -> dict:
+        return {"finding_id": finding_id, "rule_id": "PAL-TEST", "severity": "low"}
+
+    def _force_pending(self) -> None:
+        """Replay the crash that happened after the file write but before the
+        second ledger write: the entry is pending while the slot exists."""
+        entries_path = enqueue_mod._entries_path(self.home, None)
+        entries = enqueue_mod._read_entries(entries_path)
+        for entry in entries:
+            if entry.get("finding_id") == self._finding()["finding_id"]:
+                entry["pending"] = True
+        enqueue_mod._write_ledger(entries_path, entries)
+
+    def _sink_slot(self) -> Path:
+        return self.sink / "audit" / "1.md"
+
+    def test_a_crash_before_write_retry_writes_the_claimed_slot_once(self) -> None:
+        finding = self._finding()
+        first = enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self._force_pending()
+        slot = self.home / "audit" / "staging" / "1.md"
+        slot.unlink()
+        second = enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self.assertEqual(slot.read_text(encoding="utf-8"), "THE BODY\n")
+        self.assertEqual(second["audit_number"], first["audit_number"])
+        pending = [
+            e
+            for e in enqueue_mod._read_entries(
+                enqueue_mod._entries_path(self.home, None)
+            )
+            if e.get("finding_id") == finding["finding_id"]
+        ]
+        self.assertFalse(pending[0].get("pending"), "recovery must finalize the ledger")
+
+    def test_b_crash_after_correct_write_retry_performs_zero_file_writes(self) -> None:
+        finding = self._finding()
+        first = enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self._force_pending()
+        slot = self.home / "audit" / "staging" / "1.md"
+        before_bytes = slot.read_bytes()
+        before_mtime = slot.stat().st_mtime_ns
+        second = enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self.assertEqual(slot.read_bytes(), before_bytes, "slot content must be untouched")
+        self.assertEqual(slot.stat().st_mtime_ns, before_mtime, "slot mtime must be untouched")
+        self.assertEqual(second["audit_number"], first["audit_number"],
+                         "recovery keeps the original identity")
+        pending = [
+            e
+            for e in enqueue_mod._read_entries(
+                enqueue_mod._entries_path(self.home, None)
+            )
+            if e.get("finding_id") == finding["finding_id"]
+        ]
+        self.assertFalse(pending[0].get("pending"))
+
+    def test_c_mismatched_existing_bytes_are_refused_and_preserved(self) -> None:
+        from saipal_engine.errors import PalError
+
+        finding = self._finding()
+        enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self._force_pending()
+        slot = self.home / "audit" / "staging" / "1.md"
+        slot.write_text("maintainer-edited\n", encoding="utf-8")
+        before = slot.read_bytes()
+        with self.assertRaises(PalError) as caught:
+            enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        self.assertEqual(str(caught.exception.code), "EVIDENCE_MISMATCH")
+        self.assertEqual(slot.read_bytes(), before, "existing bytes must be preserved")
+        pending = [
+            e
+            for e in enqueue_mod._read_entries(
+                enqueue_mod._entries_path(self.home, None)
+            )
+            if e.get("finding_id") == finding["finding_id"]
+        ]
+        self.assertTrue(pending[0].get("pending"), "the pending claim stays for the operator")
+
+    def test_c_maintainer_sink_mismatch_is_refused_and_preserved(self) -> None:
+        """The same decision table guards the external maintainer sink."""
+        from saipal_engine.errors import PalError
+
+        sink = Path(self.tmp.name) / "maintainer"
+        (sink / "audit").mkdir(parents=True)
+        private = Path(self.tmp.name) / "private"
+        private.mkdir()
+        finding = self._finding("F-W2-002-SINK")
+        enqueue_mod.enqueue_audit(
+            self.home, finding, "SINK BODY\n",
+            maintainer_root=sink, private_ledger_home=private,
+        )
+        entries_path = enqueue_mod._entries_path(private, None)
+        entries = enqueue_mod._read_entries(entries_path)
+        for entry in entries:
+            if entry.get("finding_id") == finding["finding_id"]:
+                entry["pending"] = True
+        enqueue_mod._write_ledger(entries_path, entries)
+        slot = sink / "audit" / "1.md"
+        slot.write_text("maintainer-edited\n", encoding="utf-8")
+        before = slot.read_bytes()
+        with self.assertRaises(PalError) as caught:
+            enqueue_mod.enqueue_audit(
+                self.home, finding, "SINK BODY\n",
+                maintainer_root=sink, private_ledger_home=private,
+            )
+        self.assertEqual(str(caught.exception.code), "EVIDENCE_MISMATCH")
+        self.assertEqual(slot.read_bytes(), before)
+
+
+class PendingRecoveryConfinement(unittest.TestCase):
+    """W2-002 closure retry (T-122): the recovery digest must judge the
+    PHYSICAL node at the audit slot, never the node a symlink/junction/
+    reparse point LEADS TO. A symlink that points at byte-identical content
+    stored outside the intended root is an escape, not a recovered slot:
+    matching external bytes cannot finalize a pending audit, dangling
+    indirection must not create its target, and every resolution/stat/open/
+    digest failure fails closed with the pending ledger claim preserved.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = support.make_home(Path(self.tmp.name))
+        (self.home / "audit" / "staging").mkdir(parents=True, exist_ok=True)
+        self.external = Path(self.tmp.name) / "external"
+        self.external.mkdir()
+        (self.external / "matching.md").write_text("THE BODY\n", encoding="utf-8")
+        (self.external / "mismatched.md").write_text("foreign bytes\n", encoding="utf-8")
+
+    def _finding(self, finding_id: str = "F-W2-002-CONF") -> dict:
+        return {"finding_id": finding_id, "rule_id": "PAL-TEST", "severity": "low"}
+
+    def _stage_pending(self, finding_id: str = "F-W2-002-CONF") -> None:
+        """Allocate + finalize once, then replay the crash shape: pending
+        entry, existing slot with the intended bytes."""
+        finding = self._finding(finding_id)
+        enqueue_mod.enqueue_audit(self.home, finding, "THE BODY\n")
+        entries_path = enqueue_mod._entries_path(self.home, None)
+        entries = enqueue_mod._read_entries(entries_path)
+        for entry in entries:
+            if entry.get("finding_id") == finding_id:
+                entry["pending"] = True
+        enqueue_mod._write_ledger(entries_path, entries)
+
+    def _pending_state(self, finding_id: str = "F-W2-002-CONF") -> bool:
+        entries_path = enqueue_mod._entries_path(self.home, None)
+        for entry in enqueue_mod._read_entries(entries_path):
+            if entry.get("finding_id") == finding_id:
+                return bool(entry.get("pending"))
+        raise AssertionError("no ledger entry for finding")
+
+    def _slot(self) -> Path:
+        return self.home / "audit" / "staging" / "1.md"
+
+    def _symlink_or_skip(self, slot: Path, target: Path) -> str:
+        """Create the strongest file-level indirection the platform allows.
+        On Windows this needs symlink privilege or Developer Mode; tests that
+        need an always-available Windows control use _indirect_dir_junction
+        (a directory junction is creatable without elevation)."""
+        if slot.is_symlink() or slot.exists():
+            slot.unlink()
+        try:
+            slot.symlink_to(target)
+            return "symlink"
+        except OSError as exc:
+            # The helper PROMISES a skip and used to re-raise instead, so an
+            # unelevated Windows host reported six ERRORs that read like
+            # confinement failures while measuring nothing but
+            # SeCreateSymbolicLinkPrivilege. A host that cannot build the
+            # indirection cannot measure the refusal.
+            raise unittest.SkipTest(
+                f"this host cannot create a file symlink: {exc}"
+            ) from None
+
+    def _make_junction(self, junction: Path, target: Path) -> None:
+        """Create a directory junction without elevation (Windows)."""
+        import _winapi  # junction creation on Windows
+
+        _winapi.CreateJunction(str(target), str(junction))
+
+    @unittest.skipUnless(os.name == "nt", "Windows reparse-point control")
+    def test_windows_junction_escape_is_refused_and_external_bytes_preserved(self):
+        """Named Windows live acceptance: staging replaced by a junction to an
+        external directory holding byte-identical slot content. The junction
+        itself is the escape (the slot name resolves through it); recovery
+        must refuse without touching the external bytes. The detection must
+        work WITHOUT elevation, so it cannot depend on os.lstat S_ISLNK (a
+        junction is not a symlink to lstat); the reparse attribute is
+        authority. On platforms without the ctypes probe the equivalent
+        POSIX directory-symlink control below carries the same guarantee."""
+        self._stage_pending()
+        slot = self._slot()
+        before = slot.read_bytes()
+        staging = self.home / "audit" / "staging"
+        clone = self.external / "staging-clone"
+        clone.mkdir(parents=True)
+        slot.replace(clone / "1.md")
+        for item in list(staging.iterdir()):
+            item.unlink()
+        staging.rmdir()
+        self._make_junction(staging, clone)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        # External clone bytes untouched, junction still in place, pending kept.
+        self.assertEqual((clone / "1.md").read_bytes(), before)
+        self.assertTrue(self._slot().exists())
+        self.assertTrue(self._pending_state())
+
+    def test_symlink_escape_to_matching_external_bytes_is_refused(self):
+        """The strongest primitive available to the test environment: the slot
+        name itself is a symlink to external byte-identical content."""
+        self._stage_pending()
+        slot = self._slot()
+        external = self.external / "matching.md"
+        before = external.read_bytes()
+        primitive = self._symlink_or_skip(slot, external)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError) as caught:
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertIn(str(caught.exception.code), {"PATH_ESCAPE", "VALIDATION_FAILED"})
+        self.assertEqual(external.read_bytes(), before, "external bytes must be preserved")
+        self.assertTrue(slot.is_symlink(), f"{primitive} must not be consumed")
+        self.assertTrue(self._pending_state())
+
+    def test_symlink_escape_to_mismatched_external_bytes_is_refused(self):
+        self._stage_pending()
+        slot = self._slot()
+        external = self.external / "mismatched.md"
+        before = external.read_bytes()
+        slot.unlink()
+        self._symlink_or_skip(slot, external)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertEqual(external.read_bytes(), before)
+        self.assertTrue(self._pending_state())
+
+    def test_dangling_symlink_is_refused_and_target_never_created(self):
+        self._stage_pending()
+        slot = self._slot()
+        target = self.external / "never-created.md"
+        slot.unlink()
+        self._symlink_or_skip(slot, target)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertFalse(target.exists(), "dangling indirection must not create its target")
+        self.assertTrue(slot.is_symlink(), "the indirection itself must be preserved")
+        self.assertTrue(self._pending_state())
+
+    def test_dangling_internal_symlink_is_refused_and_target_never_created(self):
+        """The closure-retry reproduction: the dangling target lies INSIDE the
+        allowed root. `Path.exists()` follows the link and reads False, so the
+        recovery branch used to be skipped entirely -- enqueue returned
+        success and the guarded write created the symlink's target. Recovery
+        inspection is now unconditional for a pending entry and judged by
+        lstat, so this shape refuses closed."""
+        self._stage_pending()
+        slot = self._slot()
+        internal_target = self.home / "audit" / "staging" / "elsewhere.md"
+        slot.unlink()
+        self._symlink_or_skip(slot, internal_target)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError) as caught:
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertIn(str(caught.exception.code), {"PATH_ESCAPE", "VALIDATION_FAILED"})
+        self.assertFalse(internal_target.exists(), "inside-root target must remain absent")
+        self.assertTrue(slot.is_symlink(), "the symlink itself must remain")
+        self.assertTrue(self._pending_state(), "the pending ledger claim must remain")
+
+    @unittest.skipIf(os.name == "nt", "POSIX fifo control")
+    def test_non_regular_node_at_slot_is_refused(self):
+        """A FIFO (or any non-regular node) at the slot is never trusted."""
+        self._stage_pending()
+        slot = self._slot()
+        slot.unlink()
+        os.mkfifo(str(slot))
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertTrue(self._pending_state())
+
+    @unittest.skipIf(os.name == "nt", "POSIX directory-symlink control; the Windows junction control carries the reparse case")
+    def test_slot_outside_root_via_swapped_staging_directory_is_refused(self):
+        """The audit directory itself swapped for a symlink to an external
+        directory is an escape even when the inner slot looks regular."""
+        self._stage_pending()
+        staging = self.home / "audit" / "staging"
+        external_dir = self.external / "staging-clone"
+        external_dir.mkdir()
+        slot = self._slot()
+        before = slot.read_bytes()
+        slot.replace(external_dir / "1.md")
+        for item in list(staging.iterdir()):
+            if item.is_dir():
+                item.replace(external_dir / item.name)
+            else:
+                item.unlink()
+        staging.rmdir()
+        self._symlink_or_skip(staging, external_dir)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertEqual((external_dir / "1.md").read_bytes(), before)
+        self.assertTrue(self._pending_state())
+
+    def test_stat_failure_fails_closed(self):
+        """A slot that cannot be stated fails closed, pending claim kept."""
+        self._stage_pending()
+        slot = self._slot()
+        from saipal_engine.errors import PalError
+
+        real_lstat = os.lstat
+
+        def broken(path, *args, **kwargs):
+            if _normpath(str(path)).endswith(_normpath(str(slot))):
+                raise OSError("simulated stat failure")
+            return real_lstat(path, *args, **kwargs)
+
+        with unittest.mock.patch("saipal_engine.enqueue.os.lstat", broken):
+            with self.assertRaises(PalError) as caught:
+                enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertEqual(str(caught.exception.code), "VALIDATION_FAILED")
+        self.assertTrue(self._pending_state())
+
+    def test_open_failure_fails_closed(self):
+        """A slot that lstats as regular but cannot be opened fails closed."""
+        self._stage_pending()
+        slot = self._slot()
+        from saipal_engine.errors import PalError
+
+        real_open = os.open
+
+        def broken(path, flags, *args, **kwargs):
+            if _normpath(str(path)).endswith(_normpath(str(slot))):
+                raise OSError("simulated open failure")
+            return real_open(path, flags, *args, **kwargs)
+
+        with unittest.mock.patch("saipal_engine.enqueue.os.open", broken):
+            with self.assertRaises(PalError) as caught:
+                enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertEqual(str(caught.exception.code), "VALIDATION_FAILED")
+        self.assertTrue(slot.is_file(), "slot bytes untouched")
+        self.assertTrue(self._pending_state())
+
+    def test_digest_mutation_mid_read_fails_closed(self):
+        """A slot whose bytes mutate between lstat and the read-back fails
+        closed on the digest mismatch instead of trusting a partial read."""
+        self._stage_pending()
+        slot = self._slot()
+        before = slot.read_bytes()
+        from saipal_engine.errors import PalError
+        from saipal_engine import enqueue as eq
+
+        real_open = os.open
+        mutated = {"done": False}
+
+        def opening(path, flags, *args, **kwargs):
+            handle = real_open(path, flags, *args, **kwargs)
+            if (
+                not mutated["done"]
+                and _normpath(str(path)).endswith(_normpath(str(slot)))
+            ):
+                mutated["done"] = True
+                slot.write_bytes(b"swapped by an external writer\n")
+            return handle
+
+        with unittest.mock.patch("saipal_engine.enqueue.os.open", opening):
+            with self.assertRaises(PalError) as caught:
+                enqueue_mod.enqueue_audit(self.home, self._finding(), "THE BODY\n")
+        self.assertIn(str(caught.exception.code), {"VALIDATION_FAILED", "EVIDENCE_MISMATCH"})
+        self.assertTrue(self._pending_state())
+
+    def test_maintainer_sink_symlink_escape_is_refused(self):
+        """The same confinement governs the maintainer sink path."""
+        sink = Path(self.tmp.name) / "maintainer"
+        (sink / "audit").mkdir(parents=True)
+        private = Path(self.tmp.name) / "private"
+        private.mkdir()
+        finding = self._finding("F-W2-002-SINK-CONF")
+        enqueue_mod.enqueue_audit(
+            self.home, finding, "SINK BODY\n",
+            maintainer_root=sink, private_ledger_home=private,
+        )
+        entries_path = enqueue_mod._entries_path(private, None)
+        entries = enqueue_mod._read_entries(entries_path)
+        for entry in entries:
+            if entry.get("finding_id") == finding["finding_id"]:
+                entry["pending"] = True
+        enqueue_mod._write_ledger(entries_path, entries)
+        slot = sink / "audit" / "1.md"
+        slot.unlink()
+        external = self.external / "matching.md"
+        before = external.read_bytes()
+        self._symlink_or_skip(slot, external)
+        from saipal_engine.errors import PalError
+
+        with self.assertRaises(PalError):
+            enqueue_mod.enqueue_audit(
+                self.home, finding, "SINK BODY\n",
+                maintainer_root=sink, private_ledger_home=private,
+            )
+        self.assertEqual(external.read_bytes(), before)
+        for entry in enqueue_mod._read_entries(entries_path):
+            if entry.get("finding_id") == finding["finding_id"]:
+                self.assertTrue(entry.get("pending"))
+                break
+
+
+class MaintainerSinkRecoveryMatrix(PendingRecoveryImmutability):
+    """The full W2-002 recovery matrix repeated on the maintainer sink path:
+    each control re-runs with the sink's audit directory as the slot location
+    and the private ledger as the bookkeeping home. The inherited controls
+    are parameterized by writing through a sink instead of local staging."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sink = Path(self.tmp.name) / "maintainer"
+        (self.sink / "audit").mkdir(parents=True)
+        self.private = Path(self.tmp.name) / "private"
+        self.private.mkdir()
+
+    # -- inherited helpers re-targeted at the maintainer sink path ----------
+
+    def _enqueue(self, finding: dict, body: str) -> dict:
+        return enqueue_mod.enqueue_audit(
+            self.home, finding, body,
+            maintainer_root=self.sink, private_ledger_home=self.private,
+        )
+
+    def _pending_entries(self, finding_id: str) -> list[dict]:
+        entries_path = enqueue_mod._entries_path(self.private, None)
+        return [
+            e for e in enqueue_mod._read_entries(entries_path)
+            if e.get("finding_id") == finding_id
+        ]
+
+    def _force_pending(self) -> None:
+        entries_path = enqueue_mod._entries_path(self.private, None)
+        entries = enqueue_mod._read_entries(entries_path)
+        for entry in entries:
+            if entry.get("finding_id") == self._finding()["finding_id"]:
+                entry["pending"] = True
+        enqueue_mod._write_ledger(entries_path, entries)
+
+    def test_a_crash_before_write_retry_writes_the_claimed_slot_once(self) -> None:
+        finding = self._finding()
+        first = self._enqueue(finding, "SINK BODY\n")
+        self._force_pending()
+        slot = self._sink_slot()
+        slot.unlink()
+        second = self._enqueue(finding, "SINK BODY\n")
+        self.assertEqual(slot.read_text(encoding="utf-8"), "SINK BODY\n")
+        self.assertEqual(second["audit_number"], first["audit_number"])
+        self.assertEqual(second["operation_id"], first["operation_id"])
+        pending = self._pending_entries(finding["finding_id"])
+        self.assertFalse(pending[0].get("pending"), "recovery must finalize the ledger")
+
+    def test_b_crash_after_correct_write_retry_performs_zero_file_writes(self) -> None:
+        finding = self._finding()
+        first = self._enqueue(finding, "SINK BODY\n")
+        self._force_pending()
+        slot = self._sink_slot()
+        before_bytes = slot.read_bytes()
+        before_mtime = slot.stat().st_mtime_ns
+        second = self._enqueue(finding, "SINK BODY\n")
+        self.assertEqual(slot.read_bytes(), before_bytes, "slot content must be untouched")
+        self.assertEqual(slot.stat().st_mtime_ns, before_mtime, "slot mtime must be untouched")
+        self.assertEqual(second["audit_number"], first["audit_number"],
+                         "recovery keeps the original identity")
+        self.assertEqual(second["operation_id"], first["operation_id"])
+        pending = self._pending_entries(finding["finding_id"])
+        self.assertFalse(pending[0].get("pending"))
+
+    def test_c_mismatched_existing_bytes_are_refused_and_preserved(self) -> None:
+        from saipal_engine.errors import PalError
+
+        finding = self._finding()
+        self._enqueue(finding, "SINK BODY\n")
+        self._force_pending()
+        slot = self._sink_slot()
+        slot.write_text("maintainer-edited\n", encoding="utf-8")
+        before = slot.read_bytes()
+        with self.assertRaises(PalError) as caught:
+            self._enqueue(finding, "SINK BODY\n")
+        self.assertEqual(str(caught.exception.code), "EVIDENCE_MISMATCH")
+        self.assertEqual(slot.read_bytes(), before, "existing bytes must be preserved")
+        pending = self._pending_entries(finding["finding_id"])
+        self.assertTrue(pending[0].get("pending"), "the pending claim stays for the operator")
+
+    def test_c_maintainer_sink_mismatch_is_refused_and_preserved(self) -> None:
+        self.test_c_mismatched_existing_bytes_are_refused_and_preserved()
+
+    def test_dangling_internal_symlink_sink_is_refused_and_target_never_created(self) -> None:
+        """Maintainer-sink variant of the closure-retry reproduction."""
+        from saipal_engine.errors import PalError
+
+        finding = self._finding()
+        self._enqueue(finding, "SINK BODY\n")
+        self._force_pending()
+        slot = self._sink_slot()
+        internal_target = self.sink / "audit" / "elsewhere.md"
+        slot.unlink()
+        PendingRecoveryConfinement._symlink_or_skip(self, slot, internal_target)
+        with self.assertRaises(PalError) as caught:
+            self._enqueue(finding, "SINK BODY\n")
+        self.assertIn(str(caught.exception.code), {"PATH_ESCAPE", "VALIDATION_FAILED"})
+        self.assertFalse(internal_target.exists())
+        self.assertTrue(slot.is_symlink())
+        pending = self._pending_entries(finding["finding_id"])
+        self.assertTrue(pending[0].get("pending"))
 
 
 if __name__ == "__main__":

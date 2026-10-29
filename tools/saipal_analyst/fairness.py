@@ -113,6 +113,11 @@ def save_state(home: Path | str, state: dict) -> Path:
     from time import gmtime, strftime
 
     state["updated_at"] = strftime("%Y-%m-%dT%H:%M:%SZ", gmtime())
+    # TARGET B2 (T-125): the analyst workspace directory is materialized
+    # explicitly by its owning writer (see jobs.ensure_journal_dir).
+    from . import jobs as _jobs
+
+    _jobs.ensure_journal_dir(home)
     return atomic_write_json(fairness_path(home), state, root=home_paths(home).root)
 
 

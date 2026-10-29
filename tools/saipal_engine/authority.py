@@ -417,8 +417,15 @@ def _save_enrollment_journal(home: Path | str, pending: dict) -> None:
 
 def _clear_enrollment_journal(home: Path | str) -> None:
     path = enrollment_journal_path(home)
+    # T-125 Defect D: the one raw unlink() in the engine. A parent
+    # indirection (home replaced by a symlink after validation) could carry
+    # the deletion outside the home. confined_unlink binds the deletion to
+    # the verified physical home parent on POSIX and reparse-verifies it on
+    # Windows; a missing journal stays a no-op.
     try:
-        path.unlink()
+        from saipal_engine.paths import confined_unlink
+
+        confined_unlink(home_paths(home).root, ENROLLMENT_JOURNAL_NAME)
     except OSError:
         pass
 

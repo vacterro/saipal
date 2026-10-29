@@ -408,8 +408,17 @@ class ShadowCeiling(WatchBase):
     """
 
     def test_mid_batch_flip_to_publish_enabled_stages_locally(self) -> None:
+        """T-111: the immutable shadow ceiling blocks external delivery even if a
+        valid PUBLISH_ENABLED config is reached mid-batch.
+
+        T-109: a mid-batch flip to PUBLISH_ENABLED now requires a readiness
+        proof; the test mints one on the sink so the flip can persist and the
+        ceiling can still prove itself.
+        """
         import test_wave_analyst_repair as repair
         from saipal_engine import config as engine_config
+        from saipal_engine import readiness as readiness_mod
+        from saipal_engine.sink import AuditSink
 
         home = self.fresh_home("agent-noncompliance-command-route.json")
         backend = repair.StubBackend()
@@ -423,6 +432,7 @@ class ShadowCeiling(WatchBase):
             json.dumps({"kind": "saipen-audit-inbox", "schema_version": 1}),
             encoding="utf-8",
         )
+        readiness_mod.mint_readiness_for_tests(home, sink=AuditSink(home, root=sink))
 
         # Qualifying DRIFT through the REAL semantic path: investigator finds
         # DRIFT, critic agrees, submit/emit executes inside the batch.
@@ -490,7 +500,9 @@ class ShadowCeiling(WatchBase):
         """
         import test_wave_analyst_repair as repair
         from saipal_engine import config as engine_config
+        from saipal_engine import readiness as readiness_mod
         from saipal_engine import submit as submit_module
+        from saipal_engine.sink import AuditSink
 
         home = self.fresh_home("agent-noncompliance-command-route.json")
         sink = Path(self._tmp.name) / "maintainer"
@@ -499,6 +511,7 @@ class ShadowCeiling(WatchBase):
             json.dumps({"kind": "saipen-audit-inbox", "schema_version": 1}),
             encoding="utf-8",
         )
+        readiness_mod.mint_readiness_for_tests(home, sink=AuditSink(home, root=sink))
         cfg = engine_config.load_config(home)[1]
         cfg["publication_mode"] = "PUBLISH_ENABLED"
         cfg["shadow_reviewed"] = True

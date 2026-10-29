@@ -185,7 +185,7 @@ class SinkOutageIsRetried(unittest.TestCase):
         audit = self.sink_root / "audit"
         audit.mkdir(parents=True, exist_ok=True)
         (audit / "MANIFEST.json").write_text(
-            json.dumps({"kind": "saipen-audit-inbox"}), encoding="utf-8"
+            json.dumps({"kind": "saipen-audit-inbox", "schema_version": 1}), encoding="utf-8"
         )
 
     def _break_sink(self) -> None:
@@ -194,6 +194,10 @@ class SinkOutageIsRetried(unittest.TestCase):
         shutil.rmtree(self.sink_root)
 
     def _configure(self) -> None:
+        from saipal_engine import readiness as readiness_mod
+        from saipal_engine.sink import AuditSink
+
+        readiness_mod.mint_readiness_for_tests(self.home, sink=AuditSink(self.home, root=self.sink_root))
         config = self.home / "config.json"
         payload = json.loads(config.read_text(encoding="utf-8"))
         payload["publication_mode"] = "PUBLISH_ENABLED"
@@ -282,6 +286,18 @@ class SinkOutageIsRetried(unittest.TestCase):
             "the retry must publish the SAME body, not a rebuilt one",
         )
         self.assertEqual(pub_mod.pending(self.home), [])
+        # SRC-004 W2-007: the finding's duplicated delivery cache must converge
+        # to the ledger truth after the successful retry, not stay PENDING
+        # forever while the publication ledger says PUBLISHED.
+        finding = self.findings()[0]
+        self.assertEqual(
+            pub_mod.delivery_status(self.home, finding), pub_mod.PUBLISHED,
+            "authoritative delivery reads PUBLISHED from the ledger",
+        )
+        self.assertEqual(
+            finding["audit"].get("delivery"), pub_mod.PUBLISHED,
+            "the finding cache converges to PUBLISHED after a successful retry",
+        )
 
     def test_further_cycles_create_no_duplicates(self) -> None:
         self._break_sink()

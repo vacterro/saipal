@@ -114,6 +114,9 @@ class SessionLease:
             self.path,
             ttl=self.ttl,
             busy_detail=f"another cycle holds the lease for session {self.session_id!r}",
+            # PAL-WRITE-01 (T-125): the session lease refuses a redirected
+            # locks dir or a symlinked lease node outright.
+            confine_under=self.paths.root,
         )
 
     @property

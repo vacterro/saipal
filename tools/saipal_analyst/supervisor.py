@@ -160,6 +160,9 @@ def save_state(home: Path | str, state: dict) -> Path:
             "refusing invalid supervisor state: " + "; ".join(problems[:5]),
         )
     state["updated_at"] = strftime("%Y-%m-%dT%H:%M:%SZ", gmtime())
+    # TARGET B2 (T-125): the analyst workspace directory is materialized
+    # explicitly by its owning writer (see jobs.ensure_journal_dir).
+    jobs_mod.ensure_journal_dir(home)
     return atomic_write_json(
         supervisor_state_path(home), state, root=home_paths(home).root
     )
@@ -684,25 +687,10 @@ def _corpus_state(root: Path) -> dict:
         key = str((rec.get("protocol") or {}).get("binding_status") or "UNKNOWN")
         by_binding_all[key] = by_binding_all.get(key, 0) + 1
     # T-106 conflict liveness: conflicts stay visible, never count as clean.
-    conflicts = [
-        {
-            "session_id": rec.get("session_id"),
-            "generation": rec.get("generation"),
-            "detected_at": (rec.get("conflict") or {}).get("detected_at"),
-            "source_ref": (rec.get("conflict") or {}).get("source_ref"),
-            "last_analyzed_seq": (rec.get("conflict") or {}).get("last_analyzed_seq"),
-            "expected_prefix_sha256": (rec.get("conflict") or {}).get(
-                "expected_prefix_sha256"
-            ),
-            "observed_prefix_sha256": (rec.get("conflict") or {}).get(
-                "observed_prefix_sha256"
-            ),
-            "conflict_material_sha256": _conflict_material_digest(rec),
-            "material_digest_version": 1,
-        }
-        for rec in freshest
-        if rec.get("status") == "CONFLICT"
-    ]
+    # The population and its material identity come from the ONE canonical
+    # derivation in `carrier` (T-135): this surface and `next`/`status`/`report`
+    # used to count conflicts differently and disagreed by one on the live home.
+    conflicts = carrier_mod.conflict_population(index or {})["current"]
     # T-121 clause 3 (ROLE 11/32): conflict triage is DERIVED state. The
     # freshest CONFLICT population is canonical; a triage file that no
     # longer matches it reports triage_stale=true rather than being silently
@@ -731,30 +719,13 @@ def _corpus_state(root: Path) -> dict:
 
 
 def _conflict_material_digest(record: dict) -> str:
-    """ROLE 20260910 §5/§7: a deterministic identity over MATERIAL conflict evidence.
+    """ROLE 20260910 §5/§7: deterministic identity over MATERIAL conflict evidence.
 
-    Consumes the FULL canonical session record: the session identity and its
-    generation live on the outer record; conflict-specific fields live in the
-    inner conflict dict. Mutable human prose (reason, detected_at) is
-    deliberately excluded: a conflict re-observed later with identical material
-    evidence keeps the same digest; a single changed byte in the material
-    evidence yields a distinct digest so a stale triage disposition cannot
-    silently pass.
+    Delegates to the single canonical kernel definition (`ROLE 20260910`
+    semantics preserved byte-for-byte) so the digest cannot drift away from
+    what `carrier.conflict_population` and cpall's isolation both compute.
     """
-    import json as _json
-
-    inner = record.get("conflict") or {}
-    material = {
-        "session_id": str(record.get("session_id") or ""),
-        "generation": str(record.get("generation") or ""),
-        "source_ref": str(inner.get("source_ref") or ""),
-        "last_analyzed_seq": str(inner.get("last_analyzed_seq") or ""),
-        "expected_prefix_sha256": str(inner.get("expected_prefix_sha256") or ""),
-        "observed_prefix_sha256": str(inner.get("observed_prefix_sha256") or ""),
-    }
-    return hashlib.sha256(
-        _json.dumps(material, sort_keys=True).encode("utf-8")
-    ).hexdigest()
+    return carrier_mod.conflict_material_digest(record)
 
 
 def _conflict_triage_state(triage_path: Path, current_conflicts: list) -> dict:
@@ -1017,6 +988,12 @@ def watch(
         A long idle stretch never silently expires the lease: each chunk is
         shorter than the renewal cadence, and the lease is revalidated on
         every wake. Returns False (and flags the loss) if ownership changed.
+
+        Renewal is due-gated: a chunk is never longer than `renew_interval`,
+        so renewing once per due window covers every chunk. The unconditional
+        per-iteration renewal spun the sidecar write as fast as the (possibly
+        no-op) sleep allowed, which on Windows surfaced as transient sharing
+        violations on the heartbeat path itself.
         """
         deadline = _now() + float(seconds)
         while True:
@@ -1026,8 +1003,7 @@ def watch(
             if not _renew_or_lose():
                 return False
             do_sleep(min(remaining, heartbeat.renew_interval))
-            if not heartbeat.renew():
-                ownership_lost = True
+            if heartbeat.due() and not _renew_or_lose():
                 return False
 
     try:

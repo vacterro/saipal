@@ -37,7 +37,12 @@
     "PAL-ANALYSIS-03": "saipal/ANALYSIS.md",
     "PAL-ANALYSIS-04": "saipal/ANALYSIS.md",
     "PAL-ANALYSIS-05": "saipal/ANALYSIS.md",
-    "PAL-ANALYSIS-06": "saipal/ANALYSIS.md"
+    "PAL-ANALYSIS-06": "saipal/ANALYSIS.md",
+    "PAL-CPALL-01": "saipal/CPALL.md",
+    "PAL-CPALL-02": "saipal/CPALL.md",
+    "PAL-CPALL-03": "saipal/CPALL.md",
+    "PAL-CPALL-04": "saipal/CPALL.md",
+    "PAL-CPALL-05": "saipal/CPALL.md"
   },
   "enum_owners": {
     "carrier_phases": "saipal/COMMANDS.md",
@@ -63,10 +68,12 @@
     "change_target_enum": "saipal/FINDINGS.md",
     "audit_publication_states": "saipal/AUDITS.md",
     "disposition_class": "saipal/ANALYSIS.md",
-    "candidate_verdicts": "saipal/ANALYSIS.md"
+    "candidate_verdicts": "saipal/ANALYSIS.md",
+    "cpall_states": "saipal/CPALL.md",
+    "cpall_families": "saipal/CPALL.md"
   },
   "shortcuts": {
-    "cc": "saipal continue"
+    "pal": "saipal continue"
   },
   "commands": {
     "saipal": [
@@ -84,12 +91,17 @@
       "analyst-setup",
       "analyst-doctor",
       "analyst-status",
+      "analyst-requeue",
       "investigate",
       "watch",
+      "readiness",
       "authority",
       "sources",
       "rebind",
-      "coverage"
+      "coverage",
+      "operator-queue",
+      "cpall",
+      "goal"
     ]
   },
   "observed_command_tokens": [
@@ -104,7 +116,8 @@
     "saipal trigger",
     "saipal sessions",
     "saipal submit",
-    "saipal cc",
+    "saipal pal",
+    "pal",
     "saipen continue",
     "saipen status",
     "saipen next",
@@ -174,6 +187,33 @@
     "рр",
     "хх"
   ],
+  "cpall_states": [
+    "ACTIVE",
+    "WAITING",
+    "OPERATOR_BLOCKED",
+    "COMPLETED",
+    "SAFETY_STOP",
+    "CANCELLED"
+  ],
+  "cpall_families": [
+    "mechanical",
+    "semantic"
+  ],
+  "cpall": {
+    "schema_version": 1,
+    "report_cadence_seconds": 1800,
+    "min_report_interval_seconds": 5,
+    "max_slices_per_process": 0,
+    "max_units_per_slice": 25,
+    "owner_ttl_seconds": 3600,
+    "stale_owner_grace_seconds": 60,
+    "retry_base_seconds": 30,
+    "retry_max_seconds": 1800,
+    "retry_probe_after_seconds": 900,
+    "report_history_limit": 24,
+    "sleep_chunk_seconds": 15,
+    "rescan_every_slices": 10
+  },
   "carrier_phases": [
     "IDLE",
     "RECOVER",
@@ -745,14 +785,15 @@
   "doc_budgets": {
     "saipal/BOOT.md": 110,
     "saipal/CORE.md": 170,
-    "saipal/COMMANDS.md": 209,
+    "saipal/COMMANDS.md": 240,
     "saipal/SESSIONS.md": 200,
     "saipal/FINDINGS.md": 150,
     "saipal/AUDITS.md": 130,
     "saipal/ARCHITECTURE.md": 80,
     "saipal/SKILL.md": 80,
     "saipal/INDEX.md": 40,
-    "saipal/ANALYSIS.md": 200
+    "saipal/ANALYSIS.md": 200,
+    "saipal/CPALL.md": 200
   },
   "deferred_semantics": {
     "WAVE_H_HUSH": {
@@ -798,6 +839,7 @@
     "EVIDENCE_UNSUPPORTED",
     "CANDIDATE_INADMISSIBLE",
     "CANDIDATE_OUT_OF_SCOPE",
-    "SEMANTIC_CONFIRMATION_REQUIRED"
+    "SEMANTIC_CONFIRMATION_REQUIRED",
+    "PUBLICATION_GATE_CLOSED"
   ]
 }

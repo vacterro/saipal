@@ -15,6 +15,7 @@ the audited stale-save loss when the fence is bypassed.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -25,8 +26,13 @@ import pal_test_support as support
 from saipal_engine import carrier as carrier_mod
 from saipal_engine import sessions as sessions_mod
 from saipal_engine import submit as submit_mod
+from saipal_engine.errors import PalError
 from saipal_engine.inbox import import_inbox
-from saipal_engine.paths import HomeLock, writer_fence
+from saipal_engine.paths import (
+    HomeLock,
+    atomic_write_json,
+    writer_fence,
+)
 
 CLEAN = "conformant-cold.json"
 
@@ -566,6 +572,133 @@ class DirectCanonicalMutationsAreSelfFenced(unittest.TestCase):
 
         self._hold_fence_and_call(call)
         self.assertEqual(self._tree_signature(), before, "remove_source wrote under a foreign fence")
+
+
+class PhysicalHomeIdentitySplitBrain(unittest.TestCase):
+    """SRC-010 CORE-001: a WriterFence binds the PHYSICAL home, not a pathname.
+
+    Audit/5.md reproduced the split brain: `writer_fence(home)` was acquired,
+    the whole physical home was renamed away, a fresh ordinary directory was
+    created at the same lexical pathname, and a nested `writer_fence(home)`
+    reentered by lexical key alone -- then `atomic_write_json` mutated the
+    replacement while the only real lock stayed in the moved home. These are the
+    required red controls A-E; every one must fail closed after substitution.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / ".saipal"
+        self.home.mkdir()
+        self.moved = self.tmp / "home.old"
+
+    def _replace_root(self) -> None:
+        """Rename the physical home away and create a real replacement."""
+        os.rename(str(self.home), str(self.moved))
+        self.home.mkdir()
+
+    def _snapshot(self, root: Path) -> dict:
+        return {
+            path.relative_to(root).as_posix(): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    # -- A: outer holder root replacement ---------------------------------- #
+
+    def test_a_outer_holder_cannot_mutate_a_replacement_home(self) -> None:
+        with writer_fence(self.home):
+            self._replace_root()
+            before = self._snapshot(self.home)
+            with self.assertRaises(PalError):
+                atomic_write_json(self.home / "STATE.json", {"x": 1}, root=self.home)
+            self.assertEqual(
+                self._snapshot(self.home),
+                before,
+                "the replacement home must stay byte-identical",
+            )
+            self.assertFalse((self.home / "STATE.json").exists())
+            self.assertFalse((self.home / "locks" / "saipal.lock").exists())
+            # The real lock is still the one bound to the moved physical home.
+            self.assertTrue((self.moved / "locks" / "saipal.lock").exists())
+
+    # -- B: same-thread reentrancy after substitution ---------------------- #
+
+    def test_b_nested_fence_does_not_reenter_a_replacement_home(self) -> None:
+        with writer_fence(self.home):
+            self._replace_root()
+            with self.assertRaises(PalError):
+                nested = writer_fence(self.home)
+                nested.acquire()
+            # And no confined mutation through the nested attempt either.
+            with self.assertRaises(PalError):
+                atomic_write_json(self.home / "STATE.json", {"x": 1}, root=self.home)
+            self.assertEqual(sorted(p.name for p in self.home.iterdir()), [])
+
+    # -- C: second holder in the replacement home -------------------------- #
+
+    def test_c_second_holder_may_own_the_replacement_but_not_the_original(self) -> None:
+        with writer_fence(self.home):
+            self._replace_root()
+            outcome: dict = {}
+
+            def second_holder():
+                try:
+                    with writer_fence(self.home):
+                        atomic_write_json(
+                            self.home / "STATE.json", {"owned": "second"}, root=self.home
+                        )
+                    outcome["ok"] = True
+                except Exception as exc:  # noqa: BLE001
+                    outcome["error"] = exc
+
+            thread = threading.Thread(target=second_holder)
+            thread.start()
+            thread.join(15)
+            self.assertIsNone(outcome.get("error"), outcome.get("error"))
+            self.assertTrue(outcome.get("ok"))
+            # The original holder is STILL unable to mutate the replacement it
+            # does not own, so two writers never share one logical generation.
+            with self.assertRaises(PalError):
+                atomic_write_json(self.home / "OTHER.json", {"x": 1}, root=self.home)
+            self.assertFalse((self.home / "OTHER.json").exists())
+
+    # -- D: normal reentrancy is preserved --------------------------------- #
+
+    def test_d_unchanged_home_reentrancy_still_works(self) -> None:
+        with writer_fence(self.home):
+            with writer_fence(self.home):
+                nested = writer_fence(self.home)
+                self.assertTrue(nested.acquire())
+                nested.release()
+                atomic_write_json(self.home / "STATE.json", {"x": 1}, root=self.home)
+        self.assertTrue((self.home / "STATE.json").read_bytes())
+        # Only one physical lock was ever needed, and it is released.
+        self.assertFalse((self.home / "locks" / "saipal.lock").exists())
+
+    # -- E: identity verified at the mutation boundary --------------------- #
+
+    def test_e_identity_change_between_check_and_mutation_is_refused(self) -> None:
+        with writer_fence(self.home):
+            # A legitimate mutation before the swap proves the fence is usable.
+            atomic_write_json(self.home / "STATE.json", {"x": 1}, root=self.home)
+            # The swap happens AFTER acquisition, immediately before the write.
+            self._replace_root()
+            before = self._snapshot(self.home)
+            with self.assertRaises(PalError):
+                atomic_write_json(self.home / "STATE.json", {"x": 2}, root=self.home)
+            self.assertEqual(self._snapshot(self.home), before)
+            self.assertFalse((self.home / "STATE.json").exists())
+
+    def test_unfenced_primitives_are_unaffected_by_the_identity_gate(self) -> None:
+        atomic_write_json(self.home / "STATE.json", {"x": 1}, root=self.home)
+        self.assertTrue((self.home / "STATE.json").exists())
+        self.home.rename(self.moved)
+        self.home.mkdir()
+        # No fence is active for this thread, so a fresh path is ordinary work.
+        atomic_write_json(self.home / "STATE.json", {"x": 2}, root=self.home)
+        self.assertTrue((self.home / "STATE.json").exists())
 
 
 if __name__ == "__main__":

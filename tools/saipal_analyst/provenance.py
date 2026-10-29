@@ -82,6 +82,9 @@ def save_ledger(home: Path | str, ledger: dict) -> Path:
             "VALIDATION_FAILED",
             "refusing invalid analyst provenance ledger: " + "; ".join(problems[:5]),
         )
+    # TARGET B2 (T-125): the analyst workspace directory is materialized
+    # explicitly by its owning writer (see jobs.ensure_journal_dir).
+    jobs_mod.ensure_journal_dir(home)
     return atomic_write_json(
         provenance_path(home), ledger, root=home_paths(home).root
     )

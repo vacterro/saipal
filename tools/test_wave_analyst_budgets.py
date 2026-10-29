@@ -176,7 +176,55 @@ class CircuitBreaker(BudgetBase):
         allowed2, _reason2 = budgets_mod.circuit_allows(self.home, now=now + 10_001)
         self.assertTrue(allowed2)
 
+    def test_an_auth_latch_clears_when_the_credential_verdict_changes(self) -> None:
+        """The latch is pinned to the verdict, not only to the file bytes.
+
+        Exporting the variable a config names changes the situation without
+        changing the file, and a policy that makes the requirement inert changes
+        it the other way. Either way the latch must not outlive the condition it
+        was opened for: a local model that stays latched forever is only revivable
+        by hand-editing a config.
+        """
+        import os
+
+        previous = os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
+
+        def restore() -> None:
+            if previous is not None:
+                os.environ["SAIPAL_ANALYST_API_KEY"] = previous
+
+        self.addCleanup(restore)
+        config = default_analyst_config()
+        config["enabled"] = True
+        config["backend"]["model"] = "stub-model"
+        config["backend"]["endpoint"] = "http://10.0.0.5:9/v1/chat/completions"
+        config["egress"]["allow_remote_evidence"] = True
+        save_analyst_config(self.home, config)
+
+        now = 1_000_000.0
+        budgets_mod.record_backend_failure(
+            self.home, failure_class="AUTH", retryable=False, now=now
+        )
+        circuit = budgets_mod.backend_circuit(self.home)
+        self.assertEqual(circuit["state"], budgets_mod.CIRCUIT_OPEN)
+        allowed, _reason = budgets_mod.circuit_allows(self.home, now=now + 1)
+        self.assertFalse(allowed)
+        pinned = circuit["config_digest"]
+
+        os.environ["SAIPAL_ANALYST_API_KEY"] = "now-present"
+        try:
+            self.assertNotEqual(
+                budgets_mod._config_digest(self.home),
+                pinned,
+                "the credential verdict is part of what the latch is pinned to",
+            )
+            allowed2, _reason2 = budgets_mod.circuit_allows(self.home, now=now + 2)
+            self.assertTrue(allowed2, "the latch must clear once its cause is gone")
+        finally:
+            os.environ.pop("SAIPAL_ANALYST_API_KEY", None)
+
     def test_success_closes_the_circuit(self) -> None:
+
         now = 1_000_000.0
         for _ in range(budgets_mod.CIRCUIT_TRIP_THRESHOLD - 1):
             budgets_mod.record_backend_failure(

@@ -38,6 +38,13 @@ The analyst submits candidates back to Layer A through a constrained
 submission boundary. It never writes arbitrary project files. It never
 writes findings, audits or state directly.
 
+## Backend credentials are egress policy
+
+One predicate (`config.credential_verdict`) is enforced by the transport, the
+calibration preflight and `doctor`: a non-loopback endpoint without its named
+variable fails closed before a socket exists, and a loopback endpoint has no
+remote party, so the unset name is inert there and the call goes header-less.
+
 ## The signal generator contract
 
 `tools/saipal_engine/analyst.py` is NOT a semantic analyst. It is a

@@ -130,19 +130,111 @@ def mark_published(
     audit_number: int,
     audit_sha256: str,
     registry: dict | None = None,
+    finding_id: str | None = None,
 ) -> dict | None:
-    """Record that the sink confirmed this audit. Returns the entry, or None."""
+    """Record that the sink confirmed this audit. Returns the entry, or None.
+
+    W2-007 (SRC-004): the publication ledger is the AUTHORITATIVE delivery
+    truth. This also reconciles the finding's duplicated
+    `audit.delivery` cache to PUBLISHED so a consumer reading the finding
+    (rather than the ledger) cannot see a false outage forever. The
+    reconciliation is best-effort-then-idempotent: `delivery_status` re-derives
+    from the ledger on every read, so a crash between the sink write and this
+    cache update still converges on the next cold start.
+    """
     status, ledger, detail = load_publications(home)
     if status != STATUS_OK or ledger is None:
         return None
+    matched = None
     for entry in ledger["publications"]:
         if _key(entry) == (int(audit_number), str(audit_sha256)):
             entry["status"] = PUBLISHED
             entry["published_at"] = utc_now_iso()
             entry.pop("reason", None)
-            save_publications(home, ledger, registry=registry)
-            return entry
-    return None
+            matched = entry
+            break
+    if matched is not None:
+        save_publications(home, ledger, registry=registry)
+        _reconcile_finding_delivery(
+            home, matched.get("finding_id"), registry=registry
+        )
+    return matched
+
+
+def delivery_status(home: Path | str, finding: dict) -> str:
+    """W2-007: authoritative delivery state for a finding's staged audit.
+
+    The publication ledger wins for the COMPLETE supported state set
+    (PENDING, PUBLISHED, QUARANTINED): a matching `(audit_number,
+    audit_sha256)` ledger row is the delivery truth even when the finding's own
+    `audit.delivery` cache is stale in either direction -- so a PENDING ledger
+    entry overrides a stale PUBLISHED finding cache just as a PUBLISHED entry
+    overrides a stale PENDING one. The finding cache is consulted only when no
+    matching authoritative ledger row exists. A matching row carrying an
+    unsupported status is a malformed ledger and fails closed rather than
+    letting a stale cache claim delivery.
+    """
+    audit = finding.get("audit") or {}
+    number = audit.get("audit_number")
+    sha = audit.get("audit_sha256")
+    if number is None or sha is None:
+        return str(audit.get("delivery") or PENDING)
+    status, ledger, detail = load_publications(home)
+    if status == STATUS_UNRECOVERABLE:
+        raise PalError("VALIDATION_FAILED", detail)
+    if status == STATUS_OK and ledger is not None:
+        expected_key = (int(number or 0), str(sha))
+        for entry in ledger["publications"]:
+            if not isinstance(entry, dict) or _key(entry) != expected_key:
+                continue
+            delivery = entry.get("status")
+            if delivery in (PENDING, PUBLISHED, QUARANTINED):
+                return str(delivery)
+            raise PalError(
+                "VALIDATION_FAILED",
+                f"publication ledger has unsupported delivery status {delivery!r}",
+            )
+    return str(audit.get("delivery") or PENDING)
+
+
+def _reconcile_finding_delivery(
+    home: Path, finding_id: object, *, registry: dict | None = None
+) -> None:
+    """Converge one finding's `audit.delivery` cache to the ledger truth.
+
+    Idempotent and silent: a missing findings index or missing finding is not an
+    error (the ledger is still authoritative), and a crash here is repaired by
+    the next `delivery_status` read or the next retry reconciliation.
+    """
+    from . import findings as findings_mod
+    from .paths import read_json
+
+    if finding_id is None:
+        return
+    path = home_paths(home).findings_index
+    if not path.exists():
+        return
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    dirty = False
+    for finding in payload.get("findings") or []:
+        if not isinstance(finding, dict) or finding.get("finding_id") != finding_id:
+            continue
+        audit = finding.get("audit")
+        if isinstance(audit, dict) and audit.get("delivery") != PUBLISHED:
+            audit["delivery"] = PUBLISHED
+            dirty = True
+    if dirty:
+        try:
+            findings_mod.save_index(home, payload, registry=registry)
+        except Exception:
+            # The ledger stays authoritative; the next cold-start read
+            # re-derives the truth and the cache converges then.
+            pass
 
 
 def pending(home: Path | str) -> list[dict]:
@@ -172,6 +264,33 @@ def quarantined(home: Path | str) -> list[dict]:
         for entry in ledger["publications"]
         if isinstance(entry, dict) and entry.get("status") == QUARANTINED
     ]
+
+
+def _findings_map(home: Path) -> dict[str, dict]:
+    """The findings index as `finding_id -> finding`, parsed ONCE per transaction.
+
+    PERF-005 (SRC-011): `_referenced_finding` reparsed the complete findings
+    index for every pending entry, so a quarantine/retry pass cost
+    O(pending_count x findings_history) full parses. Callers preload this map
+    once and reuse it; `_referenced_finding` keeps its standalone behavior for
+    single lookups.
+    """
+    from .paths import read_json
+
+    path = home_paths(home).findings_index
+    if not path.exists():
+        return {}
+    try:
+        payload = read_json(path)
+    except (OSError, ValueError, UnicodeDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        str(finding.get("finding_id")): finding
+        for finding in payload.get("findings") or []
+        if isinstance(finding, dict) and finding.get("finding_id") is not None
+    }
 
 
 def _referenced_finding(home: Path, finding_id: object) -> dict | None:
@@ -245,11 +364,12 @@ def quarantine_unconfirmed(home: Path | str, *, registry: dict | None = None) ->
         raise PalError("VALIDATION_FAILED", detail)
     if ledger is None:
         return []
+    findings_by_id = _findings_map(Path(home))
     newly: list[dict] = []
     for entry in ledger["publications"]:
         if not isinstance(entry, dict) or entry.get("status") != PENDING:
             continue
-        finding = _referenced_finding(home, entry.get("finding_id"))
+        finding = findings_by_id.get(str(entry.get("finding_id")))
         problems = publication_problems(home, finding, entry)
         if not problems:
             continue
@@ -282,30 +402,26 @@ def retry_pending(home: Path | str, *, registry: dict | None = None) -> dict[str
     from .errors import PalError
     from .sink import configured_sink
 
-    outstanding = pending(home)
     result = {
-        "attempted": len(outstanding), "published": 0, "still_pending": 0,
+        "attempted": 0, "published": 0, "still_pending": 0,
         "quarantined": 0, "failures": [],
     }
-    if not outstanding:
-        return result
 
-    # Authority BEFORE transport: an entry that fails revalidation is
-    # quarantined whether or not any sink is configured, so calling this
-    # function never depends on delivery being possible. ONE ledger load
-    # backs both the revalidation and the mutation, so a quarantined entry
-    # cannot be silently re-saved from a stale second copy.
+    # PERF-005 (SRC-011): ONE publication-ledger load backs both the revalidation
+    # and the mutation (the previous `pending(home)` call loaded the same ledger
+    # again before this one), and the findings index is parsed ONCE into an
+    # id->finding map instead of once per pending entry.
     status, ledger, _detail = load_publications(home)
     if status != STATUS_OK or ledger is None:
-        result["still_pending"] = len(outstanding)
         result["failures"].append({"reason": "publication ledger is unreadable"})
         return result
     root = Path(home)
+    findings_by_id = _findings_map(root)
     ledger_dirty = False
     still: list[dict] = []
     for entry in [e for e in ledger["publications"]
                   if isinstance(e, dict) and e.get("status") == PENDING]:
-        finding = _referenced_finding(root, entry.get("finding_id"))
+        finding = findings_by_id.get(str(entry.get("finding_id")))
         problems = publication_problems(root, finding, entry)
         if problems:
             entry["status"] = QUARANTINED
@@ -345,6 +461,28 @@ def retry_pending(home: Path | str, *, registry: dict | None = None) -> dict[str
                 {"audit_number": entry.get("audit_number"), "reason": f"staged audit unreadable: {exc}"}
             )
             continue
+        # The publication gate is revalidated at THIS external-effect boundary too:
+        # a readiness proof that was valid at setup time may no longer match the
+        # reviewed sink identity or software fingerprint (post-setup mutation,
+        # reviewed sink substitution, or authored-code change). A closed gate does
+        # NOT quarantine -- the audit is still a valid local staging; it simply
+        # stays pending until a fresh, matching review is minted.
+        try:
+            from . import readiness as _readiness
+
+            _readiness.check_publish_gate(home, sink)
+        except Exception as exc:  # noqa: BLE001 - any gate failure keeps the audit pending
+            code = getattr(exc, "code", "") or type(exc).__name__
+            if code != "PUBLICATION_GATE_CLOSED":
+                raise
+            result["still_pending"] += 1
+            result["failures"].append(
+                {
+                    "audit_number": entry.get("audit_number"),
+                    "reason": f"publication gate closed: {getattr(exc, 'message', str(exc))}",
+                }
+            )
+            continue
         finding_stub = {"finding_id": entry.get("finding_id")}
         try:
             # Reuse the number the audit was staged as: a fresh one would deliver
@@ -364,6 +502,7 @@ def retry_pending(home: Path | str, *, registry: dict | None = None) -> dict[str
             home,
             audit_number=int(entry.get("audit_number") or 0),
             audit_sha256=str(entry.get("audit_sha256") or ""),
+            finding_id=str(entry.get("finding_id") or "") or None,
             registry=registry,
         )
         result["published"] += 1

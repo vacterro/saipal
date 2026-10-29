@@ -19,7 +19,13 @@ import time
 from pathlib import Path
 
 from saipal_engine.errors import PalError
-from saipal_engine.paths import FencedLockFile, atomic_write_json, home_paths, read_json
+from saipal_engine.paths import (
+    FencedLockFile,
+    atomic_write_json,
+    confined_mkdir,
+    home_paths,
+    read_json,
+)
 
 JOURNAL_SCHEMA_VERSION = 2
 JOURNAL_NAME = "jobs.json"
@@ -130,9 +136,87 @@ JOB_FIELDS = (
     "error_detail",
     "next_retry_at",
     "verdict",
+    # T-136: the bounded history of semantic-refusal reactivations. A job the
+    # candidate contract refused is not lost: each requeue is recorded here
+    # (when, why, under which material, and the digests of the cleared
+    # attempt), so the allowance is durable across crashes and the decision to
+    # spend another call stays auditable without replaying the refusal.
+    "requeues",
 )
 
 TERMINAL_STAGES = (DONE, BLOCKED, BLOCKED_BINDING, STALE)
+
+#: PERF-004 (SRC-004): crash-recovery payload fields a DONE job no longer
+#: needs once its receipt AND provenance are durable. The tombstone keeps
+#: every auditability fact (digests, counters, identity); only the raw model
+#: text and the candidate body -- the fields that made the journal grow
+#: without bound -- are dropped.
+DONE_PAYLOAD_FIELDS = (
+    "response_text",
+    "investigator_repair_text",
+    "critic_payload",
+    "critic_response_text",
+    "critic_repair_text",
+    "finalizer_response_text",
+    "finalizer_repair_text",
+    "candidate",
+)
+
+#: A DONE job is compactable only when its receipt is linked AND its
+#: provenance record exists (or a deliberate None backend marks provenance
+#: structurally impossible for the run). W2-005 guardrail: a REMOTE_OUTCOME_
+#: UNKNOWN or other pre-DONE stage is NEVER compacted.
+def done_provenance_ready(job: dict, provenance_receipts: set[str] | None) -> bool:
+    if job.get("stage") != DONE:
+        return False
+    receipt_id = job.get("receipt_id")
+    if not receipt_id:
+        return False
+    if provenance_receipts is None:
+        return True
+    return str(receipt_id) in provenance_receipts
+
+
+def compact_done_job(job: dict) -> dict:
+    """PERF-004: replace a settled DONE job's raw payloads with a tombstone.
+
+    Mutates the job IN MEMORY and returns it; the caller persists through one
+    canonical save_journal. Idempotent: a job whose payload fields are already
+    None is returned unchanged, byte-logically. Attempt counters, digests,
+    identity and the receipt link are preserved for auditability.
+    """
+    if job.get("stage") != DONE:
+        return job
+    if all(job.get(field) is None for field in DONE_PAYLOAD_FIELDS):
+        return job
+    for field in DONE_PAYLOAD_FIELDS:
+        job[field] = None
+    job["updated_at"] = _now()
+    return job
+
+
+def compact_done_jobs(journal: dict, home: Path | str, *, provenance_receipts: set[str] | None = None) -> int:
+    """Compact every provably settled DONE job in one journal save.
+
+    Deterministic and idempotent; returns the number of jobs newly compacted.
+    `provenance_receipts=None` treats provenance as satisfied (callers that
+    cannot read the provenance ledger here must pass the real set instead).
+    """
+    compacted = 0
+    jobs = journal.get("jobs") or {}
+    for job in jobs.values():
+        if not isinstance(job, dict):
+            continue
+        if not done_provenance_ready(job, provenance_receipts):
+            continue
+        before = all(job.get(field) is None for field in DONE_PAYLOAD_FIELDS)
+        compact_done_job(job)
+        after = all(job.get(field) is None for field in DONE_PAYLOAD_FIELDS)
+        if before != after:
+            compacted += 1
+    if compacted:
+        save_journal(home, journal)
+    return compacted
 
 #: Back-compat aliases — old journal/tests use CALLING; new name is investigator-side.
 CALLING = INVESTIGATOR_CALLING
@@ -144,6 +228,20 @@ def journal_dir(home: Path | str) -> Path:
 
 def journal_path(home: Path | str) -> Path:
     return journal_dir(home) / JOURNAL_NAME
+
+
+def ensure_journal_dir(home: Path | str) -> Path:
+    """Materialize `.saipal/analyst/` through the confinement primitive.
+
+    TARGET B2 (T-125): `atomic_write_bytes` writes only into an
+    already-authorized existing parent and never recreates missing parents.
+    The analyst workspace directory is therefore established EXPLICITLY by the
+    writers that own it -- journal, provenance, supervisor, fairness and
+    budget saves -- before any of them persists a file. Idempotent; an
+    indirection refuses with zero external mutation.
+    """
+    confined_mkdir(home_paths(home).root, ANALYST_DIRNAME)
+    return journal_dir(home)
 
 
 def worker_lock_path(home: Path | str) -> Path:
@@ -249,6 +347,7 @@ def save_journal(home: Path | str, journal: dict) -> Path:
             "refusing to save invalid analyst journal: " + "; ".join(problems[:5]),
         )
     journal["updated_at"] = _now()
+    ensure_journal_dir(home)
     return atomic_write_json(
         journal_path(home), journal, root=home_paths(home).root
     )
@@ -295,6 +394,53 @@ def _job_problems(job: dict) -> list[str]:
         value = job.get(key)
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             problems.append(f"job {job.get('job_id')!r} {key} must be a non-negative integer")
+    problems.extend(_requeue_problems(job))
+    return problems
+
+
+#: The fields a requeue history entry must carry. Closed: an entry that cannot
+#: say WHEN, WHY and UNDER WHICH MATERIAL it happened is not evidence.
+REQUEUE_ENTRY_FIELDS = (
+    "at",
+    "from_stage",
+    "error_class",
+    "error_detail",
+    "reason",
+    "forced",
+    "material",
+    "attempts",
+    "transport_attempts",
+    "cleared_digests",
+)
+
+
+def _requeue_problems(job: dict) -> list[str]:
+    """T-136: a requeue history is a closed, ordered list of closed entries."""
+    history = job.get("requeues")
+    if history is None:
+        return []
+    job_id = job.get("job_id")
+    if not isinstance(history, list):
+        return [f"job {job_id!r} requeues must be a list"]
+    problems: list[str] = []
+    for index, entry in enumerate(history):
+        if not isinstance(entry, dict):
+            problems.append(f"job {job_id!r} requeues[{index}] is not an object")
+            continue
+        for key in sorted(set(entry) - set(REQUEUE_ENTRY_FIELDS)):
+            problems.append(
+                f"job {job_id!r} requeues[{index}] has unknown field {key!r}"
+            )
+        if not isinstance(entry.get("at"), str) or not entry.get("at"):
+            problems.append(f"job {job_id!r} requeues[{index}] needs a timestamp")
+        if not isinstance(entry.get("reason"), str) or not entry.get("reason"):
+            problems.append(f"job {job_id!r} requeues[{index}] needs a reason")
+        if not isinstance(entry.get("forced"), bool):
+            problems.append(f"job {job_id!r} requeues[{index}] forced must be a boolean")
+        if not isinstance(entry.get("material"), dict):
+            problems.append(
+                f"job {job_id!r} requeues[{index}] must record the material it was admitted under"
+            )
     return problems
 
 
@@ -349,6 +495,7 @@ def new_job(
         "error_detail": None,
         "next_retry_at": None,
         "verdict": None,
+        "requeues": [],
     }
 
 

@@ -51,6 +51,17 @@ BUDGET_FIELDS = (
     # per-run budgets still bound every invocation).
     "max_model_attempts_per_hour",
     "max_semantic_units_per_hour",
+    # T-136: how many FRESH attempts a semantically refused unit may be given
+    # by `saipal analyst-requeue`. Optional; absent means the shipped default.
+    # 0 disables the path entirely.
+    "max_requeues_per_unit",
+)
+
+#: Budget keys that may legitimately be absent from a config file.
+OPTIONAL_BUDGETS = (
+    "max_model_attempts_per_hour",
+    "max_semantic_units_per_hour",
+    "max_requeues_per_unit",
 )
 DELIBERATION_FIELDS = (
     "critic_on_drift",
@@ -83,6 +94,9 @@ def default_analyst_config() -> dict:
             "max_model_calls_per_run": 50,
             "max_wall_seconds": 1800,
             "max_retries_per_unit": 2,
+            # T-136: one fresh attempt per refused unit, and only when the
+            # conditions that produced the refusal changed.
+            "max_requeues_per_unit": 1,
         },
         "deliberation": {
             "critic_on_drift": True,
@@ -171,10 +185,23 @@ def validate_analyst_config(payload: object) -> list[str]:
     if isinstance(budgets, dict):
         for key in BUDGET_FIELDS:
             if budgets.get(key) is None:
-                # Optional durable cross-run windows stay optional.
-                if key in ("max_model_attempts_per_hour", "max_semantic_units_per_hour"):
+                # Optional durable windows and the requeue allowance stay
+                # optional; the loader's defaults supply the value.
+                if key in OPTIONAL_BUDGETS:
                     continue
-            if key == "max_wall_seconds":
+            if key == "max_requeues_per_unit":
+                # A COUNT that may legitimately be zero: refusing every requeue
+                # is a policy, not a misconfiguration.
+                value = budgets.get(key)
+                if (
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                ):
+                    problems.append(
+                        "budgets.max_requeues_per_unit must be a non-negative integer"
+                    )
+            elif key == "max_wall_seconds":
                 # Seconds may legitimately be fractional; the wall budget is a
                 # duration, not a count.
                 value = budgets.get(key)
@@ -284,4 +311,33 @@ def egress_verdict(config: dict) -> tuple[bool, str]:
         "evidence would leave the machine: endpoint "
         f"{endpoint!r} is not a loopback address; set "
         "egress.allow_remote_evidence=true in .saipal/analyst.json to permit it"
+    )
+
+
+def credential_verdict(config: dict) -> tuple[bool, str]:
+    """May this backend be called without a credential, and if not why not?
+
+    The credential requirement is an EGRESS requirement, exactly like the verdict
+    above it: a loopback endpoint has no remote party to authenticate to, so an
+    unset key names an INERT requirement there and the call proceeds without an
+    Authorization header. Anything else fails closed -- evidence must never leave
+    the machine under a missing credential.
+
+    One function owns this rule because three callers depend on it: the transport
+    preflight, `calibration.preflight` and `doctor`. When they disagree, a backend
+    reports a configuration wall that one of its own layers never obeys -- which
+    is exactly how a keyless loopback model ends up unable to run.
+    """
+    import os
+
+    backend = config.get("backend") or {}
+    name = str(backend.get("api_key_env") or "").strip()
+    if not name:
+        return True, ""
+    if endpoint_is_local(str(backend.get("endpoint") or "")):
+        return True, ""
+    if os.environ.get(name):
+        return True, ""
+    return False, (
+        f"API key environment variable {name!r} is not set; no request was sent"
     )

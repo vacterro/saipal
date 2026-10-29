@@ -15,9 +15,8 @@ venv/
 # Never publish an analysis home.
 .saipal/
 
-# SAIPEN project memory is local state; only the lineage carrier is tracked.
-.saipen/*
-!.saipen/IDENTITY.md
+# SAIPEN project memory and lineage authority remain local.
+.saipen/
 
 # Operator scratch
 *.log

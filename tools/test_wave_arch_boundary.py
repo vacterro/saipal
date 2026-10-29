@@ -190,8 +190,11 @@ class LayerABoundary(unittest.TestCase):
         text = skill.read_text(encoding="utf-8")
         self.assertIn("name: saipal", text)
         self.assertIn('Trigger on "saipal"', text)
+        self.assertIn('the "pal" shortcut', text)
+        self.assertNotIn('the "cc" shortcut', text, "the installed skill must not advertise a retired cc alias")
+        self.assertNotIn("/saipal cc", text, "the installed skill must not advertise a retired cc alias")
         for command in (
-            "saipal.py cc",
+            "saipal.py pal",
             "saipal.py --json next",
             "saipal.py --json submit candidate.json",
             "saipal.py report",

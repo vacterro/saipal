@@ -14,9 +14,15 @@ from .registry import load_registry, require_mapping, require_string_list
 
 PROGRAM = "saipal"
 
+#: Operator-facing slash forms. `/goal` is the durable-objective surface:
+#: `/goal cpall`, `/goal status`, `/goal stop`. `/saipal` is the skill's plain
+#: command routing. A leading `goal` token is routed through the same
+#: subcommand so the two spellings cannot drift apart.
+OPERATOR_SLASH_FORMS: dict[str, str] = {"/goal": "goal", "/saipal": "", "saipal": ""}
+
 
 def load_shortcut_table(protocol_dir: str | None = None) -> dict[str, str]:
-    """`{"cc": "saipal continue"}`. A missing registry folds to an empty table."""
+    """`{"pal": "saipal continue"}`. A missing registry folds to an empty table."""
     try:
         registry = load_registry(protocol_dir)
     except ValueError:
@@ -91,6 +97,16 @@ def parse_args(argv: list[str]) -> Options:
         else:
             positional.append(token)
         index += 1
+
+    if positional and positional[0] in OPERATOR_SLASH_FORMS:
+        head = OPERATOR_SLASH_FORMS[positional[0]]
+        rest = positional[1:]
+        if not head:
+            positional = rest
+        elif rest and rest[0] == head:
+            positional = rest
+        else:
+            positional = [head, *rest]
 
     if positional and resolve_shortcut(positional[0]):
         expansion = resolve_shortcut(positional[0]) or ""

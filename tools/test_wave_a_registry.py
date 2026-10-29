@@ -78,18 +78,24 @@ class RegistryFacts(unittest.TestCase):
         self.assertEqual(
             {"continue", "status", "next", "report", "evidence", "setup", "doctor",
              "submit", "disposition", "trigger", "sessions",
-             "analyst-setup", "analyst-doctor", "analyst-status", "investigate", "watch",
-             "authority", "sources", "rebind", "coverage"},
+             "analyst-setup", "analyst-doctor", "analyst-status", "analyst-requeue",
+             "investigate", "watch",
+             "readiness",
+             "authority", "sources", "rebind", "coverage", "operator-queue",
+             "cpall", "goal"},
             commands,
         )
+        self.assertEqual(resolve_shortcut("pal"), "saipal continue")
+        self.assertIsNone(resolve_shortcut("cc"), "cc is retired and must not resolve")
         for alias, expansion in load_shortcut_table().items():
             with self.subTest(alias=alias):
                 parts = expansion.split()
                 self.assertEqual(parts[0], "saipal", expansion)
                 self.assertIn(parts[1], commands, expansion)
 
-    def test_cc_resolves_to_continue(self) -> None:
-        self.assertEqual(resolve_shortcut("cc"), "saipal continue")
+    def test_pal_resolves_to_continue(self) -> None:
+        self.assertEqual(resolve_shortcut("pal"), "saipal continue")
+        self.assertIsNone(resolve_shortcut("cc"), "cc is retired and must not resolve")
         self.assertIsNone(resolve_shortcut("scan"), "an unimplemented alias must not resolve")
 
     def test_deferred_semantics_name_real_rules(self) -> None:

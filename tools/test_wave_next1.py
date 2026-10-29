@@ -250,7 +250,7 @@ class SinkAbstraction(unittest.TestCase):
         self.sink_root = self.tmp / "sink"
         (self.sink_root / "audit").mkdir(parents=True)
         (self.sink_root / "audit" / "MANIFEST.json").write_text(
-            json.dumps({"name": "termisai-audit-sink", "schema_version": 1}) + "\n",
+            json.dumps({"kind": "saipen-audit-inbox", "schema_version": 1}) + "\n",
             encoding="utf-8",
         )
         self.sink = AuditSink(self.home, root=self.sink_root)

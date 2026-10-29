@@ -14,7 +14,7 @@ from . import bundle as bundle_mod
 from . import episodes as episodes_mod
 from .capability import require_action
 from .errors import PalError
-from .paths import atomic_write_json, home_paths, read_json
+from .paths import SESSIONS_DIR, atomic_write_json, confined_mkdir, home_paths, read_json
 from .registry import load_registry, require_string_list
 
 STATUS_OK = "ok"
@@ -59,12 +59,65 @@ def empty_index() -> dict:
     return {"schema_version": 1, "sessions": []}
 
 
+def _validate_episodes(
+    episodes: list, where: str, boundary_kinds: set[str]
+) -> list[str]:
+    """Validate every nested episode object (CORE-003, SRC-011)."""
+
+    def _is_int(value: object) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    problems: list[str] = []
+    seen_index: set[int] = set()
+    previous_end: int | None = None
+    for position, episode in enumerate(episodes):
+        at = f"{where}.episodes[{position}]"
+        if not isinstance(episode, dict):
+            problems.append(f"{at} is not an object")
+            continue
+        index = episode.get("index")
+        if not _is_int(index) or index < 0:
+            problems.append(f"{at}.index must be a non-negative integer")
+        else:
+            if index in seen_index:
+                problems.append(f"{at}.index {index} is duplicated")
+            if index != position:
+                problems.append(f"{at}.index {index} is out of order (expected {position})")
+            seen_index.add(index)
+        start = episode.get("start_seq")
+        end = episode.get("end_seq")
+        for field, value in (("start_seq", start), ("end_seq", end)):
+            if not _is_int(value) or value < 0:
+                problems.append(f"{at}.{field} must be a non-negative integer")
+        if _is_int(start) and _is_int(end):
+            if end < start:
+                problems.append(f"{at} end_seq {end} precedes start_seq {start}")
+            if previous_end is not None and start < previous_end:
+                problems.append(f"{at} start_seq {start} overlaps the previous episode")
+            previous_end = end
+        trigger = episode.get("trigger_seq")
+        if trigger is not None and (not _is_int(trigger) or trigger < 0):
+            problems.append(f"{at}.trigger_seq must be null or a non-negative integer")
+        kind = episode.get("kind")
+        if not isinstance(kind, str) or kind not in boundary_kinds:
+            problems.append(f"{at}.kind {kind!r} outside {sorted(boundary_kinds)}")
+        count = episode.get("event_count")
+        if not _is_int(count) or count < 0:
+            problems.append(f"{at}.event_count must be a non-negative integer")
+        for field in ("start_evidence_ref", "end_evidence_ref"):
+            ref = episode.get(field)
+            if ref is not None and not isinstance(ref, dict):
+                problems.append(f"{at}.{field} must be an object or null")
+    return problems
+
+
 def validate_index(payload: object, *, registry: dict | None = None) -> list[str]:
     data = registry if registry is not None else load_registry()
     statuses = set(require_string_list(data, "session_status"))
     temperatures = set(require_string_list(data, "temperature_enum"))
     binding_statuses = set(require_string_list(data, "binding_status"))
     proof_levels = set(require_string_list(data, "binding_proof_levels"))
+    boundary_kinds = set(require_string_list(data, "episode_boundary_kinds"))
 
     if not isinstance(payload, dict):
         return ["session index root is not an object"]
@@ -105,6 +158,10 @@ def validate_index(payload: object, *, registry: dict | None = None) -> list[str
             problems.append(f"{where}.imports must be an array")
         if not isinstance(record.get("episodes"), list):
             problems.append(f"{where}.episodes must be an array")
+        else:
+            problems.extend(
+                _validate_episodes(record["episodes"], where, boundary_kinds)
+            )
         if "evidence_refs" in record and not isinstance(record.get("evidence_refs"), list):
             problems.append(f"{where}.evidence_refs must be an array")
         if "semantic" in record and not isinstance(record.get("semantic"), dict):
@@ -148,8 +205,42 @@ def save_index(home: Path | str, index: dict, *, registry: dict | None = None) -
             next_action="the existing index was left untouched",
         )
     paths = home_paths(home)
+    # TARGET B2 (T-125): the sessions directory is materialized EXPLICITLY by
+    # its owner. `atomic_write_json` writes only into an already-authorized
+    # existing parent and never recreates missing parents; an indirection
+    # refuses with zero external mutation.
+    confined_mkdir(paths.root, SESSIONS_DIR)
     atomic_write_json(paths.sessions_index, index, root=paths.root)
     return index
+
+
+def compact_index(home: Path | str, index: dict, *, registry: dict | None = None) -> tuple[dict, int]:
+    """PERF-001 (SRC-004): remove derived per-event projections from every record.
+
+    Idempotent compaction: `evidence_refs` (84.8% of the live index) and legacy
+    `mechanical_spans` are derivable from the canonical bundle, so carrying them
+    duplicated the provider's entire event-locator history into every status,
+    allocation, intake and save. Migration refuses a corrupted index (the caller
+    load_index gate) rather than "compacting" it into a new truth, and preserves
+    every non-derived field byte-for-byte logically. Returns the compacted
+    index and the number of records changed.
+    """
+    changed = 0
+    for record in index.get("sessions") or []:
+        if not isinstance(record, dict):
+            continue
+        touched = False
+        if "evidence_refs" in record:
+            record.pop("evidence_refs", None)
+            touched = True
+        if "mechanical_spans" in record:
+            record.pop("mechanical_spans", None)
+            touched = True
+        if touched:
+            changed += 1
+    if changed:
+        save_index(home, index, registry=registry)
+    return index, changed
 
 
 def find_session(index: dict, session_id: str) -> dict | None:
@@ -272,11 +363,6 @@ def new_record(
         "imported_at": imported_at,
         "updated_at": imported_at,
         "episodes": episodes,
-        "evidence_refs": [
-            {"seq": event["seq"], "evidence_ref": event["evidence_ref"]}
-            for event in bundle_mod.events_of(bundle)
-            if event.get("evidence_ref") is not None
-        ],
         "imports": [
             {
                 "source_ref": source_ref,
@@ -533,3 +619,4 @@ def historical_applicability(
         "reason": reason,
         "current_protocol_protection": protection,
     }
+

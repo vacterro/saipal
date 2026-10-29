@@ -6,11 +6,14 @@ denial is structural, data-driven, and applies to real paths on disk.
 
 from __future__ import annotations
 
+import contextlib
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from saipal_engine import capability
+from saipal_engine import paths as paths_mod
 from saipal_engine.errors import PalError
 from saipal_engine.paths import atomic_write_bytes
 from saipal_engine.registry import load_registry, require_mapping
@@ -174,6 +177,173 @@ class PathBoundary(unittest.TestCase):
                 REAL_SAIPEN / ".saipen" / "STATE.md", home=self.home
             )
         self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+
+
+class AtomicWriteFinalNodeBoundary(unittest.TestCase):
+    """T-122 closure retry (SRC-005 W2-002): the SHARED atomic write
+    primitive must judge the requested final node BEFORE resolution erases
+    its identity. `Path.resolve()` flattens a final symlink, so the old
+    post-resolve `is_symlink()` test checked the TARGET, not the node the
+    caller named: a write through `root/link.txt` silently replaced
+    `root/target.txt` and left the symlink alive. The contract
+    "refuses a symlinked or non-regular final node" is now enforced with
+    non-following primitives (lstat + the Windows reparse-attribute probe),
+    including dangling symlinks regardless of where their target would land,
+    and every refusal leaves all pre-existing bytes untouched and creates no
+    symlink target as a side effect.
+    """
+
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.external_root = Path(tempfile.mkdtemp())
+        self.addCleanup(self._tmp.cleanup)
+
+    def _symlink(self, link: Path, target: Path) -> None:
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable in this environment")
+
+    def test_absent_regular_destination_inside_root_succeeds(self) -> None:
+        target = self.root / "fresh.txt"
+        result = atomic_write_bytes(target, b"fresh", root=self.root)
+        self.assertEqual(target.read_bytes(), b"fresh")
+        self.assertFalse(result.is_symlink())
+
+    def test_regular_file_inside_root_is_atomically_replaced(self) -> None:
+        target = self.root / "state.json"
+        target.write_bytes(b"{\"v\": 1}")
+        atomic_write_bytes(target, b"{\"v\": 2}", root=self.root)
+        self.assertEqual(target.read_bytes(), b"{\"v\": 2}")
+        self.assertFalse(target.is_symlink(), "replacement must stay a regular file")
+
+    def test_final_symlink_to_existing_file_outside_root_is_refused(self) -> None:
+        outside = self.external_root / "outside.txt"
+        outside.write_bytes(b"outside bytes")
+        link = self.root / "link.txt"
+        self._symlink(link, outside)
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(link, b"x", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertEqual(outside.read_bytes(), b"outside bytes", "external bytes untouched")
+        self.assertTrue(link.is_symlink(), "the indirection itself must survive")
+
+    def test_final_symlink_to_existing_file_inside_root_is_refused(self) -> None:
+        target = self.root / "target.txt"
+        target.write_bytes(b"old bytes")
+        link = self.root / "link.txt"
+        self._symlink(link, target)
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(link, b"new bytes", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertEqual(target.read_bytes(), b"old bytes", "target bytes preserved")
+        self.assertTrue(link.is_symlink())
+
+    def test_dangling_final_symlink_to_outside_root_is_refused(self) -> None:
+        link = self.root / "dangle.txt"
+        self._symlink(link, self.external_root / "never.txt")
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(link, b"x", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertFalse((self.external_root / "never.txt").exists(), "no target created")
+        self.assertTrue(link.is_symlink())
+
+    def test_dangling_final_symlink_to_inside_root_is_refused(self) -> None:
+        link = self.root / "dangle.txt"
+        self._symlink(link, self.root / "never.md")
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(link, b"x", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertFalse((self.root / "never.md").exists(), "no target created")
+        self.assertTrue(link.is_symlink())
+
+    @unittest.skipIf(os.name == "nt", "POSIX fifo control; the Windows junction control carries the reparse case")
+    def test_non_regular_final_node_is_refused(self) -> None:
+        import stat as stat_mod
+
+        fifo = self.root / "pipe"
+        os.mkfifo(str(fifo))
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(fifo, b"x", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertTrue(stat_mod.S_ISFIFO(os.lstat(str(fifo)).st_mode))
+
+    def test_parent_directory_junction_outside_root_is_refused(self) -> None:
+        """A parent directory swapped for a junction/reparse point to an
+        external directory must not carry the write outside the root."""
+        if os.name != "nt":
+            self.skipTest("Windows junction control (POSIX dir-symlink variant below)")
+        import _winapi  # junction creation on Windows
+
+        outside_dir = self.external_root / "extdir"
+        outside_dir.mkdir()
+        junction = self.root / "audit"
+        junction.rmdir() if junction.exists() else None
+        _winapi.CreateJunction(str(outside_dir), str(junction))
+        try:
+            with self.assertRaises(PalError) as caught:
+                atomic_write_bytes(junction / "f.md", b"x", root=self.root)
+            self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+            self.assertFalse((outside_dir / "f.md").exists(), "no file through the junction")
+        finally:
+            with contextlib.suppress(OSError):
+                junction.rmdir()
+
+    def test_parent_directory_symlink_outside_root_is_refused(self) -> None:
+        """POSIX variant of the parent-indirection refusal."""
+        if os.name == "nt":
+            self.skipTest("POSIX directory-symlink control")
+        outside_dir = self.external_root / "extdir"
+        outside_dir.mkdir()
+        sub = self.root / "audit"
+        self._symlink(sub, outside_dir)
+        with self.assertRaises(PalError) as caught:
+            atomic_write_bytes(sub / "f.md", b"x", root=self.root)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertFalse((outside_dir / "f.md").exists())
+
+    def test_refusal_preserves_all_pre_existing_bytes(self) -> None:
+        """A refused write must leave every pre-existing byte in the tree."""
+        target = self.root / "target.txt"
+        target.write_bytes(b"keep me")
+        sibling = self.root / "sibling.txt"
+        sibling.write_bytes(b"sibling")
+        link = self.root / "link.txt"
+        self._symlink(link, target)
+        with self.assertRaises(PalError):
+            atomic_write_bytes(link, b"overwrite", root=self.root)
+        self.assertEqual(target.read_bytes(), b"keep me")
+        self.assertEqual(sibling.read_bytes(), b"sibling")
+        leftovers = [p.name for p in self.root.iterdir() if p.name.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "a refused write must leave no temp artifacts")
+
+    def test_reparse_detection_actually_sees_a_junction(self) -> None:
+        """Windows acceptance: carries_reparse_attr must return True for a
+        REAL junction, proving the WinAPI path executes and detects -- not a
+        code path that silently returns False on a non-Windows platform."""
+        if os.name != "nt":
+            self.skipTest("Windows junction acceptance")
+        import _winapi
+
+        real_dir = self.root / "real"
+        real_dir.mkdir()
+        junction = self.root / "junc"
+        _winapi.CreateJunction(str(real_dir), str(junction))
+        try:
+            self.assertTrue(
+                paths_mod.carries_reparse_attr(junction),
+                "a real junction must be detected via the reparse attribute",
+            )
+            self.assertFalse(
+                paths_mod.carries_reparse_attr(real_dir),
+                "a plain directory must not be flagged as a reparse point",
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                junction.rmdir()
 
 
 if __name__ == "__main__":

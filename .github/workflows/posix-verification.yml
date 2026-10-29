@@ -1,0 +1,43 @@
+# SRC-006:R008 -- PAL-WRITE-01 POSIX verification.
+#
+# R008 requires the write-boundary suites, the full discovery run (which must
+# NOT die with OSError Errno 24 "Too many open files" -- the descriptor-leak
+# defect T-127 repaired), validate.py and compileall to pass ON A REAL POSIX
+# HOST. The development host is Windows-only, so this workflow is the standing
+# POSIX host: it runs the exact SRC-006 command block on ubuntu-latest for
+# every push and pull request, and fails the build if any step regresses.
+name: POSIX verification (SRC-006 R008)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  posix-write-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Focused Wave suites
+        run: |
+          python -B -m unittest discover -s tools -p "test_wave_pal_write_01.py"
+          python -B -m unittest discover -s tools -p "test_wave_unattended.py"
+          python -B -m unittest discover -s tools -p "test_wave_lock_ownership.py"
+          python -B -m unittest discover -s tools -p "test_wave_a_continue.py"
+          python -B -m unittest discover -s tools -p "test_wave_e_audit.py"
+          python -B -m unittest discover -s tools -p "test_wave_t109_gate.py"
+          python -B -m unittest discover -s tools -p "test_wave_crash_recovery.py"
+
+      - name: Full discovery (no Errno 24 / EMFILE)
+        run: python -B -m unittest discover -s tools -p "test_*.py"
+
+      - name: Validator
+        run: python -B tools/validate.py
+
+      - name: compileall
+        run: python -B -m compileall tools

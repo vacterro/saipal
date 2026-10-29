@@ -100,6 +100,9 @@ class ProtocolCommandRecognition(unittest.TestCase):
             ("saipal status", "saipal status"),
             ("SAIPAL status", "saipal status"),
             ("saipal", "saipal"),
+            ("pal", "pal"),
+            ("PAL", "pal"),
+            ("/saipal pal", "saipal pal"),
             ("/saipal cc", "saipal cc"),
             ("gg build the thing", "gg build the thing"),
             ("ff topbar", "ff topbar"),
@@ -114,6 +117,9 @@ class ProtocolCommandRecognition(unittest.TestCase):
             "Get-ChildItem -Force .saipen",
             "ruff check x.py",
             "cc && git push",
+            "pal && git push",
+            "pal report",
+            "Please check the pal report tomorrow",
             "ffmpeg -i x.mp4",
             "hh extra words",
             "",
@@ -234,8 +240,15 @@ class OpencodeAdapterSqlite(unittest.TestCase):
             self.assertEqual(code, 0, err)
             self.assertIsNotNone(payload)
             record = support.sessions_of(runtime_home)[0]
-        self.assertEqual(len(record["evidence_refs"]), len(bundle["events"]))
+        # SRC-004 PERF-001: the per-event locator projection no longer lives in
+        # the index; locators are derived from the canonical bundle on demand
+        # (carrier + evidence). Episodes keep their boundary locators.
+        self.assertNotIn("evidence_refs", record)
         self.assertTrue(any(ep.get("start_evidence_ref") for ep in record["episodes"]))
+        self.assertTrue(
+            all(e.get("evidence_ref") is not None for e in bundle["events"]),
+            "the canonical bundle remains the locator authority",
+        )
 
     def test_bounded_window_reconstructs_exchange_and_excludes_reasoning(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

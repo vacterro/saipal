@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 
 from .backend import AUTH, LIMIT, OK, PERMANENT, RETRYABLE, ModelReply
+from .config import credential_verdict
 
 _REQUEST_TIMEOUT = 120.0
 _CHUNK = 8192
@@ -62,14 +63,16 @@ def call(
     started = time.perf_counter()
 
     headers, _key = _headers(config)
-    if backend.get("api_key_env") and "Authorization" not in headers:
+    credential_ok, credential_detail = credential_verdict(config)
+    if not credential_ok:
+        # Fail closed BEFORE a socket exists: with no configured credential there
+        # is no authorized remote party to send evidence to. A loopback endpoint
+        # is the documented exception -- it has no remote party at all, so an
+        # unset key is inert there and the call proceeds header-less.
         return ModelReply(
             ok=False,
             failure_class=AUTH,
-            detail=(
-                f"environment variable {backend.get('api_key_env')!r} is not set; "
-                "no request was sent"
-            ),
+            detail=credential_detail,
             latency_seconds=time.perf_counter() - started,
         )
 

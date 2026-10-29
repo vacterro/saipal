@@ -11,6 +11,7 @@ it is rejected before it can reach an audit.
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -277,10 +278,164 @@ def load_bundle_with_digest(
     return parse_bundle(payload, registry=registry, digest=digest), digest
 
 
-def load_bundle_file(path: Path | str, *, registry: dict | None = None) -> dict:
+#: PERF-005 (SRC-004): small process-local parsed-bundle working set. One
+#: unchanged semantic unit used to pay TWO full JSON parses of the same
+#: canonical bundle (pre-model carrier + submit revalidation) plus again per
+#: later slice. The cache is keyed by strong artifact identity: the resolved
+#: path plus (size, mtime_ns, inode), the session generation's expected bundle
+#: digest AND the registry/spec fingerprint the entry was validated under.
+#: `parse_bundle` is registry-sensitive, so a cached parse is never reused
+#: under a different validation policy. Any mismatch, missing file or
+#: uncertain state falls back to the full parse; HOT extension/replacement
+#: always invalidates.
+#:
+#: The (size, mtime_ns, inode) stat tuple is a cheap fast-path rejector, NOT a
+#: cryptographic binding of the file bytes. SAIPAL writes session bundles only
+#: through atomic same-directory replacement, which always changes mtime_ns
+#: (and typically the inode), so a metadata-preserving byte replacement -- the
+#: mutation class a stat tuple cannot detect -- is outside this cache's
+#: contract: it would require an actor already able to rewrite .saipal state
+#: while forging stat metadata, which the home's own trust model does not
+#: defend. What binds a hit to the indexed generation is `expected_sha256`,
+#: and what binds it to the validation policy is the spec fingerprint.
+_BUNDLE_CACHE_MAX = 4
+_BUNDLE_CACHE: "OrderedDict[str, dict]" = OrderedDict()
+
+
+def _canonical_spec(value: Any) -> Any:
+    """Normalize a spec value so equal policies digest equal.
+
+    `_spec` mixes tuples (from `require_string_list`), dicts and scalars; a
+    canonical form makes the fingerprint depend only on the effective policy,
+    never on the container spelling.
+    """
+    if isinstance(value, (tuple, list)):
+        return [_canonical_spec(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _canonical_spec(item) for key, item in value.items()}
+    return value
+
+
+def _spec_fingerprint(registry: dict | None = None) -> str:
+    """Deterministic digest of the exact validation spec a parse ran under.
+
+    PERF-005 (SRC-004): every registry field `_spec` feeds into
+    `validate_bundle` (bundle_schema_version, required/optional fields, event
+    fields/types/forbidden keys, adapters, temperature enum, protocol binding
+    fields/statuses/proof levels, evidence budgets, locator fields/kinds/roles
+    and limits) participates in the fingerprint, so a cached parse can only
+    ever be reused under the policy that validated it.
+    """
+    spec = _canonical_spec(_spec(registry))
+    return sha256_bytes(
+        json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+
+
+def bundle_cache_clear() -> None:
+    """Test/operational hook: drop the parsed-bundle working set."""
+    _BUNDLE_CACHE.clear()
+
+
+def _cache_stat_key(path: Path) -> tuple | None:
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return (int(info.st_size), int(info.st_mtime_ns), int(info.st_ino))
+
+
+def _cache_probe(
+    resolved: str, stat_key: tuple | None, expected_sha256: str, spec_fingerprint: str
+) -> dict | None:
+    """The cached bundle matching all four identities, or None."""
+    if stat_key is None:
+        return None
+    entry = _BUNDLE_CACHE.get(resolved)
+    if not (
+        isinstance(entry, dict)
+        and entry.get("stat") == stat_key
+        and entry.get("digest") == expected_sha256
+        and entry.get("spec") == spec_fingerprint
+    ):
+        return None
+    _BUNDLE_CACHE.move_to_end(resolved)
+    return entry["bundle"]
+
+
+def _cache_put(
+    resolved: str, stat_key: tuple | None, digest: str, spec_fingerprint: str, bundle: dict
+) -> None:
+    if stat_key is None:
+        return
+    _BUNDLE_CACHE[resolved] = {
+        "stat": stat_key, "digest": digest, "spec": spec_fingerprint, "bundle": bundle,
+    }
+    while len(_BUNDLE_CACHE) > _BUNDLE_CACHE_MAX:
+        _BUNDLE_CACHE.popitem(last=False)
+
+
+def load_bundle_file(
+    path: Path | str,
+    *,
+    registry: dict | None = None,
+    expected_sha256: str | None = None,
+) -> dict:
     """Read one inbox file. Unreadable is `INBOX_UNREADABLE`, malformed is
-    `BUNDLE_INVALID` -- the two mean different things to whoever exported it."""
-    bundle, _digest = load_bundle_with_digest(path, registry=registry)
+    `BUNDLE_INVALID` -- the two mean different things to whoever exported it.
+
+    PERF-005: with `expected_sha256` (the session record's bundle digest) the
+    parsed bundle is reused from the bounded working set when the resolved
+    path, the file stat identity, the expected digest AND the validation-spec
+    fingerprint all agree. Any mismatch falls back to the full parse; callers
+    without a trustworthy expected digest always take the full parse.
+    """
+    target = Path(path)
+    resolved = str(target.resolve())
+    stat_key = _cache_stat_key(target)
+    spec_fingerprint = _spec_fingerprint(registry)
+    if expected_sha256:
+        cached = _cache_probe(resolved, stat_key, expected_sha256, spec_fingerprint)
+        if cached is not None:
+            return cached
+    bundle, digest = load_bundle_with_digest(target, registry=registry)
+    _cache_put(resolved, stat_key, digest, spec_fingerprint, bundle)
+    return bundle
+
+
+def load_bundle_verified(
+    path: Path | str,
+    *,
+    registry: dict | None = None,
+    expected_sha256: str,
+) -> dict:
+    """The canonical bundle, bound to a trusted expected content digest.
+
+    SRC-004 PERF-001 integrity repair: the session index names generation A by
+    `bundle_sha256`. Answering from bundle bytes that hash to anything else
+    would let a materially different file stand in as the indexed generation's
+    evidence authority. This loader therefore refuses -- with the canonical
+    `BUNDLE_INVALID` integrity error -- when the parsed bundle's own digest is
+    not the expected digest, and it refuses malformed/unreadable bytes through
+    the same canonical loader. Cache hits only ever reuse an entry that was
+    itself digest-bound, so they are equally safe.
+    """
+    target = Path(path)
+    resolved = str(target.resolve())
+    stat_key = _cache_stat_key(target)
+    spec_fingerprint = _spec_fingerprint(registry)
+    cached = _cache_probe(resolved, stat_key, expected_sha256, spec_fingerprint)
+    if cached is not None:
+        return cached
+    bundle, digest = load_bundle_with_digest(target, registry=registry)
+    if digest != expected_sha256:
+        raise PalError(
+            "BUNDLE_INVALID",
+            f"canonical bundle digest {digest[:16]}... does not match the indexed "
+            f"generation digest {str(expected_sha256)[:16]}...",
+            next_action="re-import the session or restore the canonical bundle bytes",
+        )
+    _cache_put(resolved, stat_key, digest, spec_fingerprint, bundle)
     return bundle
 
 

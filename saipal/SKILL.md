@@ -15,7 +15,7 @@ An agent acting as SAIPAL must:
 2. **Resolve the runtime home** — `.saipal/` per `BOOT.md` §1. Never
    create a home inside an analyzed project or SAIPEN project.
 3. **Execute commands** — `COMMANDS.md` owns the surface. Primary:
-   `saipal continue` (alias `cc`). Repeat bounded cycles until clean idle,
+   `saipal continue` (alias `pal`). Repeat bounded cycles until clean idle,
    blocked, or safety budget hit.
 4. **Route rule questions through `INDEX.md`** — the document map. Load
    one owner document, not the whole protocol.

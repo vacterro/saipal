@@ -324,6 +324,27 @@ def _submit_candidate_locked(
             next_action="fix the candidate; nothing was written",
         )
 
+    # W2-003 (SRC-011): the intention journal is consulted BEFORE fresh-evidence
+    # scope validation. An open operation with the exact receipt identity proves
+    # this transaction was already admitted, so a retry must recover it even
+    # after a later cycle advanced the session to a new COLD generation or a HOT
+    # tail. Computing the key and loading the journal here is what lets recovery
+    # precede the validation an already-accepted transaction can no longer pass.
+    key = receipt_id(candidate)
+    receipts_status, receipts, receipts_detail = load_receipts(root)
+    if receipts_status == "unrecoverable":
+        raise PalError(
+            "VALIDATION_FAILED",
+            receipts_detail,
+            next_action=f"repair or remove .saipal/{RECEIPTS_NAME} by hand",
+        )
+    if receipts is None:
+        receipts = empty_receipts()
+    recovery_op = _existing_operation(receipts, key)
+    recovery_snapshot = None
+    if recovery_op is not None and isinstance(recovery_op.get("snapshot"), dict):
+        recovery_snapshot = recovery_op["snapshot"]
+
     status, index, detail = sessions_mod.load_index(root, registry=data)
     if status == sessions_mod.STATUS_UNRECOVERABLE:
         raise PalError("VALIDATION_FAILED", f"session index is unusable: {detail}")
@@ -364,27 +385,33 @@ def _submit_candidate_locked(
         episode_index=episode_index,
         slice_index=candidate.get("slice_index"),
     )
-    scope = cand_mod.episode_scope_problems(candidate, unit, registry=data)
-    if scope:
-        raise PalError(
-            "CANDIDATE_OUT_OF_SCOPE",
-            "candidate does not answer the unit it names: " + "; ".join(scope),
-            next_action="re-read the carrier with `saipal --json next`; nothing was written",
-        )
+    # W2-003 (SRC-011): an open operation whose receipt identity matches this
+    # exact candidate proves the transaction was previously admitted. Recovery
+    # must NOT re-run fresh-evidence scope validation (the evidence may have
+    # advanced to a new generation since), but the exception is bounded: the
+    # arriving candidate must still match the immutable snapshot that proved
+    # admission, so an unrelated stale candidate can never ride the exception.
+    if recovery_snapshot is not None:
+        expecting = str(recovery_snapshot.get("unit_digest") or "")
+        if str(unit.get("unit_digest") or "") != expecting:
+            raise PalError(
+                "CANDIDATE_OUT_OF_SCOPE",
+                "open operation exists but this candidate's unit does not match "
+                "the admitted transaction; refusing to recover unrelated work",
+                next_action="re-read the carrier with `saipal --json next`",
+            )
+    else:
+        scope = cand_mod.episode_scope_problems(candidate, unit, registry=data)
+        if scope:
+            raise PalError(
+                "CANDIDATE_OUT_OF_SCOPE",
+                "candidate does not answer the unit it names: " + "; ".join(scope),
+                next_action="re-read the carrier with `saipal --json next`; nothing was written",
+            )
 
-    key = receipt_id(candidate)
     window = unit.get("slice") or {}
     slice_index = int(window.get("index") or 0)
     slices = int(window.get("count") or 1)
-    receipts_status, receipts, receipts_detail = load_receipts(root)
-    if receipts_status == "unrecoverable":
-        raise PalError(
-            "VALIDATION_FAILED",
-            receipts_detail,
-            next_action=f"repair or remove .saipal/{RECEIPTS_NAME} by hand",
-        )
-    if receipts is None:
-        receipts = empty_receipts()
 
     def reconcile(entry: dict) -> dict:
         """Bring the semantic position in line with a receipt that exists.
@@ -409,6 +436,34 @@ def _submit_candidate_locked(
 
     duplicate = _existing_receipt(receipts, key)
     if duplicate is not None:
+        # W2-002 (SRC-011): an exact duplicate receipt is recovery of an
+        # already-validated transaction. Before it may be treated as converged,
+        # the emitted audit must carry its required closed-loop link: a crash
+        # (or a transient ledger fault) after the audit became authoritative but
+        # before/at linkage left the receipt without one, and only this path is
+        # in a position to repair it. `link_finding_audit` is idempotent, so a
+        # link that already exists is a no-op.
+        duplicate_audit = duplicate.get("audit")
+        if isinstance(duplicate_audit, dict) and duplicate_audit.get("audit_number"):
+            try:
+                from . import closedloop as closedloop_mod
+
+                closedloop_mod.link_finding_audit(
+                    root, str(duplicate.get("finding_id") or ""), duplicate_audit
+                )
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                from . import log as log_module
+
+                log_module.append_event(
+                    root,
+                    "closed_loop_link_failure",
+                    data={
+                        "finding_id": duplicate.get("finding_id", ""),
+                        "audit_number": duplicate_audit.get("audit_number"),
+                        "reason": str(exc),
+                    },
+                    registry=data,
+                )
         return {
             "receipt_id": key,
             "verdict": duplicate.get("verdict"),
@@ -463,9 +518,34 @@ def _submit_candidate_locked(
     # findings, digest-keyed audit slots, forward-only cursors, receipt-derived
     # tallies -- and this record exists so an interrupted attempt is visible
     # rather than inferred.
-    operation = _existing_operation(receipts, key)
+    # W2-003 (SRC-011): the durable intention now carries an IMMUTABLE recovery
+    # snapshot -- the normalized candidate and the evidence/protocol identity
+    # derived at admission time -- so recovery after a crash no longer depends on
+    # the newest evidence still representing the original unit. The admitted
+    # candidate is the analyst's own normalized input; the snapshot binds the
+    # exact transaction that was accepted.
+    operation = recovery_op
     recovered = operation is not None
     if operation is None:
+        snapshot = {
+            "receipt_id": key,
+            "session_id": session_id,
+            "episode_index": episode_index,
+            "slice_index": slice_index,
+            "slice_count": slices,
+            "unit_digest": str(candidate.get("unit_digest") or ""),
+            "verdict": str(candidate.get("verdict") or ""),
+            "finality": str(cand_mod.normalize_candidate(candidate, registry=data).get("finality") or finality),
+            "reasoning_sha256": sha256_text(str(candidate.get("reasoning") or "")),
+            "unit_protocol": {
+                k: unit.get("protocol", {}).get(k)
+                for k in ("binding_status", "proof_level", "version",
+                          "git_head", "registry_sha256", "tree_fingerprint")
+                if unit.get("protocol", {}).get(k) is not None
+            },
+            "candidate": dict(candidate),
+            "opened_at": _now(),
+        }
         operation = {
             "receipt_id": key,
             "session_id": session_id,
@@ -474,6 +554,7 @@ def _submit_candidate_locked(
             "verdict": verdict,
             "opened_at": _now(),
             "stages": [],
+            "snapshot": snapshot,
         }
         receipts["operations"].append(operation)
         _save_receipts(root, receipts, registry=data)
